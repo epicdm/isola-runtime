@@ -554,6 +554,14 @@ async def websocket_chat(
                         assistant_response = await llm_task
                         logger.info(f"[WS] LLM response: {assistant_response[:80]}")
 
+                    # call_llm returns error strings instead of raising — detect and
+                    # re-raise so the fallback model logic below can trigger correctly.
+                    _LLM_ERROR_PREFIXES = ("[LLM Error]", "[LLM call error]", "[Error]")
+                    if not aborted and assistant_response and any(
+                        assistant_response.startswith(p) for p in _LLM_ERROR_PREFIXES
+                    ):
+                        raise RuntimeError(assistant_response)
+
                     # Update last_active_at
                     from datetime import datetime, timezone as tz
                     async with async_session() as _db:
