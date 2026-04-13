@@ -439,8 +439,32 @@ async def websocket_chat(
             # Track thinking content for storage (initialize before condition)
             thinking_content = []
 
+            # Reload model config on every message so Settings changes take effect
+            # immediately without requiring a page refresh / WebSocket reconnect.
+            async with async_session() as _mdb:
+                _agent_r = await _mdb.execute(select(Agent).where(Agent.id == agent_id))
+                _agent_cur = _agent_r.scalar_one_or_none()
+                if _agent_cur:
+                    if _agent_cur.primary_model_id:
+                        _m_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.primary_model_id))
+                        _m = _m_r.scalar_one_or_none()
+                        llm_model = _m if (_m and _m.enabled) else None
+                    else:
+                        llm_model = None
+                    if _agent_cur.fallback_model_id:
+                        _fb_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.fallback_model_id))
+                        _fb = _fb_r.scalar_one_or_none()
+                        fallback_llm_model = _fb if (_fb and _fb.enabled) else None
+                    else:
+                        fallback_llm_model = None
+                    # Config-level fallback: primary missing → use fallback immediately
+                    if not llm_model and fallback_llm_model:
+                        llm_model = fallback_llm_model
+                        fallback_llm_model = None
+
             # Call LLM with streaming
             if llm_model:
+
                 try:
                     logger.info(f"[WS] Calling LLM {llm_model.model} (streaming)...")
                     
