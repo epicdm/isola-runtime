@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +14,23 @@ class IdentityProvider(Base):
     """Configuration for external identity providers (Feishu, DingTalk, WeCom, etc.)."""
 
     __tablename__ = "identity_providers"
+    __table_args__ = (
+        Index("ix_identity_providers_tenant_id", "tenant_id"),
+        Index("ix_identity_providers_tenant_type", "tenant_id", "provider_type"),
+        Index(
+            "uq_identity_providers_tenant_type",
+            "tenant_id",
+            "provider_type",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_identity_providers_global_type",
+            "provider_type",
+            unique=True,
+            postgresql_where=text("tenant_id IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Use plain String instead of PostgreSQL native Enum to stay compatible with the

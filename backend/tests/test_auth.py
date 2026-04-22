@@ -160,6 +160,36 @@ async def test_login_unverified_email():
     assert exc.value.detail["needs_verification"] is True
 
 
+@pytest.mark.asyncio
+async def test_login_success_binds_org_member_for_web_user():
+    """Successful web login should ensure the user exists in org_members."""
+    identity = _make_identity()
+    user = _make_user(identity.id)
+    tenant = SimpleNamespace(id=user.tenant_id, is_active=True)
+    db = RecordingDB(
+        responses=[
+            DummyResult(values=[identity]),  # identity lookup
+            DummyResult(values=[user]),      # user lookup
+            DummyResult(values=[tenant]),    # tenant lookup
+        ]
+    )
+    data = _make_login_data()
+    bg = AsyncMock()
+
+    with patch.object(auth_api, "UserOut") as MockUserOut, \
+         patch.object(auth_api, "IdentityOut") as MockIdentityOut, \
+         patch.object(auth_api, "TokenResponse", side_effect=lambda **kwargs: kwargs), \
+         patch.object(auth_api, "create_access_token", return_value="token"), \
+         patch("app.services.registration_service.registration_service.bind_org_member", new_callable=AsyncMock) as mock_bind:
+        MockUserOut.model_validate.return_value = {"id": str(user.id)}
+        MockIdentityOut.model_validate.return_value = {"id": str(identity.id)}
+        result = await auth_api.login(data, bg, db)
+
+    mock_bind.assert_awaited_once_with(db, user)
+    assert db.committed is True
+    assert result["access_token"] == "token"
+
+
 # ---------------------------------------------------------------------------
 # /me tests
 # ---------------------------------------------------------------------------

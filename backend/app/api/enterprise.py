@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -933,6 +933,18 @@ async def create_identity_provider(
                 detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled."
             )
 
+    existing = await db.execute(
+        select(IdentityProvider).where(
+            IdentityProvider.provider_type == data.provider_type,
+            IdentityProvider.tenant_id == tid,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Identity provider '{data.provider_type}' already exists for this tenant",
+        )
+
     provider = IdentityProvider(
         provider_type=data.provider_type,
         name=data.name,
@@ -942,7 +954,14 @@ async def create_identity_provider(
         tenant_id=tid
     )
     db.add(provider)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Identity provider '{data.provider_type}' already exists for this tenant",
+        )
     await db.refresh(provider)
     auth_provider_registry._clear_cache(provider.provider_type)
     return _identity_provider_response(provider)
@@ -987,6 +1006,18 @@ async def create_oauth2_provider(
     if not tid:
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
 
+    existing = await db.execute(
+        select(IdentityProvider).where(
+            IdentityProvider.provider_type == "oauth2",
+            IdentityProvider.tenant_id == tid,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409,
+            detail="Identity provider 'oauth2' already exists for this tenant",
+        )
+
     provider = IdentityProvider(
         provider_type="oauth2",
         name=data.name,
@@ -995,7 +1026,14 @@ async def create_oauth2_provider(
         tenant_id=tid
     )
     db.add(provider)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Identity provider 'oauth2' already exists for this tenant",
+        )
     await db.refresh(provider)
     auth_provider_registry._clear_cache(provider.provider_type)
     return _identity_provider_response(provider)

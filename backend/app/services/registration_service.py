@@ -26,6 +26,37 @@ from loguru import logger
 class RegistrationService:
     """Service for handling user registration flows."""
 
+    async def ensure_identity_provider(
+        self,
+        db: AsyncSession,
+        provider_type: str,
+        tenant_id: uuid.UUID | None,
+        *,
+        name: str | None = None,
+        sso_login_enabled: bool = False,
+    ) -> IdentityProvider:
+        """Get or create an IdentityProvider record for a tenant."""
+        query = select(IdentityProvider).where(
+            IdentityProvider.provider_type == provider_type,
+            IdentityProvider.tenant_id == tenant_id,
+        )
+        result = await db.execute(query)
+        provider = result.scalar_one_or_none()
+        if provider:
+            return provider
+
+        provider = IdentityProvider(
+            provider_type=provider_type,
+            name=name or provider_type.capitalize(),
+            is_active=True,
+            sso_login_enabled=sso_login_enabled,
+            config={},
+            tenant_id=tenant_id,
+        )
+        db.add(provider)
+        await db.flush()
+        return provider
+
     async def detect_tenant_by_email(self, db: AsyncSession, email: str) -> Tenant | None:
         """Detect tenant based on email domain.
 
@@ -463,11 +494,27 @@ class RegistrationService:
             return
 
         from app.models.org import OrgMember
+
+        web_provider = await self.ensure_identity_provider(
+            db,
+            "web",
+            user.tenant_id,
+            name="Web",
+        )
         
         member = None
 
-        # Prefer email match
-        if user.email:
+        # Prefer an already-linked member for this exact tenant-user.
+        result = await db.execute(
+            select(OrgMember).where(
+                OrgMember.user_id == user.id,
+                OrgMember.tenant_id == user.tenant_id,
+            )
+        )
+        member = result.scalar_one_or_none()
+
+        # Prefer email match when no linked member exists yet.
+        if not member and user.email:
             result = await db.execute(
                 select(OrgMember).where(
                     OrgMember.email == user.email,
@@ -490,6 +537,10 @@ class RegistrationService:
         
         if member:
             member.user_id = user.id
+
+            # Platform-created shell members should show up as a distinct Web category.
+            if member.provider_id is None:
+                member.provider_id = web_provider.id
             
             # Sync email/phone both ways (prefer user if provided)
             if user.email and member.email != user.email:
@@ -501,6 +552,13 @@ class RegistrationService:
                 member.phone = user.primary_mobile
             elif not user.primary_mobile and member.phone:
                 user.primary_mobile = member.phone
+
+            if member.provider_id == web_provider.id:
+                desired_name = user.display_name or member.name or "User"
+                if desired_name and member.name != desired_name:
+                    member.name = desired_name
+                if not member.title:
+                    member.title = "Web User"
             
             await db.flush()
         else:
@@ -508,6 +566,8 @@ class RegistrationService:
                 name=user.display_name or "User",
                 email=user.email,
                 phone=user.primary_mobile,
+                provider_id=web_provider.id,
+                title="Web User",
                 tenant_id=user.tenant_id,
                 user_id=user.id,
                 status="active"

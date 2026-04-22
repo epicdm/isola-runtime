@@ -432,6 +432,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
     """Login with email/phone/username and password. Supports multi-tenant selection."""
     from app.models.tenant import Tenant
     from app.models.user import Identity, User
+    from app.services.registration_service import registration_service
 
     # 1. Query Identity
     query = select(Identity).where(
@@ -533,6 +534,10 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your organization has been disabled.",
             )
+
+    # Ensure all web-login users are represented in org_members.
+    await registration_service.bind_org_member(db, user)
+    await db.commit()
 
     # 6. Generate Token
     token = create_access_token(str(user.id), user.role)
