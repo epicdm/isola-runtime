@@ -156,7 +156,7 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
     - soul.md → personality
     - memory.md → long-term memory
     - skills/ → skill names + summaries
-    - relationships.md → relationship descriptions
+    - relationships.md → relationship snapshot/reference
     """
     ws_root = _agent_workspace(agent_id)
 
@@ -415,7 +415,7 @@ You have a dedicated workspace with this structure:
   - memory/reflections.md → Your autonomous thinking journal
   - skills/        → Your skill definition files (one .md per skill)
   - workspace/     → Your work files (reports, documents, etc.)
-  - relationships.md → Your relationship list
+  - relationships.md → Informational relationship snapshot (reference only; messaging tools resolve recipients from the database)
   - enterprise_info/ → Shared company information
 
 Workspace organization rule:
@@ -505,6 +505,8 @@ Workspace organization rule:
    - DON'T mechanically remind people of every pending item
 
 9. **Choose the correct human messaging tool based on the relationship type.**
+   - Messaging tools resolve recipients and validate relationships from the database at send time.
+   - Do not treat `relationships.md` as the source of truth for delivery. It is only a readable snapshot for context.
    - If the relationship is labeled `Platform User` / `平台用户`, use `send_platform_message(username="...", message="...")`.
    - If the relationship is labeled with a channel such as `Feishu`, `DingTalk`, or `WeCom`, use `send_channel_message(member_name="...", message="...")`.
    - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.

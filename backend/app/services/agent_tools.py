@@ -491,7 +491,9 @@ AGENT_TOOLS = [
             "description": (
                 "Send a message to a colleague via their configured external channel "
                 "(Feishu, DingTalk, WeCom). Automatically detects the recipient's channel "
-                "based on their org relationship. Use this only for channel users. "
+                "based on their org relationship. Recipient resolution and relationship validation "
+                "are done from the database at send time; you do not need to read relationships.md first. "
+                "Use this only for channel users. "
                 "For relationships labeled Platform User / 平台用户, use send_platform_message instead."
             ),
             "parameters": {
@@ -499,7 +501,7 @@ AGENT_TOOLS = [
                 "properties": {
                     "member_name": {
                         "type": "string",
-                        "description": "Recipient's name as shown in relationships, e.g. '张三'. Must be a person in your relationship network.",
+                        "description": "Recipient's name, e.g. '张三'. The backend resolves the person from your database-backed relationship network.",
                     },
                     "message": {
                         "type": "string",
@@ -519,7 +521,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_platform_message",
-            "description": "Send a message to a user on the Clawith first-party platform (web or app). The message will appear in their platform chat history and be pushed in real-time if they are online. Use this to proactively notify platform users.",
+            "description": "Send a message to a user on the Clawith first-party platform (web or app). The message will appear in their platform chat history and be pushed in real-time if they are online. User lookup is resolved from the database within your organization at send time. Use this to proactively notify platform users.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -540,7 +542,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_message_to_agent",
-            "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Your relationships.md lists available digital employees under 'Digital Employee Colleagues'.\n\nDECISION GUIDE for msg_type:\nAsk yourself: does the target agent need to DO WORK (analyze, research, summarize, write, compare, plan, etc.) and RETURN RESULTS to you or the user?\n\n- If YES, the target needs to do work → use task_delegate. Examples: 'summarize X', 'analyze Y', 'check Z', 'prepare a report', 'review and give feedback', 'find out X', 'confirm with X and report back'. The target works asynchronously and you will be woken when they finish.\n\n- If the target just needs to KNOW something → use notify. Examples: 'meeting cancelled', 'I updated the doc', 'heads up about X', 'FYI'. No reply expected.\n\n- If you need a quick factual answer right now → use consult. Examples: 'what is X?', 'do you know Y?'. Synchronous, blocks until reply.\n\nWhen in doubt between notify and task_delegate, prefer task_delegate — it is safer because it guarantees the user gets a result.",
+            "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Target lookup and relationship validation are resolved from the database at send time; you do not need to read relationships.md first.\n\nDECISION GUIDE for msg_type:\nAsk yourself: does the target agent need to DO WORK (analyze, research, summarize, write, compare, plan, etc.) and RETURN RESULTS to you or the user?\n\n- If YES, the target needs to do work → use task_delegate. Examples: 'summarize X', 'analyze Y', 'check Z', 'prepare a report', 'review and give feedback', 'find out X', 'confirm with X and report back'. The target works asynchronously and you will be woken when they finish.\n\n- If the target just needs to KNOW something → use notify. Examples: 'meeting cancelled', 'I updated the doc', 'heads up about X', 'FYI'. No reply expected.\n\n- If you need a quick factual answer right now → use consult. Examples: 'what is X?', 'do you know Y?'. Synchronous, blocks until reply.\n\nWhen in doubt between notify and task_delegate, prefer task_delegate — it is safer because it guarantees the user gets a result.",
             "parameters": {
                 "type": "object",
                 "properties": {

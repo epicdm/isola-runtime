@@ -664,7 +664,11 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     db=db,
                     agent=agent_obj,
                     channel_type="feishu",
+<<<<<<< HEAD
                     # For Feishu, external_user_id is strictly user_id (tenant-stable).
+=======
+                    # For Feishu, external_user_id is strictly user_id.
+>>>>>>> origin/main
                     external_user_id=sender_user_id_feishu or None,
                     extra_info=extra_info,
                 )
@@ -1054,7 +1058,11 @@ async def _handle_feishu_file(
                 db=db,
                 agent=agent_obj,
                 channel_type="feishu",
+<<<<<<< HEAD
                 # For Feishu, external_user_id is strictly user_id (tenant-stable).
+=======
+                # For Feishu, external_user_id is strictly user_id.
+>>>>>>> origin/main
                 external_user_id=sender_user_id_feishu or None,
                 extra_info=extra_info,
             )
