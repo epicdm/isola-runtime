@@ -465,12 +465,176 @@ async def _phase_b3_signed_image_webhook(http, test_state, fake_creds, mock_meta
         assert "[image:workspace/uploads/" in latest.content, f"no image marker in user message: {latest.content!r}"
 
 
+async def _phase_b4_interactive(http, test_state, fake_creds, mock_meta, db_session):
+    """B.4: outbound interactive senders + inbound button/list reply routing.
+
+    Depends on B.3 having proven the webhook + LLM + send-reply pipeline.
+    Shares the same ChatSession (customer phone 15551234567) so these
+    messages append to the B.2/B.3 history.
+    """
+    from app.services.whatsapp_service import whatsapp_service
+
+    agent_id = test_state["agent_id"]
+    from_wa_id = "15551234567"
+
+    # --- Outbound: call the service directly, assert mock Meta sees the shape.
+    pre = len(mock_meta)
+    await whatsapp_service.send_interactive_buttons(
+        phone_number_id=fake_creds["phone_number_id"],
+        access_token=fake_creds["access_token"],
+        to=from_wa_id,
+        body_text="Please confirm your reservation",
+        buttons=[
+            {"id": "confirm_btn", "title": "Confirm"},
+            {"id": "cancel_btn", "title": "Cancel"},
+        ],
+        footer_text="Isola",
+    )
+    btn_record = next(
+        (r for r in mock_meta[pre:] if r.get("op") == "send_message"
+         and (r.get("body", {}).get("interactive", {}) or {}).get("type") == "button"),
+        None,
+    )
+    assert btn_record is not None, f"buttons send not observed: {mock_meta[pre:]}"
+    btn_body = btn_record["body"]
+    assert btn_body["type"] == "interactive"
+    assert btn_body["to"] == from_wa_id
+    btn_ids = {
+        b["reply"]["id"]
+        for b in btn_body["interactive"]["action"]["buttons"]
+    }
+    assert btn_ids == {"confirm_btn", "cancel_btn"}
+
+    pre = len(mock_meta)
+    await whatsapp_service.send_interactive_list(
+        phone_number_id=fake_creds["phone_number_id"],
+        access_token=fake_creds["access_token"],
+        to=from_wa_id,
+        body_text="Pick a category",
+        button_text="View menu",
+        sections=[
+            {"title": "Starters", "rows": [
+                {"id": "starter_pho", "title": "Pho", "description": "Beef broth"},
+                {"id": "starter_salad", "title": "Salad", "description": "Garden greens"},
+            ]},
+            {"title": "Mains", "rows": [
+                {"id": "main_curry", "title": "Curry", "description": "Coconut + lime"},
+            ]},
+        ],
+    )
+    list_record = next(
+        (r for r in mock_meta[pre:] if r.get("op") == "send_message"
+         and (r.get("body", {}).get("interactive", {}) or {}).get("type") == "list"),
+        None,
+    )
+    assert list_record is not None, f"list send not observed: {mock_meta[pre:]}"
+    list_body = list_record["body"]
+    row_ids = {
+        row["id"]
+        for sec in list_body["interactive"]["action"]["sections"]
+        for row in sec["rows"]
+    }
+    assert row_ids == {"starter_pho", "starter_salad", "main_curry"}
+
+    # --- Inbound: customer taps the Confirm button.
+    suffix = test_state["suffix"]
+    msg_id = f"wamid.test-b4-btn-{suffix}"
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": fake_creds["waba_id"],
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "17678180000",
+                        "phone_number_id": fake_creds["phone_number_id"],
+                    },
+                    "contacts": [{
+                        "profile": {"name": "Phase B Tester"},
+                        "wa_id": from_wa_id,
+                    }],
+                    "messages": [{
+                        "from": from_wa_id,
+                        "id": msg_id,
+                        "timestamp": str(int(time.time())),
+                        "type": "interactive",
+                        "interactive": {
+                            "type": "button_reply",
+                            "button_reply": {
+                                "id": "confirm_btn",
+                                "title": "Confirm",
+                            },
+                        },
+                    }],
+                },
+                "field": "messages",
+            }],
+        }],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    signature = _sign(body, fake_creds["app_secret"])
+
+    pre = len(mock_meta)
+    r = await http.post(
+        f"/api/channel/whatsapp/{agent_id}/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-hub-signature-256": signature,
+        },
+    )
+    assert r.status_code == 200
+
+    # Wait for the background task to produce an outbound text reply
+    # (no LLM model is configured, so the reply is our canned no-model error
+    # string — still a successful send_text_message call).
+    deadline = time.monotonic() + 30.0
+    saw_text_reply = False
+    while time.monotonic() < deadline:
+        for rec in mock_meta[pre:]:
+            if rec.get("op") == "send_message" and rec.get("body", {}).get("type") == "text":
+                saw_text_reply = True
+                break
+        if saw_text_reply:
+            break
+        await asyncio.sleep(0.5)
+    assert saw_text_reply, f"no text reply after button tap: {mock_meta[pre:]}"
+
+    # DB assertion: latest user ChatMessage should carry Confirm + [button:confirm_btn]
+    from app.models.chat_session import ChatSession
+    from app.models.audit import ChatMessage
+
+    Session = db_session
+    async with Session() as db:
+        sess_r = await db.execute(
+            select(ChatSession).where(
+                ChatSession.agent_id == uuid.UUID(agent_id),
+                ChatSession.external_conv_id == f"wa:{from_wa_id}",
+            )
+        )
+        sess = sess_r.scalar_one_or_none()
+        assert sess is not None
+
+        msgs_r = await db.execute(
+            select(ChatMessage).where(
+                ChatMessage.agent_id == uuid.UUID(agent_id),
+                ChatMessage.conversation_id == str(sess.id),
+                ChatMessage.role == "user",
+            ).order_by(ChatMessage.created_at.desc())
+        )
+        latest = msgs_r.scalars().first()
+        assert latest is not None
+        assert "Confirm" in latest.content
+        assert "[button:confirm_btn]" in latest.content
+
+
 async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, db_session):
-    """Run B.1 -> B.2 -> B.3 as one dependent chain.
+    """Run B.1 -> B.2 -> B.3 -> B.4 as one dependent chain.
 
     Single test function so module-scoped fixtures stay on one event loop.
-    Each phase's assertions must pass before the next phase runs — if B.1
-    breaks, B.2 and B.3 don't execute (fail-fast).
+    Each phase's assertions must pass before the next phase runs — if an
+    earlier phase breaks, later phases don't execute (fail-fast).
     """
     print("\n--- Phase B.1: config CRUD + Meta verify handshake ---")
     await _phase_b1_config_crud(http, test_state, fake_creds)
@@ -483,3 +647,7 @@ async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, db_session
     print("--- Phase B.3: signed image webhook -> media download + save + LLM ---")
     await _phase_b3_signed_image_webhook(http, test_state, fake_creds, mock_meta, db_session)
     print("Phase B.3 PASS")
+
+    print("--- Phase B.4: interactive outbound (buttons+list) + inbound button_reply ---")
+    await _phase_b4_interactive(http, test_state, fake_creds, mock_meta, db_session)
+    print("Phase B.4 PASS")

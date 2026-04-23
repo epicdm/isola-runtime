@@ -189,6 +189,149 @@ class WhatsAppService:
             resp.raise_for_status()
             return resp.json()
 
+    async def send_interactive_buttons(
+        self,
+        *,
+        phone_number_id: str,
+        access_token: str,
+        to: str,
+        body_text: str,
+        buttons: list[dict],
+        header_text: str = "",
+        footer_text: str = "",
+    ) -> dict:
+        """Send a reply-buttons interactive message (max 3 buttons).
+
+        Each button dict needs {"id": str (max 256), "title": str (max 20)}.
+        The id flows back in the customer's button_reply event so the bot can
+        route the tap without parsing the visible title.
+
+        Meta Cloud API reference:
+          https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#interactive-object
+        """
+        if not buttons or len(buttons) > 3:
+            raise ValueError(
+                f"send_interactive_buttons needs 1-3 buttons, got {len(buttons)}"
+            )
+        interactive = {
+            "type": "button",
+            "body": {"text": body_text[:1024]},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": str(b["id"])[:256],
+                            "title": str(b["title"])[:20],
+                        },
+                    }
+                    for b in buttons
+                ]
+            },
+        }
+        if header_text:
+            interactive["header"] = {"type": "text", "text": header_text[:60]}
+        if footer_text:
+            interactive["footer"] = {"text": footer_text[:60]}
+
+        url = f"{META_GRAPH_API_BASE}/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": interactive,
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"[WhatsApp] send_interactive_buttons failed "
+                    f"status={resp.status_code} body={resp.text[:500]}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def send_interactive_list(
+        self,
+        *,
+        phone_number_id: str,
+        access_token: str,
+        to: str,
+        body_text: str,
+        button_text: str,
+        sections: list[dict],
+        header_text: str = "",
+        footer_text: str = "",
+    ) -> dict:
+        """Send a list-picker interactive message (up to 10 rows total).
+
+        sections is a list of {"title": str, "rows": [...]} dicts. Each row
+        needs {"id": str, "title": str (max 24), "description": str (max 72)}.
+
+        button_text is the single label that opens the menu drawer
+        (max 20 chars per Meta).
+        """
+        total_rows = sum(len(s.get("rows") or []) for s in sections)
+        if total_rows == 0 or total_rows > 10:
+            raise ValueError(
+                f"send_interactive_list needs 1-10 total rows, got {total_rows}"
+            )
+
+        normalized_sections = []
+        for s in sections:
+            rows = [
+                {
+                    "id": str(r["id"])[:200],
+                    "title": str(r["title"])[:24],
+                    "description": str(r.get("description", ""))[:72],
+                }
+                for r in (s.get("rows") or [])
+            ]
+            normalized_sections.append({
+                "title": str(s.get("title", ""))[:24],
+                "rows": rows,
+            })
+
+        interactive = {
+            "type": "list",
+            "body": {"text": body_text[:1024]},
+            "action": {
+                "button": button_text[:20],
+                "sections": normalized_sections,
+            },
+        }
+        if header_text:
+            interactive["header"] = {"type": "text", "text": header_text[:60]}
+        if footer_text:
+            interactive["footer"] = {"text": footer_text[:60]}
+
+        url = f"{META_GRAPH_API_BASE}/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "interactive",
+            "interactive": interactive,
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"[WhatsApp] send_interactive_list failed "
+                    f"status={resp.status_code} body={resp.text[:500]}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+
 
 # Extension map: MIME prefix -> default file extension when Meta doesn't
 # give us a usable filename. Covers the common Cloud API media types.

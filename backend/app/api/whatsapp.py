@@ -309,9 +309,14 @@ async def _process_whatsapp_message(
         logger.error(f"[WhatsApp] agent={agent_id} missing phone_number_id or access_token")
         return
 
-    # B.3: handle text + media (image, audio, voice, video, document, sticker).
-    # B.4 adds interactive button/list replies. Types we still skip with a
-    # short ack: reaction, location, contacts.
+    # B.3/B.4: route by Meta message type.
+    #   text               -> B.2 path
+    #   image/audio/voice/
+    #     video/document/
+    #     sticker          -> B.3 media ingest
+    #   interactive        -> B.4 button_reply / list_reply tap → user text
+    #   reaction           -> logged + ignored
+    #   other              -> short ack, no LLM
     user_text = ""
     media_markers: list[str] = []
 
@@ -328,6 +333,11 @@ async def _process_whatsapp_message(
         caption = (msg.get(msg_type) or {}).get("caption", "").strip() if msg_type in {"image", "video", "document"} else ""
         if caption:
             user_text = caption
+    elif msg_type == "interactive":
+        user_text = _extract_interactive_user_text(msg)
+        if not user_text:
+            logger.info(f"[WhatsApp] agent={agent_id} ignoring empty interactive id={msg_id}")
+            return
     elif msg_type == "reaction":
         logger.info(f"[WhatsApp] agent={agent_id} ignoring reaction id={msg_id}")
         return
@@ -538,3 +548,41 @@ async def _ingest_whatsapp_media(
         f"{filename} ({len(data)} bytes, {mime_type})"
     )
     return [f"[{msg_type}:workspace/uploads/{filename}]"]
+
+
+# ─── Interactive inbound (B.4) ───────────────────────────
+
+
+def _extract_interactive_user_text(msg: dict) -> str:
+    """Flatten a Meta interactive-reply event into a user-text synthesis.
+
+    Customer tap shape:
+      {"type":"interactive",
+       "interactive": {
+         "type": "button_reply" | "list_reply",
+         "button_reply": {"id":"confirm_btn","title":"Confirm"}  OR
+         "list_reply":   {"id":"starter_pho","title":"Pho","description":"..."}}}
+
+    We hand the LLM the visible title + a [button:id] / [list:id] marker so
+    it can branch on the id deterministically without relying on the title
+    wording.
+    """
+    interactive = msg.get("interactive") or {}
+    i_type = interactive.get("type", "")
+    if i_type == "button_reply":
+        br = interactive.get("button_reply") or {}
+        title = (br.get("title") or "").strip()
+        bid = (br.get("id") or "").strip()
+        if not (title or bid):
+            return ""
+        return f"{title} [button:{bid}]" if bid else title
+    if i_type == "list_reply":
+        lr = interactive.get("list_reply") or {}
+        title = (lr.get("title") or "").strip()
+        description = (lr.get("description") or "").strip()
+        lid = (lr.get("id") or "").strip()
+        base = title if not description else f"{title} — {description}"
+        if not (base or lid):
+            return ""
+        return f"{base} [list:{lid}]" if lid else base
+    return ""
