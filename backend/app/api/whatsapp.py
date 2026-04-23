@@ -421,6 +421,43 @@ async def _process_whatsapp_message(
         sess.last_message_at = datetime.now(timezone.utc)
         await db.flush()
 
+        # ── Phase B.6: Paperclip mirror inbound + escalation ping ──
+        # Synchronous so the outbound mirror later sees sess.paperclip_issue_id.
+        from app.services import escalation, paperclip_mirror
+
+        if paperclip_mirror.is_enabled():
+            issue_id = await paperclip_mirror.ensure_issue_for_session(
+                agent_name=agent.name,
+                customer_name=sender_name,
+                customer_phone=from_wa_id,
+                paperclip_company_id=agent.paperclip_company_id,
+                paperclip_agent_id=agent.paperclip_agent_id,
+                existing_issue_id=sess.paperclip_issue_id,
+                first_message_snippet=user_text,
+            )
+            if issue_id and issue_id != sess.paperclip_issue_id:
+                sess.paperclip_issue_id = issue_id
+                await db.flush()
+            if issue_id:
+                await paperclip_mirror.mirror_message(
+                    issue_id=issue_id, direction="inbound", body=user_text
+                )
+
+        matched, hit_keywords = escalation.detect(user_text, agent.escalation_keywords)
+        if matched:
+            await escalation.ping_operator(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                owner_phone=agent.owner_phone,
+                phone_number_id=phone_number_id,
+                access_token=access_token,
+                customer_phone=from_wa_id,
+                customer_name=sender_name,
+                message_body=user_text,
+                keywords=hit_keywords,
+                paperclip_issue_id=sess.paperclip_issue_id,
+            )
+
         ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
         history_r = await db.execute(
             select(ChatMessage)
@@ -464,6 +501,8 @@ async def _process_whatsapp_message(
             )
         )
         sess.last_message_at = datetime.now(timezone.utc)
+        # Capture mirror target before the session closes.
+        paperclip_issue_id_for_outbound = sess.paperclip_issue_id
         await db.commit()
 
     # Send the reply outside the DB session so we aren't holding a connection
@@ -481,6 +520,21 @@ async def _process_whatsapp_message(
         )
     except Exception as e:
         logger.error(f"[WhatsApp] Failed to send reply to {from_wa_id}: {e}")
+
+    # ── Phase B.6: Paperclip mirror outbound ──
+    # Fire-and-forget after the customer reply is sent; Paperclip outage
+    # never delays or breaks the customer-facing path.
+    if paperclip_issue_id_for_outbound:
+        from app.services import paperclip_mirror
+
+        if paperclip_mirror.is_enabled():
+            asyncio.create_task(
+                paperclip_mirror.mirror_message(
+                    issue_id=paperclip_issue_id_for_outbound,
+                    direction="outbound",
+                    body=reply_text,
+                )
+            )
 
 
 # ─── Media ingress (B.3) ─────────────────────────────────

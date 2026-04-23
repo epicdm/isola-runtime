@@ -49,12 +49,25 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
 
+# Populate Base.metadata — we select Agent in B.6 which has FKs to
+# tenants, users, llm_models, so those tables must be known to the
+# mapper or sort_tables() raises NoReferencedTableError.
+from app.models import tenant as _tenant  # noqa: F401
+from app.models import user as _user  # noqa: F401
+from app.models import llm as _llm  # noqa: F401
+from app.models import channel_config as _channel_config  # noqa: F401
+from app.models import agent as _agent  # noqa: F401
+from app.models import chat_session as _chat_session  # noqa: F401
+from app.models import audit as _audit  # noqa: F401
+from app.models import participant as _participant  # noqa: F401
+
 
 # ─── Fixtures (shared state chain) ───────────────────────────────────
 
 
 BACKEND = "http://localhost:8000"
 MOCK_META_PORT = 8901
+MOCK_PAPERCLIP_PORT = 8902
 
 
 @pytest.fixture
@@ -106,6 +119,82 @@ async def mock_meta():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", MOCK_META_PORT)
+    await site.start()
+    try:
+        yield records
+    finally:
+        await runner.cleanup()
+
+
+@pytest.fixture
+async def mock_paperclip():
+    """In-process Paperclip mock on localhost:8902.
+
+    Implements the 3 endpoints our B.6 port actually hits:
+      POST /api/companies/{company_id}/issues  -> create_issue
+      POST /api/issues/{issue_id}/comments     -> post_comment
+      GET  /api/issues/{issue_id}              -> status check
+
+    Records every call so tests can assert on the fanout shape.
+    Requires Authorization: Bearer <anything>.
+    """
+    records: list[dict] = []
+    # Counter for issue ids
+    seq = {"n": 0}
+
+    def _require_bearer(request):
+        auth = request.headers.get("Authorization", "")
+        return auth.startswith("Bearer ")
+
+    async def create_issue(request):
+        if not _require_bearer(request):
+            return web.Response(status=401, text="missing bearer")
+        company_id = request.match_info["company_id"]
+        body = await request.json()
+        seq["n"] += 1
+        issue_id = f"mock-issue-{seq['n']:04d}"
+        records.append({
+            "op": "create_issue",
+            "company_id": company_id,
+            "body": body,
+            "issue_id": issue_id,
+        })
+        return web.json_response({
+            "id": issue_id,
+            "companyId": company_id,
+            "identifier": f"EPI-{seq['n']}",
+            "title": body.get("title", ""),
+            "status": "backlog",
+            "createdAt": "2026-04-23T00:00:00Z",
+        })
+
+    async def post_comment(request):
+        if not _require_bearer(request):
+            return web.Response(status=401, text="missing bearer")
+        issue_id = request.match_info["issue_id"]
+        body = await request.json()
+        records.append({
+            "op": "post_comment",
+            "issue_id": issue_id,
+            "body": body.get("body", ""),
+        })
+        return web.json_response({"id": f"comment-{len(records)}"}, status=201)
+
+    async def get_issue(request):
+        if not _require_bearer(request):
+            return web.Response(status=401, text="missing bearer")
+        issue_id = request.match_info["issue_id"]
+        records.append({"op": "get_issue", "issue_id": issue_id})
+        return web.json_response({"id": issue_id, "status": "backlog"})
+
+    app = web.Application()
+    app.router.add_post("/api/companies/{company_id}/issues", create_issue)
+    app.router.add_post("/api/issues/{issue_id}/comments", post_comment)
+    app.router.add_get("/api/issues/{issue_id}", get_issue)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", MOCK_PAPERCLIP_PORT)
     await site.start()
     try:
         yield records
@@ -703,8 +792,155 @@ async def _phase_b5_template_send(http, test_state, fake_creds, mock_meta):
     assert types == ["header", "body"], f"component types mismatch: {types}"
 
 
-async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, db_session):
-    """Run B.1 -> B.2 -> B.3 -> B.4 -> B.5 as one dependent chain.
+async def _phase_b6_paperclip_escalation(
+    http, test_state, fake_creds, mock_meta, mock_paperclip, db_session
+):
+    """B.6: Paperclip mirror + operator escalation ping on inbound keyword.
+
+    Depends on B.5. Configures agent.owner_phone + escalation_keywords +
+    paperclip_company_id via direct DB update, then sends a signed inbound
+    text that trips an escalation keyword. Asserts:
+
+      - mock Paperclip POST /api/companies/<company>/issues once
+      - mock Paperclip POST /api/issues/<id>/comments for inbound (prefixed 🟦)
+      - mock Meta send_text_message to OWNER_PHONE (the 🚨 escalation ping)
+      - mock Meta send_text_message to CUSTOMER (LLM reply, even if no-model)
+      - mock Paperclip POST /api/issues/<id>/comments for outbound (prefixed 🟩)
+    """
+    from app.models.agent import Agent
+    from app.services.escalation import reset_dedup
+
+    # Reset in-process dedup so tests aren't poisoned by B.2's prior run
+    # (this run is the first escalation for this customer in this process).
+    reset_dedup()
+
+    agent_id = test_state["agent_id"]
+    owner_phone = "17678189999"
+    paperclip_company_id = "test-company-b6"
+
+    # Configure the test agent's Paperclip + escalation fields directly.
+    Session = db_session
+    async with Session() as db:
+        ag_r = await db.execute(select(Agent).where(Agent.id == uuid.UUID(agent_id)))
+        agent = ag_r.scalar_one_or_none()
+        assert agent is not None
+        agent.owner_phone = owner_phone
+        agent.paperclip_company_id = paperclip_company_id
+        agent.escalation_keywords = ["refund", "urgent"]
+        await db.commit()
+
+    # Use a fresh customer phone so this is Paperclips first inbound for
+    # this agent+customer pair (forces create_issue, not just post_comment).
+    suffix = test_state["suffix"]
+    customer_phone = "15559997777"
+    msg_id = f"wamid.test-b6-{suffix}"
+    user_text = "I need a refund urgently — this is broken"
+
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": fake_creds["waba_id"],
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "17678180000",
+                        "phone_number_id": fake_creds["phone_number_id"],
+                    },
+                    "contacts": [{
+                        "profile": {"name": "B6 Test"},
+                        "wa_id": customer_phone,
+                    }],
+                    "messages": [{
+                        "from": customer_phone,
+                        "id": msg_id,
+                        "timestamp": str(int(time.time())),
+                        "type": "text",
+                        "text": {"body": user_text},
+                    }],
+                },
+                "field": "messages",
+            }],
+        }],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    signature = _sign(body, fake_creds["app_secret"])
+
+    meta_pre = len(mock_meta)
+    pc_pre = len(mock_paperclip)
+
+    r = await http.post(
+        f"/api/channel/whatsapp/{agent_id}/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-hub-signature-256": signature,
+        },
+    )
+    assert r.status_code == 200
+
+    # Poll for up to 30s until we see the full fanout
+    deadline = time.monotonic() + 30.0
+    saw = {
+        "issue_created": False,
+        "inbound_mirror": False,
+        "operator_ping": False,
+        "customer_reply": False,
+        "outbound_mirror": False,
+    }
+    issue_id: str | None = None
+    while time.monotonic() < deadline:
+        for rec in mock_paperclip[pc_pre:]:
+            if rec.get("op") == "create_issue" and rec.get("company_id") == paperclip_company_id:
+                saw["issue_created"] = True
+                issue_id = rec.get("issue_id")
+            if rec.get("op") == "post_comment" and issue_id and rec.get("issue_id") == issue_id:
+                body_s = rec.get("body", "")
+                if "🟦 Customer" in body_s:
+                    saw["inbound_mirror"] = True
+                elif "🟩 Agent" in body_s:
+                    saw["outbound_mirror"] = True
+        for rec in mock_meta[meta_pre:]:
+            if rec.get("op") != "send_message":
+                continue
+            body_s = rec.get("body", {}) or {}
+            to = body_s.get("to", "")
+            text = (body_s.get("text") or {}).get("body", "")
+            if to == owner_phone and "Escalation" in text:
+                saw["operator_ping"] = True
+            elif to == customer_phone and body_s.get("type") == "text":
+                saw["customer_reply"] = True
+        if all(saw.values()):
+            break
+        await asyncio.sleep(0.5)
+
+    missing = [k for k, v in saw.items() if not v]
+    assert not missing, (
+        f"B.6 fanout incomplete. missing={missing} "
+        f"paperclip_records={mock_paperclip[pc_pre:]} "
+        f"meta_records={mock_meta[meta_pre:]}"
+    )
+
+    # ChatSession should have paperclip_issue_id populated
+    from app.models.chat_session import ChatSession
+
+    async with Session() as db:
+        sess_r = await db.execute(
+            select(ChatSession).where(
+                ChatSession.agent_id == uuid.UUID(agent_id),
+                ChatSession.external_conv_id == f"wa:{customer_phone}",
+            )
+        )
+        sess = sess_r.scalar_one_or_none()
+        assert sess is not None
+        assert sess.paperclip_issue_id == issue_id, (
+            f"session paperclip_issue_id mismatch: got {sess.paperclip_issue_id!r} "
+            f"expected {issue_id!r}"
+        )
+
+
+async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paperclip, db_session):
+    """Run B.1 -> B.2 -> B.3 -> B.4 -> B.5 -> B.6 as one dependent chain.
 
     Single test function so module-scoped fixtures stay on one event loop.
     Each phase's assertions must pass before the next phase runs — if an
@@ -729,3 +965,9 @@ async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, db_session
     print("--- Phase B.5: template send (simple + rich components) ---")
     await _phase_b5_template_send(http, test_state, fake_creds, mock_meta)
     print("Phase B.5 PASS")
+
+    print("--- Phase B.6: Paperclip mirror + operator escalation ping ---")
+    await _phase_b6_paperclip_escalation(
+        http, test_state, fake_creds, mock_meta, mock_paperclip, db_session
+    )
+    print("Phase B.6 PASS")
