@@ -256,6 +256,77 @@ class WhatsAppService:
             resp.raise_for_status()
             return resp.json()
 
+    async def send_template(
+        self,
+        *,
+        phone_number_id: str,
+        access_token: str,
+        to: str,
+        template_name: str,
+        language: str = "en_US",
+        body_params: list[str] | None = None,
+        components: list[dict] | None = None,
+    ) -> dict:
+        """Send a pre-approved template message.
+
+        Meta requires templates for any business-initiated send outside the
+        24h customer-service window. Templates are registered + approved in
+        Meta Business Manager; the send names the template and fills its
+        {{1}}, {{2}}, ... variable slots.
+
+        Simple path — pass body_params as a list of strings, one per body
+        variable in order:
+
+            await send_template(
+                ..., template_name="reservation_reminder",
+                language="en_US",
+                body_params=["John", "7:00 PM"],
+            )
+
+        Rich path — pass pre-built components (header media / quick-reply
+        buttons / URL buttons) directly as the components list, per Meta's
+        reference:
+          https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages#template-object
+
+        body_params and components are mutually exclusive; if components is
+        non-None it's used as-is.
+        """
+        if components is None:
+            components = []
+            if body_params:
+                components.append({
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": str(p)} for p in body_params
+                    ],
+                })
+
+        url = f"{META_GRAPH_API_BASE}/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language},
+                "components": components,
+            },
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"[WhatsApp] send_template failed "
+                    f"status={resp.status_code} body={resp.text[:500]}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+
     async def send_interactive_list(
         self,
         *,

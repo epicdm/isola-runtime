@@ -629,8 +629,82 @@ async def _phase_b4_interactive(http, test_state, fake_creds, mock_meta, db_sess
         assert "[button:confirm_btn]" in latest.content
 
 
+async def _phase_b5_template_send(http, test_state, fake_creds, mock_meta):
+    """B.5: outbound pre-approved template send with variable substitution.
+
+    Depends on B.4 (proves the service + mock-Meta wiring is healthy).
+    Asserts the Meta Graph payload shape: type=template, template.name,
+    template.language.code, template.components[0].type=body,
+    parameters in order matching body_params.
+    """
+    from app.services.whatsapp_service import whatsapp_service
+
+    pre = len(mock_meta)
+    await whatsapp_service.send_template(
+        phone_number_id=fake_creds["phone_number_id"],
+        access_token=fake_creds["access_token"],
+        to="15551234567",
+        template_name="reservation_reminder",
+        language="en_US",
+        body_params=["John", "7:00 PM"],
+    )
+    record = next(
+        (r for r in mock_meta[pre:] if r.get("op") == "send_message"
+         and r.get("body", {}).get("type") == "template"),
+        None,
+    )
+    assert record is not None, f"template send not observed: {mock_meta[pre:]}"
+    body = record["body"]
+    template = body["template"]
+    assert template["name"] == "reservation_reminder"
+    assert template["language"] == {"code": "en_US"}
+
+    components = template["components"]
+    assert len(components) == 1
+    assert components[0]["type"] == "body"
+    params = components[0]["parameters"]
+    assert [p["text"] for p in params] == ["John", "7:00 PM"], \
+        f"body params mismatch: {params}"
+    assert all(p["type"] == "text" for p in params)
+
+    # Rich path: pre-built components override body_params cleanly.
+    pre = len(mock_meta)
+    await whatsapp_service.send_template(
+        phone_number_id=fake_creds["phone_number_id"],
+        access_token=fake_creds["access_token"],
+        to="15551234567",
+        template_name="order_shipped",
+        language="en_US",
+        components=[
+            {
+                "type": "header",
+                "parameters": [
+                    {"type": "text", "text": "TRACKING-42"},
+                ],
+            },
+            {
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "text": "John"},
+                    {"type": "text", "text": "Tuesday"},
+                ],
+            },
+        ],
+    )
+    record = next(
+        (r for r in mock_meta[pre:] if r.get("op") == "send_message"
+         and r.get("body", {}).get("type") == "template"
+         and r.get("body", {}).get("template", {}).get("name") == "order_shipped"),
+        None,
+    )
+    assert record is not None
+    rich_components = record["body"]["template"]["components"]
+    types = [c["type"] for c in rich_components]
+    assert types == ["header", "body"], f"component types mismatch: {types}"
+
+
 async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, db_session):
-    """Run B.1 -> B.2 -> B.3 -> B.4 as one dependent chain.
+    """Run B.1 -> B.2 -> B.3 -> B.4 -> B.5 as one dependent chain.
 
     Single test function so module-scoped fixtures stay on one event loop.
     Each phase's assertions must pass before the next phase runs — if an
@@ -651,3 +725,7 @@ async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, db_session
     print("--- Phase B.4: interactive outbound (buttons+list) + inbound button_reply ---")
     await _phase_b4_interactive(http, test_state, fake_creds, mock_meta, db_session)
     print("Phase B.4 PASS")
+
+    print("--- Phase B.5: template send (simple + rich components) ---")
+    await _phase_b5_template_send(http, test_state, fake_creds, mock_meta)
+    print("Phase B.5 PASS")
