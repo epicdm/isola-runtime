@@ -24,11 +24,11 @@ _LLM_TIMEOUT_SECONDS_DEFAULT = 180.0
 # File-received acknowledgement messages (rotated randomly by channel
 # adapters that need to ack an inbound file before the LLM responds).
 _FILE_ACK_MESSAGES = [
-    "收到你的文件，请问有什么需要帮忙的？",
-    "文件收到了！你想让我怎么处理它？",
-    "好的，我已经收到这份文件，请告诉我你的需求~",
-    "已收到文件，随时准备好为你处理！",
-    "收到！请问希望我对这份文件做什么？",
+    "Got your file — how can I help with it?",
+    "File received! What would you like me to do with it?",
+    "Thanks, I have the file. What's the next step?",
+    "File in hand. Ready whenever you are.",
+    "Received. What would you like me to do with it?",
 ]
 
 
@@ -69,7 +69,7 @@ async def _call_agent_llm(
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = agent_result.scalar_one_or_none()
     if not agent:
-        return "⚠️ 数字员工未找到"
+        return "⚠️ Agent not found"
 
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
@@ -96,7 +96,7 @@ async def _call_agent_llm(
         logger.warning(f"[Channel] Primary model unavailable, using fallback: {model.model}")
 
     if not model:
-        return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
+        return f"⚠️ {agent.name} has no LLM model configured. Set one in admin."
 
     messages: list[dict] = []
     ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
@@ -208,4 +208,4 @@ async def _call_agent_llm(
             except Exception as e2:
                 traceback.print_exc()
                 return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
-        return f"⚠️ 调用模型出错: {error_msg[:150]}"
+        return f"⚠️ Model call failed: {error_msg[:150]}"

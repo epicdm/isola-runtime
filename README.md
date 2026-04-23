@@ -1,4 +1,41 @@
 <p align="center">
+  <img src="assets/Clawith_slogan.png" alt="isola-runtime — forked from Clawith" width="800" />
+</p>
+
+# isola-runtime
+
+**Python/FastAPI agent runtime for [Isola](https://isola.epic.dm) — EPIC Communications' AI front-desk platform for Caribbean small businesses.**
+
+Forked from [dataelement/clawith](https://github.com/dataelement/clawith) (Apache 2.0) on 2026-04-23. The original project — Clawith — is an enterprise "digital employee" platform built on the OpenClaw protocol. This fork adapts it to the Caribbean SMB market:
+
+- **Stripped:** Feishu / WeCom / DingTalk / Atlassian Rovo / AgentBay channels, OpenClaw edge gateway, Chinese-locale defaults.
+- **Kept:** Slack, Discord, Microsoft Teams, Plaza (agent marketplace), A2A relationship-gated collaboration, AgentTrigger pulse engine, autonomy policy (L1/L2/L3), template + skill seeders, websocket tool-calling loop with 50-round budget, MCP client.
+- **Coming (Phase B):** WhatsApp Business Cloud API channel, vertical AgentTemplates (Rex / Mara / Joey × restaurant / hotel / clinic / retail / service).
+
+## Status
+
+- Phase A (strip + rebrand) — **in progress** on `phase-a-strip` branch.
+- Phase B (WhatsApp channel) — 4–6 weeks, post Phase A merge.
+- Phase C (vertical templates) — 2–3 weeks after Phase B.
+- Phase D (apps/isola UI swap) — ongoing.
+- Phase E (connector MCPs — Odoo, Chatwoot, LiveKit, Fiserv) — ongoing.
+
+## Where this runs
+
+- Backend: `/opt/isola-runtime/backend` on the EPIC dev host, Python 3.12 / FastAPI / PostgreSQL / Redis.
+- UI: [apps/isola](https://github.com/epicdm/isola-mvp/tree/main/apps/isola) — Next.js 15, deployed to `isola.epic.dm` via Vercel. Will call this runtime's API once Phase D lands.
+
+## Upstream
+
+Upstream Clawith is still actively developed at [dataelement/clawith](https://github.com/dataelement/clawith) — we pull from it **selectively**, carrying our own patches forward in this fork. Our rebrand baseline is tagged `clawith-pristine`.
+
+## Original Clawith documentation
+
+The upstream Clawith README is preserved below the divider for reference during Phase A. It will be replaced with an Isola-focused doc set in Phase A.5.
+
+---
+
+<p align="center">
   <img src="assets/Clawith_slogan.png" alt="Clawith — OpenClaw for Teams" width="800" />
 </p>
 
