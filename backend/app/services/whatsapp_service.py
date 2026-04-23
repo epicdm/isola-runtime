@@ -118,5 +118,103 @@ class WhatsAppService:
             # Typing failures are non-fatal — return the response regardless.
             return resp.json() if resp.status_code < 400 else {}
 
+    async def download_media(
+        self,
+        *,
+        media_id: str,
+        access_token: str,
+    ) -> tuple[bytes, str, str]:
+        """Fetch inbound media bytes from Meta in the standard 2-step flow.
+
+        Step 1: GET /{media_id} → JSON with a short-lived signed `url` field.
+        Step 2: GET that signed url (authenticated) → raw bytes.
+
+        Returns (bytes, mime_type, sha256). Raises httpx.HTTPError on failure;
+        the caller should log + return a graceful reply to the customer.
+        """
+        headers = {"Authorization": f"Bearer {access_token}"}
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            meta_resp = await client.get(
+                f"{META_GRAPH_API_BASE}/{media_id}", headers=headers
+            )
+            meta_resp.raise_for_status()
+            meta = meta_resp.json()
+            signed_url = meta.get("url")
+            mime_type = meta.get("mime_type", "application/octet-stream")
+            sha256 = meta.get("sha256", "")
+            if not signed_url:
+                raise ValueError(f"No download url in Meta response: {meta}")
+
+            file_resp = await client.get(signed_url, headers=headers)
+            file_resp.raise_for_status()
+            return file_resp.content, mime_type, sha256
+
+    async def send_image_by_url(
+        self,
+        *,
+        phone_number_id: str,
+        access_token: str,
+        to: str,
+        image_url: str,
+        caption: str = "",
+    ) -> dict:
+        """Send an image to a WhatsApp user by public URL.
+
+        Meta requires the URL to be publicly accessible (HTTPS, no auth,
+        TLS 1.2+, valid cert). For private images use upload_media first
+        and send via media_id (send_media_by_id, to be added when needed).
+        """
+        url = f"{META_GRAPH_API_BASE}/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "image",
+            "image": {"link": image_url},
+        }
+        if caption:
+            payload["image"]["caption"] = caption[:1024]  # Meta caps caption at 1024.
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"[WhatsApp] send_image_by_url failed "
+                    f"status={resp.status_code} body={resp.text[:500]}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+
+
+# Extension map: MIME prefix -> default file extension when Meta doesn't
+# give us a usable filename. Covers the common Cloud API media types.
+_DEFAULT_EXT = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/amr": ".amr",
+    "video/mp4": ".mp4",
+    "video/3gpp": ".3gp",
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+}
+
+
+def guess_extension(mime_type: str) -> str:
+    """Map a MIME type to a file extension (best-effort, defaults to .bin)."""
+    return _DEFAULT_EXT.get(mime_type.split(";", 1)[0].strip().lower(), ".bin")
+
 
 whatsapp_service = WhatsAppService()

@@ -309,26 +309,49 @@ async def _process_whatsapp_message(
         logger.error(f"[WhatsApp] agent={agent_id} missing phone_number_id or access_token")
         return
 
-    # Only text in B.2. For other types, send a graceful stub reply so the
-    # customer knows we got the message. B.3 handles media; B.4 handles
-    # interactive button replies.
-    if msg_type != "text":
-        logger.info(f"[WhatsApp] agent={agent_id} ignoring {msg_type} msg id={msg_id}")
+    # B.3: handle text + media (image, audio, voice, video, document, sticker).
+    # B.4 adds interactive button/list replies. Types we still skip with a
+    # short ack: reaction, location, contacts.
+    user_text = ""
+    media_markers: list[str] = []
+
+    if msg_type == "text":
+        user_text = (msg.get("text") or {}).get("body", "").strip()
+    elif msg_type in {"image", "audio", "voice", "video", "document", "sticker"}:
+        media_markers = await _ingest_whatsapp_media(
+            agent_id=agent_id,
+            msg=msg,
+            msg_type=msg_type,
+            access_token=access_token,
+        )
+        # Include the customer's caption if they added one (image/video/document).
+        caption = (msg.get(msg_type) or {}).get("caption", "").strip() if msg_type in {"image", "video", "document"} else ""
+        if caption:
+            user_text = caption
+    elif msg_type == "reaction":
+        logger.info(f"[WhatsApp] agent={agent_id} ignoring reaction id={msg_id}")
+        return
+    else:
+        logger.info(f"[WhatsApp] agent={agent_id} ignoring unsupported type={msg_type} id={msg_id}")
         try:
             await whatsapp_service.send_text_message(
                 phone_number_id=phone_number_id,
                 access_token=access_token,
                 to=from_wa_id,
-                text=(
-                    "Got your message. I can only read plain text right now — "
-                    "media and interactive messages land in the next release."
-                ),
+                text="Got your message, but I don't handle that message type yet.",
             )
         except Exception as e:
-            logger.error(f"[WhatsApp] non-text stub reply failed: {e}")
+            logger.error(f"[WhatsApp] unsupported-type stub reply failed: {e}")
         return
 
-    user_text = (msg.get("text") or {}).get("body", "").strip()
+    # For media-only messages (no caption), synthesize a content line so the
+    # LLM sees what the customer sent. The Agent can later read the file
+    # from its workspace via the list_files / read_file tools.
+    if media_markers and not user_text:
+        user_text = " ".join(media_markers)
+    elif media_markers and user_text:
+        user_text = f"{user_text} {' '.join(media_markers)}"
+
     if not user_text:
         return
 
@@ -448,3 +471,70 @@ async def _process_whatsapp_message(
         )
     except Exception as e:
         logger.error(f"[WhatsApp] Failed to send reply to {from_wa_id}: {e}")
+
+
+# ─── Media ingress (B.3) ─────────────────────────────────
+
+
+async def _ingest_whatsapp_media(
+    *,
+    agent_id: uuid.UUID,
+    msg: dict,
+    msg_type: str,
+    access_token: str,
+) -> list[str]:
+    """Download inbound media to the agent workspace, return [file:...] markers.
+
+    Meta passes media objects like {"id": "...", "mime_type": "...", "filename": "..."}
+    nested under the type key ("image", "document", etc.). We download each,
+    save it under `<agent_data>/<agent_id>/workspace/uploads/`, and return
+    marker strings that get appended to user_text so the LLM knows what the
+    customer sent.
+
+    Failures log and return a single "[<type>:upload-failed]" marker so the
+    customer still gets a reply acknowledging the media was received.
+    """
+    from pathlib import Path
+
+    from app.config import get_settings
+    from app.services.whatsapp_service import guess_extension
+
+    media_obj = msg.get(msg_type) or {}
+    media_id = media_obj.get("id", "")
+    if not media_id:
+        return [f"[{msg_type}:no-media-id]"]
+
+    settings = get_settings()
+    upload_dir = Path(settings.AGENT_DATA_DIR) / str(agent_id) / "workspace" / "uploads"
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"[WhatsApp] upload dir create failed: {e}")
+        return [f"[{msg_type}:upload-dir-failed]"]
+
+    try:
+        data, mime_type, _sha = await whatsapp_service.download_media(
+            media_id=media_id,
+            access_token=access_token,
+        )
+    except Exception as e:
+        logger.error(f"[WhatsApp] Media download failed id={media_id}: {e}")
+        return [f"[{msg_type}:download-failed]"]
+
+    # Prefer Meta's filename (documents) when present, else synthesize.
+    filename = media_obj.get("filename") or f"wa_{msg_type}_{media_id[:12]}{guess_extension(mime_type)}"
+    # Drop any path components to keep writes inside upload_dir.
+    filename = filename.replace("/", "_").replace("\\", "_")
+    out_path = upload_dir / filename
+
+    try:
+        out_path.write_bytes(data)
+    except Exception as e:
+        logger.error(f"[WhatsApp] Media save failed to {out_path}: {e}")
+        return [f"[{msg_type}:save-failed]"]
+
+    logger.info(
+        f"[WhatsApp] agent={agent_id} saved {msg_type} "
+        f"{filename} ({len(data)} bytes, {mime_type})"
+    )
+    return [f"[{msg_type}:workspace/uploads/{filename}]"]
