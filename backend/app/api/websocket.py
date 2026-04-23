@@ -142,7 +142,6 @@ async def websocket_chat(
 
     # Verify access and load agent + model
     agent_name = ""
-    agent_type = ""  # Track agent type for OpenClaw routing
     role_description = ""
     welcome_message = ""
     llm_model = None
@@ -168,11 +167,10 @@ async def websocket_chat(
                 await websocket.close(code=4003)
                 return
             agent_name = agent.name
-            agent_type = agent.agent_type or ""
             role_description = agent.role_description or ""
             welcome_message = agent.welcome_message or ""
             ctx_size = agent.context_window_size or 100
-            logger.info(f"[WS] Agent: {agent_name}, type: {agent_type}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
+            logger.info(f"[WS] Agent: {agent_name}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
 
             # Load the agent's primary model
             if agent.primary_model_id:
@@ -407,27 +405,6 @@ async def websocket_chat(
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
             logger.info("[WS] User message saved")
-
-            # ── OpenClaw routing: insert into gateway_messages instead of LLM ──
-            if agent_type == "openclaw":
-                from app.models.gateway_message import GatewayMessage as GwMsg
-                async with async_session() as db:
-                    gw_msg = GwMsg(
-                        agent_id=agent_id,
-                        sender_user_id=user_id,
-                        conversation_id=conv_id,
-                        content=content,
-                        status="pending",
-                    )
-                    db.add(gw_msg)
-                    await db.commit()
-                logger.info("[WS] OpenClaw: message queued for gateway poll")
-                await websocket.send_json({
-                    "type": "done",
-                    "role": "assistant",
-                    "content": "Message forwarded to OpenClaw agent. Waiting for response..."
-                })
-                continue
 
             # Detect task creation intent
             import re

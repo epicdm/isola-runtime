@@ -17,10 +17,7 @@ DEFAULT_CONTEXT_WINDOW_SIZE = 100
 
 
 class Agent(Base):
-    """Digital employee (Agent) instance.
-
-    agent_type: 'native' (platform-hosted) or 'openclaw' (remote OpenClaw bot).
-    """
+    """Digital employee (Agent) instance."""
 
     __tablename__ = "agents"
 
@@ -34,13 +31,6 @@ class Agent(Base):
     # Ownership
     creator_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"))
-
-    # Agent type: 'native' (platform-hosted LLM) or 'openclaw' (remote OpenClaw bot)
-    agent_type: Mapped[str] = mapped_column(String(20), default="native", nullable=False)
-    # API key hash for OpenClaw gateway authentication
-    api_key_hash: Mapped[str | None] = mapped_column(String(128))
-    # Last time OpenClaw polled the gateway (online status indicator)
-    openclaw_last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Runtime
     status: Mapped[str] = mapped_column(
@@ -116,11 +106,6 @@ class Agent(Base):
 
     # Relationships
     creator: Mapped["User"] = relationship("User", back_populates="created_agents", foreign_keys=[creator_id])
-
-    @property
-    def has_api_key(self) -> bool:
-        """Whether this agent has an API key configured."""
-        return bool(self.api_key_hash)
     permissions: Mapped[list["AgentPermission"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     tasks: Mapped[list["Task"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     channel_config: Mapped["ChannelConfig | None"] = relationship(back_populates="agent", uselist=False)
