@@ -431,28 +431,6 @@ async def websocket_chat(
                     
                     async def tool_call_to_ws(data: dict):
                         """Send tool call info to client and persist completed ones."""
-                        if data.get("status") == "done":
-                            try:
-                                from app.services.agentbay_live import detect_agentbay_env, get_desktop_screenshot, get_browser_snapshot
-
-                                tool_name = data.get("name", "")
-                                env = detect_agentbay_env(tool_name)
-                                if env == "desktop":
-                                    b64_url = await get_desktop_screenshot(agent_id, session_id=conv_id)
-                                    if b64_url:
-                                        data["live_preview"] = {"env": env, "screenshot_url": b64_url}
-                                        logger.info(f"[WS][LivePreview] Embedded {env} base64 in tool_call")
-                                elif env == "browser":
-                                    b64_url = await get_browser_snapshot(agent_id, session_id=conv_id)
-                                    if b64_url:
-                                        data["live_preview"] = {"env": env, "screenshot_url": b64_url}
-                                        logger.info(f"[WS][LivePreview] Embedded {env} base64 in tool_call")
-                                elif env == "code":
-                                    tool_result = data.get("result", "") or ""
-                                    data["live_preview"] = {"env": "code", "output": tool_result[:5000]}
-                            except Exception as _lp_err:
-                                logger.warning(f"[WS][LivePreview] Embed failed: {_lp_err}")
-
                         await websocket.send_json({"type": "tool_call", **data})
                         # Save completed tool calls to DB so they persist in chat history
                         if data.get("status") == "done":

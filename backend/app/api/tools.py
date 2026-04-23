@@ -331,9 +331,6 @@ async def get_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Get tools for a specific agent with their enabled status."""
-    from app.services.agent_tools import _agent_has_feishu
-    has_feishu = await _agent_has_feishu(agent_id)
-
     # All available tools
     all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
     all_tools = all_tools_r.scalars().all()
@@ -344,9 +341,6 @@ async def get_agent_tools(
 
     result = []
     for t in all_tools:
-        # Hide feishu tools for agents without Feishu channel
-        if t.category == "feishu" and not has_feishu:
-            continue
         tid = str(t.id)
         at = assignments.get(tid)
         # MCP tools installed by agents only show for that agent.
@@ -659,9 +653,6 @@ async def get_agent_tools_with_config(
     rather than Tool.config. We resolve those as part of the global config so
     the agent-level UI can show the inherited key hint.
     """
-    from app.services.agent_tools import _agent_has_feishu
-    has_feishu = await _agent_has_feishu(agent_id)
-
     all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
     all_tools = all_tools_r.scalars().all()
     agent_tools_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
@@ -678,9 +669,6 @@ async def get_agent_tools_with_config(
 
     result = []
     for t in all_tools:
-        # Hide feishu tools for agents without Feishu channel
-        if t.category == "feishu" and not has_feishu:
-            continue
         tid = str(t.id)
         at = assignments.get(tid)
         # MCP tools installed by agents only show for that agent.
