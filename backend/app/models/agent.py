@@ -32,14 +32,18 @@ class Agent(Base):
     creator_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("tenants.id"))
 
+    # Paperclip management-plane mirror + owner escalation (Phase B.6)
+    owner_phone: Mapped[str | None] = mapped_column(String(32))
+    paperclip_agent_id: Mapped[str | None] = mapped_column(String(64))
+    paperclip_company_id: Mapped[str | None] = mapped_column(String(64))
+    escalation_keywords: Mapped[list] = mapped_column(JSON, default=list)
+
     # Runtime
     status: Mapped[str] = mapped_column(
         Enum("creating", "running", "idle", "stopped", "error", name="agent_status_enum", create_constraint=False),
         default="creating",
         nullable=False,
     )
-    container_id: Mapped[str | None] = mapped_column(String(100))
-    container_port: Mapped[int | None] = mapped_column(Integer)
 
     # LLM config
     primary_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
