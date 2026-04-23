@@ -18,7 +18,8 @@ import httpx
 from loguru import logger
 
 
-META_GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
+import os
+META_GRAPH_API_BASE = os.environ.get("WHATSAPP_GRAPH_BASE_URL") or "https://graph.facebook.com/v21.0"
 
 
 class WhatsAppService:
