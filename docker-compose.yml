@@ -3,15 +3,15 @@ services:
     image: postgres:15-alpine
     restart: unless-stopped
     networks:
-      - clawith_dev
+      - isolaruntime_dev
     environment:
-      POSTGRES_USER: clawith
-      POSTGRES_PASSWORD: clawith
-      POSTGRES_DB: clawith
+      POSTGRES_USER: isolaruntime
+      POSTGRES_PASSWORD: isolaruntime
+      POSTGRES_DB: isolaruntime
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U clawith" ]
+      test: [ "CMD-SHELL", "pg_isready -U isolaruntime" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -20,7 +20,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     networks:
-      - clawith_dev
+      - isolaruntime_dev
     volumes:
       - redisdata:/data
     healthcheck:
@@ -38,16 +38,14 @@ services:
     restart: unless-stopped
     command: ["/bin/bash", "/app/entrypoint.sh"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://clawith:clawith@postgres:5432/clawith
+      DATABASE_URL: postgresql+asyncpg://isolaruntime:isolaruntime@postgres:5432/isolaruntime
       REDIS_URL: redis://redis:6379/0
       AGENT_DATA_DIR: /data/agents
       AGENT_TEMPLATE_DIR: /app/agent_template
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-jwt-secret}
       CORS_ORIGINS: '["*"]'
-      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
-      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
-      DOCKER_NETWORK: clawith_yaojin_network
+      DOCKER_NETWORK: isola_runtime_network
       SS_CONFIG_FILE: /data/ss-nodes.json
       # Public base URL for constructing OAuth callback URLs and email links.
       # Required when deployed behind a reverse proxy (e.g. Nginx, Cloudflare).
@@ -61,7 +59,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./ss-nodes.json:/data/ss-nodes.json:ro
     networks:
-      - clawith_dev
+      - isolaruntime_dev
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,7 +81,7 @@ services:
       - ./frontend/src:/app/src
       - ./frontend/public:/app/public
     networks:
-      - clawith_dev
+      - isolaruntime_dev
     depends_on:
       - backend
 
@@ -93,5 +91,5 @@ volumes:
 
 
 networks:
-  clawith_dev:
-    name: clawith_yaojin_network
+  isolaruntime_dev:
+    name: isola_runtime_network

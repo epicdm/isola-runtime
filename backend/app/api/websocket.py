@@ -142,7 +142,6 @@ async def websocket_chat(
 
     # Verify access and load agent + model
     agent_name = ""
-    agent_type = ""  # Track agent type for OpenClaw routing
     role_description = ""
     welcome_message = ""
     llm_model = None
@@ -168,11 +167,10 @@ async def websocket_chat(
                 await websocket.close(code=4003)
                 return
             agent_name = agent.name
-            agent_type = agent.agent_type or ""
             role_description = agent.role_description or ""
             welcome_message = agent.welcome_message or ""
             ctx_size = agent.context_window_size or 100
-            logger.info(f"[WS] Agent: {agent_name}, type: {agent_type}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
+            logger.info(f"[WS] Agent: {agent_name}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
 
             # Load the agent's primary model
             if agent.primary_model_id:
@@ -408,27 +406,6 @@ async def websocket_chat(
                 await db.commit()
             logger.info("[WS] User message saved")
 
-            # ── OpenClaw routing: insert into gateway_messages instead of LLM ──
-            if agent_type == "openclaw":
-                from app.models.gateway_message import GatewayMessage as GwMsg
-                async with async_session() as db:
-                    gw_msg = GwMsg(
-                        agent_id=agent_id,
-                        sender_user_id=user_id,
-                        conversation_id=conv_id,
-                        content=content,
-                        status="pending",
-                    )
-                    db.add(gw_msg)
-                    await db.commit()
-                logger.info("[WS] OpenClaw: message queued for gateway poll")
-                await websocket.send_json({
-                    "type": "done",
-                    "role": "assistant",
-                    "content": "Message forwarded to OpenClaw agent. Waiting for response..."
-                })
-                continue
-
             # Detect task creation intent
             import re
             task_match = re.search(
@@ -454,28 +431,6 @@ async def websocket_chat(
                     
                     async def tool_call_to_ws(data: dict):
                         """Send tool call info to client and persist completed ones."""
-                        if data.get("status") == "done":
-                            try:
-                                from app.services.agentbay_live import detect_agentbay_env, get_desktop_screenshot, get_browser_snapshot
-
-                                tool_name = data.get("name", "")
-                                env = detect_agentbay_env(tool_name)
-                                if env == "desktop":
-                                    b64_url = await get_desktop_screenshot(agent_id, session_id=conv_id)
-                                    if b64_url:
-                                        data["live_preview"] = {"env": env, "screenshot_url": b64_url}
-                                        logger.info(f"[WS][LivePreview] Embedded {env} base64 in tool_call")
-                                elif env == "browser":
-                                    b64_url = await get_browser_snapshot(agent_id, session_id=conv_id)
-                                    if b64_url:
-                                        data["live_preview"] = {"env": env, "screenshot_url": b64_url}
-                                        logger.info(f"[WS][LivePreview] Embedded {env} base64 in tool_call")
-                                elif env == "code":
-                                    tool_result = data.get("result", "") or ""
-                                    data["live_preview"] = {"env": "code", "output": tool_result[:5000]}
-                            except Exception as _lp_err:
-                                logger.warning(f"[WS][LivePreview] Embed failed: {_lp_err}")
-
                         await websocket.send_json({"type": "tool_call", **data})
                         # Save completed tool calls to DB so they persist in chat history
                         if data.get("status") == "done":

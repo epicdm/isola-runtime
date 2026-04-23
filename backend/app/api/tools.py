@@ -331,9 +331,6 @@ async def get_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Get tools for a specific agent with their enabled status."""
-    from app.services.agent_tools import _agent_has_feishu
-    has_feishu = await _agent_has_feishu(agent_id)
-
     # All available tools
     all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
     all_tools = all_tools_r.scalars().all()
@@ -344,9 +341,6 @@ async def get_agent_tools(
 
     result = []
     for t in all_tools:
-        # Hide feishu tools for agents without Feishu channel
-        if t.category == "feishu" and not has_feishu:
-            continue
         tid = str(t.id)
         at = assignments.get(tid)
         # MCP tools installed by agents only show for that agent.
@@ -659,9 +653,6 @@ async def get_agent_tools_with_config(
     rather than Tool.config. We resolve those as part of the global config so
     the agent-level UI can show the inherited key hint.
     """
-    from app.services.agent_tools import _agent_has_feishu
-    has_feishu = await _agent_has_feishu(agent_id)
-
     all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
     all_tools = all_tools_r.scalars().all()
     agent_tools_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
@@ -678,9 +669,6 @@ async def get_agent_tools_with_config(
 
     result = []
     for t in all_tools:
-        # Hide feishu tools for agents without Feishu channel
-        if t.category == "feishu" and not has_feishu:
-            continue
         tid = str(t.id)
         at = assignments.get(tid)
         # MCP tools installed by agents only show for that agent.
@@ -915,14 +903,6 @@ async def update_category_config(
 
     await db.commit()
 
-    # Special logic for Atlassian: trigger sync
-    if category == "atlassian":
-        from app.api.atlassian import _sync_atlassian_tools_for_agent
-        import asyncio
-        # Need plaintext key for sync
-        plaintext_key = data.config.get("api_key") or data.config.get("api_secret") or data.config.get("app_secret")
-        asyncio.create_task(_sync_atlassian_tools_for_agent(agent_id, plaintext_key))
-
     return {"ok": True}
 
 
@@ -958,11 +938,4 @@ async def test_category_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Test connectivity for a tool category."""
-    if category == "atlassian":
-        from app.api.atlassian import test_atlassian_channel
-        return await test_atlassian_channel(agent_id, current_user, db)
-    elif category == "agentbay":
-        from app.services.agentbay_client import test_agentbay_channel
-        return await test_agentbay_channel(agent_id, current_user, db)
-
     return {"ok": True, "message": f"Settings for {category} saved."}

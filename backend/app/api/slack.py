@@ -313,7 +313,7 @@ async def slack_event_webhook(
     from pathlib import Path as _Path
     import httpx as _httpx
     from datetime import datetime, timezone
-    from app.api.feishu import _FILE_ACK_MESSAGES
+    from app.api.channel_common import _FILE_ACK_MESSAGES
     _file_user_messages = []
     _settings = _gs()
     _upload_dir = _Path(_settings.AGENT_DATA_DIR) / str(agent_id) / "workspace" / "uploads"
@@ -406,7 +406,7 @@ async def slack_event_webhook(
     _cfs_s_token = _cfs_s.set(_slack_file_sender)
 
     # Call LLM
-    from app.api.feishu import _call_agent_llm
+    from app.api.channel_common import _call_agent_llm
     reply_text = await _call_agent_llm(db, agent_id, user_text, history=history)
     _cfs_s.reset(_cfs_s_token)
     logger.info(f"[Slack] LLM reply: {reply_text[:80]}")

@@ -18,7 +18,6 @@ from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.services.feishu_service import feishu_service
 
 
 class AutonomyService:
@@ -216,50 +215,12 @@ class AutonomyService:
             link=f"/agents/{agent.id}#activityLog",
         )
 
-        # Try Feishu notification if channel is configured
-        channel_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
-        )
-        channel = channel_result.scalars().first()
-
-        if channel and channel.app_id and channel.app_secret:
-            creator_result = await db.execute(
-                select(User).where(User.id == agent.creator_id)
-            )
-            creator = creator_result.scalar_one_or_none()
-            if creator:
-                from app.models.identity import IdentityProvider
-                from app.models.org import OrgMember
-
-                provider_r = await db.execute(
-                    select(IdentityProvider).where(
-                        IdentityProvider.provider_type == "feishu",
-                        IdentityProvider.tenant_id == creator.tenant_id,
-                    )
-                )
-                provider = provider_r.scalar_one_or_none()
-                if provider:
-                    member_r = await db.execute(
-                        select(OrgMember).where(
-                            OrgMember.user_id == creator.id,
-                            OrgMember.provider_id == provider.id,
-                        )
-                    )
-                    member = member_r.scalar_one_or_none()
-                    if member and (member.external_id or member.open_id):
-                        receive_id = member.external_id or member.open_id
-                        id_type = "user_id" if member.external_id else "open_id"
-                        await feishu_service.send_message(
-                            channel.app_id, channel.app_secret,
-                            receive_id, "text",
-                            json.dumps({"text": f"[{agent.name}] executed: {action_type}"}),
-                            receive_id_type=id_type,
-                        )
+        # OD-49 A.1b: Feishu-specific action notification removed with Feishu channel.
+        # Web notification above still delivers the event.
 
     async def _request_approval(self, db: AsyncSession, agent: Agent,
                                  approval: ApprovalRequest) -> None:
-        """Send L3 approval request to creator via Feishu card + web notification."""
-        # Web notification (always)
+        """Send L3 approval request to creator via web notification."""
         from app.services.notification_service import send_notification
         await send_notification(
             db,
@@ -270,46 +231,7 @@ class AutonomyService:
             link=f"/agents/{agent.id}#approvals",
             ref_id=approval.id,
         )
-
-        # Try Feishu notification
-        channel_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
-        )
-        channel = channel_result.scalars().first()
-
-        if channel and channel.app_id and channel.app_secret:
-            creator_result = await db.execute(
-                select(User).where(User.id == agent.creator_id)
-            )
-            creator = creator_result.scalar_one_or_none()
-            if creator:
-                from app.models.identity import IdentityProvider
-                from app.models.org import OrgMember
-
-                provider_r = await db.execute(
-                    select(IdentityProvider).where(
-                        IdentityProvider.provider_type == "feishu",
-                        IdentityProvider.tenant_id == creator.tenant_id,
-                    )
-                )
-                provider = provider_r.scalar_one_or_none()
-                if provider:
-                    member_r = await db.execute(
-                        select(OrgMember).where(
-                            OrgMember.user_id == creator.id,
-                            OrgMember.provider_id == provider.id,
-                        )
-                    )
-                    member = member_r.scalar_one_or_none()
-                    if member and (member.external_id or member.open_id):
-                        receive_id = member.external_id or member.open_id
-                        await feishu_service.send_approval_card(
-                            channel.app_id, channel.app_secret,
-                            receive_id,
-                            agent.name, approval.action_type,
-                            json.dumps(approval.details, ensure_ascii=False),
-                            str(approval.id),
-                        )
+        # OD-49 A.1b: Feishu approval-card delivery removed with Feishu channel.
 
 
 autonomy_service = AutonomyService()

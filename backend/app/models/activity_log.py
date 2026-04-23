@@ -19,7 +19,7 @@ class AgentActivityLog(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False, index=True)
     action_type: Mapped[str] = mapped_column(
         Enum(
-            "chat_reply", "tool_call", "feishu_msg_sent", "agent_msg_sent",
+            "chat_reply", "tool_call", "agent_msg_sent",
             "web_msg_sent", "task_created", "task_updated", "file_written", "error",
             "schedule_run", "heartbeat", "plaza_post",
             name="activity_action_enum",

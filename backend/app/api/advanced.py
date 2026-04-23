@@ -251,10 +251,6 @@ async def get_agent_metrics(
         )
     )
 
-    # Container status
-    from app.services.agent_manager import agent_manager
-    container_status = agent_manager.get_container_status(agent)
-
     # Extract scalar values (each result can only be consumed once)
     _total_tasks = total_tasks.scalar() or 0
     _done_tasks = done_tasks.scalar() or 0
@@ -267,7 +263,6 @@ async def get_agent_metrics(
         "agent_id": str(agent_id),
         "agent_name": agent.name,
         "status": agent.status,
-        "container": container_status,
         "tokens": {
             "used_today": agent.tokens_used_today,
             "used_month": agent.tokens_used_month,
