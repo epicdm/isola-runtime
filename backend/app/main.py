@@ -85,9 +85,6 @@ async def lifespan(app: FastAPI):
     from app.services.trigger_daemon import start_trigger_daemon
     from app.services.tool_seeder import seed_builtin_tools
     from app.services.template_seeder import seed_agent_templates
-    from app.services.feishu_ws import feishu_ws_manager
-    from app.services.dingtalk_stream import dingtalk_stream_manager
-    from app.services.wecom_stream import wecom_stream_manager
     from app.services.discord_gateway import discord_gateway_manager
 
     # ── Step 0: Ensure all DB tables exist (idempotent, safe to run on every startup) ──
@@ -172,16 +169,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[startup] Builtin tools seed or cleanup failed: {e}")
 
-    try:
-        from app.services.tool_seeder import seed_atlassian_rovo_config, get_atlassian_api_key
-        await seed_atlassian_rovo_config()
-        # Auto-import Atlassian Rovo tools if an API key is already configured
-        _rovo_key = await get_atlassian_api_key()
-        if _rovo_key:
-            from app.services.resource_discovery import seed_atlassian_rovo_tools
-            await seed_atlassian_rovo_tools(_rovo_key)
-    except Exception as e:
-        logger.warning(f"[startup] Atlassian tools seed failed: {e}")
 
     try:
         await seed_agent_templates()
@@ -220,9 +207,6 @@ async def lifespan(app: FastAPI):
 
         for name, coro in [
             ("trigger_daemon", start_trigger_daemon()),
-            ("feishu_ws", feishu_ws_manager.start_all()),
-            ("dingtalk_stream", dingtalk_stream_manager.start_all()),
-            ("wecom_stream", wecom_stream_manager.start_all()),
             ("discord_gw", discord_gateway_manager.start_all()),
         ]:
             task = asyncio.create_task(coro, name=name)
@@ -270,7 +254,6 @@ from app.api.agents import router as agents_router
 from app.api.tasks import router as tasks_router
 from app.api.files import router as files_router
 from app.api.websocket import router as ws_router
-from app.api.feishu import router as feishu_router
 from app.api.sso import router as sso_router
 from app.api.organization import router as org_router
 from app.api.enterprise import router as enterprise_router
@@ -289,12 +272,9 @@ from app.api.users import router as users_router
 from app.api.chat_sessions import router as chat_sessions_router
 from app.api.slack import router as slack_router
 from app.api.discord_bot import router as discord_router
-from app.api.dingtalk import router as dingtalk_router
-from app.api.wecom import router as wecom_router
 from app.api.teams import router as teams_router
 from app.api.triggers import router as triggers_router
 
-from app.api.atlassian import router as atlassian_router
 
 from app.api.webhooks import router as webhooks_router
 from app.api.notification import router as notification_router
@@ -302,13 +282,11 @@ from app.api.gateway import router as gateway_router
 from app.api.admin import router as admin_router
 from app.api.pages import router as pages_router, public_router as pages_public_router
 from app.api.agent_credentials import router as credentials_router
-from app.api.agentbay_control import router as agentbay_control_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
 app.include_router(tasks_router, prefix=settings.API_PREFIX)
 app.include_router(files_router, prefix=settings.API_PREFIX)
-app.include_router(feishu_router, prefix=settings.API_PREFIX)
 app.include_router(sso_router, prefix=settings.API_PREFIX)
 app.include_router(org_router, prefix=settings.API_PREFIX)
 app.include_router(enterprise_router, prefix=settings.API_PREFIX)
@@ -326,11 +304,8 @@ app.include_router(skills_router, prefix=settings.API_PREFIX)
 app.include_router(users_router, prefix=settings.API_PREFIX)
 app.include_router(slack_router, prefix=settings.API_PREFIX)
 app.include_router(discord_router, prefix=settings.API_PREFIX)
-app.include_router(dingtalk_router, prefix=settings.API_PREFIX)
-app.include_router(wecom_router, prefix=settings.API_PREFIX)
 app.include_router(teams_router, prefix=settings.API_PREFIX)
 
-app.include_router(atlassian_router, prefix=settings.API_PREFIX)
 
 app.include_router(triggers_router)
 app.include_router(chat_sessions_router)
@@ -343,7 +318,6 @@ app.include_router(admin_router, prefix=settings.API_PREFIX)
 app.include_router(pages_router, prefix=settings.API_PREFIX)
 app.include_router(pages_public_router)  # Public endpoint for /p/{short_id}, no API prefix
 app.include_router(credentials_router, prefix=settings.API_PREFIX)
-app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

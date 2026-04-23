@@ -915,14 +915,6 @@ async def update_category_config(
 
     await db.commit()
 
-    # Special logic for Atlassian: trigger sync
-    if category == "atlassian":
-        from app.api.atlassian import _sync_atlassian_tools_for_agent
-        import asyncio
-        # Need plaintext key for sync
-        plaintext_key = data.config.get("api_key") or data.config.get("api_secret") or data.config.get("app_secret")
-        asyncio.create_task(_sync_atlassian_tools_for_agent(agent_id, plaintext_key))
-
     return {"ok": True}
 
 
@@ -958,11 +950,4 @@ async def test_category_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Test connectivity for a tool category."""
-    if category == "atlassian":
-        from app.api.atlassian import test_atlassian_channel
-        return await test_atlassian_channel(agent_id, current_user, db)
-    elif category == "agentbay":
-        from app.services.agentbay_client import test_agentbay_channel
-        return await test_agentbay_channel(agent_id, current_user, db)
-
     return {"ok": True, "message": f"Settings for {category} saved."}

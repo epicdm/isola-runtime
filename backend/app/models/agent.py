@@ -61,7 +61,6 @@ class Agent(Base):
         default={
             "read_files": "L1",
             "write_workspace_files": "L2",
-            "send_feishu_message": "L2",
             "send_external_message": "L3",
             "modify_soul": "L3",
             "access_business_system_read": "L2",

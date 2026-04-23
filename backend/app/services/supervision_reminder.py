@@ -112,8 +112,6 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
         get_model_api_key,
     )
 
-    )
-
     model_id = target_agent.primary_model_id or target_agent.fallback_model_id
     if not model_id:
         return None
@@ -168,7 +166,6 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
         from app.models.org import AgentRelationship
         from app.models.channel_config import ChannelConfig
         from app.models.activity_log import AgentActivityLog
-        from app.services.feishu_service import feishu_service
         from sqlalchemy.orm import selectinload
         import json as _json
 
@@ -287,33 +284,8 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                         target_member = r.member
                         break
 
-                if target_member:
-                    # Try Feishu
-                    config_r = await db.execute(
-                        select(ChannelConfig).where(
-                            ChannelConfig.agent_id == task.agent_id,
-                            ChannelConfig.channel_type == "feishu",
-                        )
-                    )
-                    config = config_r.scalar_one_or_none()
-                    if config and (target_member.email or target_member.phone):
-                        try:
-                            resolved = await feishu_service.resolve_open_id(
-                                config.app_id, config.app_secret,
-                                email=target_member.email, mobile=target_member.phone,
-                            )
-                            if resolved:
-                                content = _json.dumps({"text": reminder_msg}, ensure_ascii=False)
-                                resp = await feishu_service.send_message(
-                                    config.app_id, config.app_secret,
-                                    receive_id=resolved, msg_type="text",
-                                    content=content, receive_id_type="open_id",
-                                )
-                                if resp.get("code") == 0:
-                                    sent = True
-                                    send_method = "飞书"
-                        except Exception:
-                            pass
+                # OD-49 A.1b: Feishu member-reminder delivery removed with Feishu channel.
+                # Supervision reminders still fire via the Agent ChatMessage path above.
 
             # Log result to TaskLog
             if sent:
