@@ -38,8 +38,6 @@ class Agent(Base):
         default="creating",
         nullable=False,
     )
-    container_id: Mapped[str | None] = mapped_column(String(100))
-    container_port: Mapped[int | None] = mapped_column(Integer)
 
     # LLM config
     primary_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))

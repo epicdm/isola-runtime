@@ -1,9 +1,7 @@
 """WhatsApp Business Cloud API channel routes.
 
-Phase B.1 scaffolding. CRUD for per-agent WhatsApp channel config, webhook
-verification (Meta's GET challenge), and a webhook POST handler stub that
-currently just acknowledges receipt. B.2 wires the POST handler to
-channel_common._call_agent_llm and sends the reply back.
+Phase B.2: webhook POST now dispatches inbound text messages to the agent
+LLM and sends the reply back through Meta's Cloud API.
 
 Webhook URL shape (matches slack.py's per-agent pattern):
     GET  /api/channel/whatsapp/{agent_id}/webhook  → Meta verification
@@ -21,8 +19,10 @@ WhatsApp-specific fields live in ChannelConfig.extra_config (JSON):
     app_secret: str         Meta app secret for HMAC SHA256 signature check
 """
 
+import asyncio
 import json
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from loguru import logger
@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
-from app.database import get_db
+from app.database import async_session, get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
@@ -252,6 +252,7 @@ async def whatsapp_webhook_event(
         return Response(status_code=400)
 
     # Dedup by message_id — Meta retries aggressively on non-200.
+    # Dispatch processing in the background so we can ack Meta quickly.
     entries = body.get("entry") or []
     for entry in entries:
         for change in entry.get("changes") or []:
@@ -266,10 +267,184 @@ async def whatsapp_webhook_event(
                     _processed_wa_messages.add(msg_id)
                     if len(_processed_wa_messages) > 2000:
                         _processed_wa_messages.clear()
-                logger.info(
-                    f"[WhatsApp] agent={agent_id} from={msg.get('from')} "
-                    f"type={msg.get('type')} id={msg_id} — B.2 will dispatch"
+                # Copy the extra_config out of the DB-bound ChannelConfig so the
+                # background task doesn't touch a detached SQLAlchemy row.
+                extra_snapshot = dict(config.extra_config or {})
+                asyncio.create_task(
+                    _process_whatsapp_message(agent_id, value, msg, extra_snapshot)
                 )
 
-    # Always ack 200 so Meta stops retrying. Errors logged above.
+    # Always ack 200 so Meta stops retrying. Processing happens in the background.
     return {"status": "ok"}
+
+
+# ─── Background processor (B.2 core) ─────────────────────
+
+
+async def _process_whatsapp_message(
+    agent_id: uuid.UUID,
+    value: dict,
+    msg: dict,
+    extra_config: dict,
+) -> None:
+    """Handle one inbound WhatsApp message end-to-end.
+
+    Runs in the background so the webhook POST returns 200 to Meta fast.
+    Phase B.2 only handles type='text'; other types are acked and ignored
+    with a stub reply so the customer isn't left hanging.
+    """
+    # Lazy imports keep module-load clean (these import chains touch models).
+    from app.api.channel_common import _call_agent_llm
+    from app.models.agent import Agent, DEFAULT_CONTEXT_WINDOW_SIZE
+    from app.models.audit import ChatMessage
+    from app.models.chat_session import ChatSession
+
+    msg_id = msg.get("id", "")
+    msg_type = msg.get("type", "")
+    from_wa_id = msg.get("from", "")
+
+    phone_number_id = extra_config.get("phone_number_id", "")
+    access_token = extra_config.get("access_token", "")
+    if not phone_number_id or not access_token:
+        logger.error(f"[WhatsApp] agent={agent_id} missing phone_number_id or access_token")
+        return
+
+    # Only text in B.2. For other types, send a graceful stub reply so the
+    # customer knows we got the message. B.3 handles media; B.4 handles
+    # interactive button replies.
+    if msg_type != "text":
+        logger.info(f"[WhatsApp] agent={agent_id} ignoring {msg_type} msg id={msg_id}")
+        try:
+            await whatsapp_service.send_text_message(
+                phone_number_id=phone_number_id,
+                access_token=access_token,
+                to=from_wa_id,
+                text=(
+                    "Got your message. I can only read plain text right now — "
+                    "media and interactive messages land in the next release."
+                ),
+            )
+        except Exception as e:
+            logger.error(f"[WhatsApp] non-text stub reply failed: {e}")
+        return
+
+    user_text = (msg.get("text") or {}).get("body", "").strip()
+    if not user_text:
+        return
+
+    contacts = value.get("contacts") or []
+    sender_name = (
+        contacts[0].get("profile", {}).get("name", from_wa_id) if contacts else from_wa_id
+    )
+
+    # Fire-and-forget typing indicator; non-fatal if it fails.
+    asyncio.create_task(
+        whatsapp_service.send_typing_indicator(
+            phone_number_id=phone_number_id,
+            access_token=access_token,
+            message_id=msg_id,
+        )
+    )
+
+    reply_text: str
+    async with async_session() as db:
+        agent_r = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = agent_r.scalar_one_or_none()
+        if not agent:
+            logger.error(f"[WhatsApp] agent={agent_id} not found during processing")
+            return
+
+        ext_conv = f"wa:{from_wa_id}"
+        sess_r = await db.execute(
+            select(ChatSession).where(
+                ChatSession.agent_id == agent_id,
+                ChatSession.external_conv_id == ext_conv,
+            )
+        )
+        sess = sess_r.scalar_one_or_none()
+        if sess is None:
+            sess = ChatSession(
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                title=f"WhatsApp — {sender_name}"[:200],
+                source_channel="whatsapp",
+                external_conv_id=ext_conv,
+                is_group=False,
+            )
+            db.add(sess)
+            await db.flush()
+
+        session_conv_id = str(sess.id)
+
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                role="user",
+                content=user_text,
+                conversation_id=session_conv_id,
+            )
+        )
+        sess.last_message_at = datetime.now(timezone.utc)
+        await db.flush()
+
+        ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
+        history_r = await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == session_conv_id,
+            )
+            .order_by(ChatMessage.created_at.desc())
+            .limit(ctx_size)
+        )
+        history = [
+            {"role": m.role, "content": m.content}
+            for m in reversed(history_r.scalars().all())
+        ]
+        # Drop the just-inserted user message — _call_agent_llm will re-append it.
+        if history and history[-1]["role"] == "user" and history[-1]["content"] == user_text:
+            history = history[:-1]
+
+        try:
+            reply_text = await _call_agent_llm(
+                db,
+                agent_id,
+                user_text,
+                history=history,
+                user_id=agent.creator_id,
+                session_id=session_conv_id,
+            )
+        except Exception as e:
+            logger.error(f"[WhatsApp] LLM call failed for agent={agent_id}: {e}")
+            reply_text = (
+                "⚠️ Something went wrong on my end. Please try again in a moment."
+            )
+
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                role="assistant",
+                content=reply_text,
+                conversation_id=session_conv_id,
+            )
+        )
+        sess.last_message_at = datetime.now(timezone.utc)
+        await db.commit()
+
+    # Send the reply outside the DB session so we aren't holding a connection
+    # during the Meta Graph API round-trip.
+    try:
+        await whatsapp_service.send_text_message(
+            phone_number_id=phone_number_id,
+            access_token=access_token,
+            to=from_wa_id,
+            text=reply_text,
+        )
+        logger.info(
+            f"[WhatsApp] agent={agent_id} replied to {from_wa_id} "
+            f"({len(reply_text)} chars)"
+        )
+    except Exception as e:
+        logger.error(f"[WhatsApp] Failed to send reply to {from_wa_id}: {e}")
