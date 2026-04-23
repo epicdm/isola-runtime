@@ -270,6 +270,7 @@ from app.api.skills import router as skills_router
 from app.api.users import router as users_router
 from app.api.chat_sessions import router as chat_sessions_router
 from app.api.slack import router as slack_router
+from app.api.whatsapp import router as whatsapp_router
 from app.api.discord_bot import router as discord_router
 from app.api.teams import router as teams_router
 from app.api.triggers import router as triggers_router
@@ -301,6 +302,7 @@ app.include_router(enterprise_kb_router, prefix=settings.API_PREFIX)
 app.include_router(skills_router, prefix=settings.API_PREFIX)
 app.include_router(users_router, prefix=settings.API_PREFIX)
 app.include_router(slack_router, prefix=settings.API_PREFIX)
+app.include_router(whatsapp_router, prefix=settings.API_PREFIX)
 app.include_router(discord_router, prefix=settings.API_PREFIX)
 app.include_router(teams_router, prefix=settings.API_PREFIX)
 
