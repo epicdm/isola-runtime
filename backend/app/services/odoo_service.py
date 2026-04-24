@@ -148,49 +148,60 @@ class OdooService:
         """
         uid = self._authenticate()
 
-        # 1. By external_ref (our tenant UUID stamped on res.company.ref).
+        # Odoo 18 note: `res.company` has no `ref` field — every company has
+        # an auto-created `res.partner` (via partner_id), and partners DO
+        # have ref. We store the Isola tenant UUID on the partner's ref so
+        # the identity survives renames and future schema shifts.
+
+        # 1. By external_ref on the linked partner.
         rows = self._execute(
             uid,
             "res.company",
             "search_read",
-            args=[[("ref", "=", external_ref)]],
-            kwargs={"fields": ["id", "name"], "limit": 1},
+            args=[[("partner_id.ref", "=", external_ref)]],
+            kwargs={"fields": ["id", "name", "partner_id"], "limit": 1},
         )
         if rows:
             company_id = int(rows[0]["id"])
             self._update_company(uid, company_id, name=name, email=email, phone=phone)
-            logger.info("ensure_company: found by ref, id=%s name=%s", company_id, name)
+            logger.info("ensure_company: found by partner.ref, id=%s name=%s", company_id, name)
             return company_id
 
         # 2. By name — protects against re-provisioning after a DB wipe
-        #    where external_ref wasn't persisted. We still update ref.
+        #    where external_ref wasn't persisted. We still backfill ref.
         rows = self._execute(
             uid,
             "res.company",
             "search_read",
             args=[[("name", "=ilike", name)]],
-            kwargs={"fields": ["id", "name", "ref"], "limit": 1},
+            kwargs={"fields": ["id", "name", "partner_id"], "limit": 1},
         )
         if rows:
             company_id = int(rows[0]["id"])
-            self._execute(
-                uid,
-                "res.company",
-                "write",
-                args=[[company_id], {"ref": external_ref}],
+            partner_id = (
+                rows[0]["partner_id"][0]
+                if isinstance(rows[0].get("partner_id"), (list, tuple))
+                else rows[0].get("partner_id")
             )
+            if partner_id:
+                self._execute(
+                    uid,
+                    "res.partner",
+                    "write",
+                    args=[[int(partner_id)], {"ref": external_ref}],
+                )
             self._update_company(uid, company_id, name=name, email=email, phone=phone)
             logger.info(
-                "ensure_company: name-match backfilled ref, id=%s name=%s",
+                "ensure_company: name-match backfilled partner.ref, id=%s name=%s",
                 company_id,
                 name,
             )
             return company_id
 
-        # 3. Create.
+        # 3. Create. res.company.create auto-creates the partner; we then
+        # write `ref` on that partner in a second call.
         vals: dict[str, Any] = {
             "name": name[:128],
-            "ref": external_ref,
         }
         if email:
             vals["email"] = email[:240]
@@ -200,14 +211,34 @@ class OdooService:
             country_id = self._resolve_country_id(uid, country_code)
             if country_id:
                 vals["country_id"] = country_id
-        # vertical is informational — store on the `note` comment for now.
-        # Future: add a custom field via a /mnt/extra-addons module.
-        if vertical:
-            vals["comment"] = f"Isola vertical: {vertical}"
 
         company_id = int(
             self._execute(uid, "res.company", "create", args=[vals])
         )
+
+        # Pull the partner_id + set ref + (optional) vertical note.
+        row = self._execute(
+            uid,
+            "res.company",
+            "read",
+            args=[[company_id], ["partner_id"]],
+        )
+        partner_id_raw = row[0].get("partner_id") if row else None
+        partner_id = (
+            int(partner_id_raw[0])
+            if isinstance(partner_id_raw, (list, tuple))
+            else (int(partner_id_raw) if partner_id_raw else None)
+        )
+        if partner_id:
+            partner_vals: dict[str, Any] = {"ref": external_ref}
+            if vertical:
+                partner_vals["comment"] = f"Isola vertical: {vertical}"
+            self._execute(
+                uid,
+                "res.partner",
+                "write",
+                args=[[partner_id], partner_vals],
+            )
         logger.info(
             "ensure_company: created id=%s name=%s vertical=%s",
             company_id,
