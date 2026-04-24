@@ -53,6 +53,8 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       # Password reset token lifetime in minutes (default: 30)
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
+      # Phase E.6c: shared service secret for apps/isola <-> isola-runtime
+      ISOLA_INTERNAL_SECRET: ${ISOLA_INTERNAL_SECRET:-}
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents
