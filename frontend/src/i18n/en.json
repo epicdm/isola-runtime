@@ -47,10 +47,10 @@
   },
   "nav": {
     "dashboard": "Dashboard",
-    "myAgents": "My Digital Employees",
+    "myAgents": "My Team",
     "myCreated": "Created by me",
     "companyShared": "Company shared",
-    "newAgent": "New Digital Employee",
+    "newAgent": "Hire",
     "enterprise": "Company Settings",
     "language": "Language",
     "plaza": "Plaza"
@@ -143,7 +143,7 @@
       "afternoon": "Good afternoon",
       "evening": "Good evening"
     },
-    "totalAgents": "{{count}} digital employees",
+    "totalAgents": "{{count}} team members",
     "stats": {
       "agents": "Digital Employees",
       "online": "{{count}} online",
@@ -176,8 +176,8 @@
     "daysAgo": "{{count}}d ago",
     "globalActivity": "Global Activity",
     "recentCount": "Last {{count}}",
-    "noAgents": "No digital employees yet, create your first one",
-    "createFirst": "Create first digital employee"
+    "noAgents": "No team members yet — hire your first",
+    "createFirst": "Hire first team member"
   },
   "agent": {
     "status": {
@@ -730,7 +730,7 @@
     "next": "Next",
     "prev": "Previous",
     "finish": "Create",
-    "nameHint": "Name your digital employee",
+    "nameHint": "Name your new hire",
     "roleHint": "Describe its role",
     "step1": {
       "title": "Basic Info & Model Selection",
