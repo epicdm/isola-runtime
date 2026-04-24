@@ -232,6 +232,11 @@ function VersionDisplay() {
 }
 
 export default function Layout() {
+    // Phase E.2.8 — when served inside an iframe at isola.epic.dm, hide our
+    // own sidebar/top chrome. The apps/isola shell provides all of that.
+    const isEmbedded = typeof window !== 'undefined' &&
+        new URLSearchParams(window.location.search).get('embedded') === '1';
+
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
     const { user, logout, setAuth } = useAuthStore();
@@ -530,6 +535,16 @@ export default function Layout() {
             })}
         </div>
     );
+
+    if (isEmbedded) {
+        return (
+            <div className="app-layout embedded" style={{ display: 'block' }}>
+                <main className="main-content embedded-main" style={{ marginLeft: 0, width: '100%', height: '100vh' }}>
+                    <Outlet />
+                </main>
+            </div>
+        );
+    }
 
     return (
         <div className={`app-layout ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
