@@ -204,6 +204,7 @@ class UserUpdate(BaseModel):
 
 class AgentCreate(BaseModel):
     name: str = Field(min_length=2, max_length=100, description="Agent name, 2-100 characters")
+    agent_type: str = "native"  # native | openclaw (Edge)
     role_description: str = Field(default="", max_length=500, description="Role description, max 500 characters")
     bio: str | None = None
     welcome_message: str | None = None
@@ -263,6 +264,10 @@ class AgentOut(BaseModel):
     is_expired: bool = False
     llm_calls_today: int = 0
     max_llm_calls_per_day: int = 100
+    agent_type: str = "native"
+    openclaw_last_seen: datetime | None = None
+    has_api_key: bool = False
+    api_key_hash: str | None = None
     created_at: datetime
     last_active_at: datetime | None = None
 

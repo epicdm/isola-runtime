@@ -4130,6 +4130,44 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
             session_id = str(chat_session.id)
 
+            # ── Edge (OpenClaw) target: queue message for gateway poll ──
+            if getattr(target, "agent_type", "native") == "openclaw":
+                # 1. Save the source message to the chat session
+                db.add(ChatMessage(
+                    agent_id=session_agent_id,
+                    user_id=owner_id,
+                    role="user",
+                    content=message_text,
+                    conversation_id=session_id,
+                    participant_id=src_participant.id if src_participant else None,
+                ))
+                chat_session.last_message_at = datetime.now(timezone.utc)
+
+                # 2. Queue for Gateway
+                from app.models.gateway_message import GatewayMessage as GMsg
+                gw_msg = GMsg(
+                    agent_id=target.id,
+                    sender_agent_id=from_agent_id,
+                    sender_user_id=owner_id,
+                    content=f"[From {source_name}] {message_text}",
+                    status="pending",
+                    conversation_id=session_id,
+                )
+                db.add(gw_msg)
+                await db.commit()
+
+                # 3. Log activity
+                from app.services.activity_logger import log_activity
+                await log_activity(
+                    from_agent_id, "agent_msg_sent",
+                    f"Sent message to {target.name} (queued)",
+                    detail={"partner": target.name, "message": message_text[:200]},
+                )
+
+                online = target.openclaw_last_seen and (datetime.now(timezone.utc) - target.openclaw_last_seen).total_seconds() < 300
+                status_hint = "online" if online else "offline (message will be delivered on next heartbeat)"
+                return f"Message sent to {target.name} (Edge agent, currently {status_hint}). The message has been queued and will be delivered when the agent polls for updates."
+
             # ── Native target: branch by msg_type ──
 
             # Save source message (common to all paths)

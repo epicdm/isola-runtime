@@ -458,6 +458,27 @@ async def _process_whatsapp_message(
                 paperclip_issue_id=sess.paperclip_issue_id,
             )
 
+        # ── Edge (OpenClaw) routing: queue for daemon poll, skip LLM + immediate reply ──
+        # Customer reply is sent by /gateway/report when the Edge daemon reports back
+        # (see gateway.py:report_result -- WA-origin conversations forward result via
+        # WhatsAppService.send_text_message).
+        if getattr(agent, "agent_type", "native") == "openclaw":
+            from app.models.gateway_message import GatewayMessage as GwMsg
+            gw_msg = GwMsg(
+                agent_id=agent_id,
+                sender_user_id=agent.creator_id,
+                conversation_id=session_conv_id,
+                content=user_text,
+                status="pending",
+            )
+            db.add(gw_msg)
+            await db.commit()
+            logger.info(
+                f"[WhatsApp] Edge agent={agent_id}: inbound queued for gateway poll "
+                f"(msg_id={gw_msg.id}, conv={session_conv_id})"
+            )
+            return
+
         ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
         history_r = await db.execute(
             select(ChatMessage)

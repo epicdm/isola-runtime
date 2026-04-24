@@ -939,6 +939,252 @@ async def _phase_b6_paperclip_escalation(
         )
 
 
+async def _phase_e1_openclaw_gateway(http, test_state, fake_creds, mock_meta, db_session):
+    """Edge (OpenClaw) gateway flow: create edge agent -> poll -> seed queue -> poll -> report.
+
+    Covers:
+      1. POST /api/agents with agent_type=openclaw returns an api_key once + status=idle
+         (no workspace init, no LLM model required).
+      2. GET /api/gateway/poll with X-Api-Key=<returned-key> authenticates + returns empty queue.
+      3. Directly insert a GatewayMessage row simulating a queued inbound customer message.
+      4. Poll again -> the gateway returns the seeded message under the authenticated agent.
+      5. POST /api/gateway/report with {"message_id": ..., "result": "..."} marks the
+         message completed and stores the Edge-generated reply.
+      6. After report, a follow-up poll returns empty again (the reported message is not
+         re-delivered).
+
+    This test chains onto B.6: runs against the same test_state and db_session fixtures,
+    verifies that Phase E.1 restored the gateway lifecycle without regressing Phase B.
+    """
+    suffix = test_state["suffix"]
+    headers = test_state["headers"]
+
+    # 1. Create an Edge agent. The creator is authenticated via test_state["jwt"].
+    r = await http.post("/api/agents", headers=headers, json={
+        "name": f"E-Edge Agent {suffix}",
+        "agent_type": "openclaw",
+        "role_description": "Phase E.1 Edge integration test agent",
+    })
+    assert r.status_code in (200, 201), f"edge agent create failed: {r.status_code} {r.text}"
+    body = r.json()
+    assert body["agent_type"] == "openclaw", f"agent_type mismatch: {body}"
+    assert body["status"] == "idle", f"edge agent should be idle, got {body['status']}"
+    api_key = body.get("api_key")
+    assert api_key and api_key.startswith("oc-"), f"api_key missing or wrong shape: {api_key!r}"
+    edge_agent_id = body["id"]
+
+    # 2. Empty poll with the returned key: expect 200 + empty messages.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r.status_code == 200, f"empty poll failed: {r.status_code} {r.text}"
+    poll_body = r.json()
+    assert isinstance(poll_body.get("messages"), list), f"messages not list: {poll_body}"
+    assert poll_body["messages"] == [], f"expected empty queue, got {poll_body['messages']}"
+
+    # 3. Wrong key -> 401.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": "oc-definitely-not-a-real-key"})
+    assert r.status_code == 401, f"wrong-key poll should 401, got {r.status_code}"
+
+    # 4. Seed a GatewayMessage directly into the DB for this agent.
+    from app.models.gateway_message import GatewayMessage
+    async with db_session() as db:
+        gw_msg = GatewayMessage(
+            agent_id=uuid.UUID(edge_agent_id),
+            sender_user_id=uuid.UUID(test_state["user_id"]),
+            content="Hey Edge agent, customer needs a quote for 3 rooms next weekend.",
+            status="pending",
+        )
+        db.add(gw_msg)
+        await db.commit()
+        seeded_message_id = str(gw_msg.id)
+
+    # 5. Poll again -> the seeded message appears.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r.status_code == 200, f"second poll failed: {r.status_code} {r.text}"
+    poll_body = r.json()
+    msgs = poll_body.get("messages", [])
+    assert len(msgs) == 1, f"expected 1 message, got {len(msgs)}: {msgs}"
+    assert msgs[0]["id"] == seeded_message_id, f"message id mismatch: {msgs[0]}"
+    assert "customer needs a quote" in msgs[0]["content"], f"content missing: {msgs[0]}"
+
+    # 6. Report a reply for the seeded message.
+    r = await http.post("/api/gateway/report", headers={"X-Api-Key": api_key}, json={
+        "message_id": seeded_message_id,
+        "result": "Three rooms (double bed, ocean view) available Sat-Sun — EC$450/night each.",
+    })
+    assert r.status_code == 200, f"report failed: {r.status_code} {r.text}"
+
+    # 7. Verify the row is now completed in the DB.
+    async with db_session() as db:
+        from sqlalchemy import select as _select
+        row = await db.execute(
+            _select(GatewayMessage).where(GatewayMessage.id == uuid.UUID(seeded_message_id))
+        )
+        gw = row.scalar_one()
+        assert gw.status == "completed", f"expected completed, got {gw.status!r}"
+        assert gw.result and "ocean view" in gw.result, f"result not stored: {gw.result!r}"
+
+    # 8. Follow-up poll returns empty again (reported messages are not re-delivered).
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r.status_code == 200, f"follow-up poll failed: {r.status_code} {r.text}"
+    assert r.json().get("messages") == [], (
+        f"completed message should not be re-polled: {r.json()}"
+    )
+
+    # 9. Rotate API key via /agents/<id>/api-key -> old key should stop working.
+    r = await http.post(
+        f"/api/agents/{edge_agent_id}/api-key",
+        headers=headers,
+    )
+    assert r.status_code == 200, f"api-key rotate failed: {r.status_code} {r.text}"
+    rotated = r.json().get("api_key")
+    assert rotated and rotated.startswith("oc-") and rotated != api_key, (
+        f"rotation returned bad key: {rotated!r} (original {api_key!r})"
+    )
+    r_old = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r_old.status_code == 401, f"old key should be revoked, got {r_old.status_code}"
+    r_new = await http.get("/api/gateway/poll", headers={"X-Api-Key": rotated})
+    assert r_new.status_code == 200, f"rotated key should work, got {r_new.status_code}"
+
+
+    # ────────────────────────────────────────────────────────────────
+    # Phase E.1.5: WA webhook -> Edge gateway routing
+    # ────────────────────────────────────────────────────────────────
+    # Configure a WhatsApp channel on the Edge agent, send a signed inbound
+    # webhook, verify it queues into gateway_messages (NOT the native LLM
+    # path — so mock_meta should NOT see a send_message during this step).
+    # Then report a reply via /gateway/report and confirm mock_meta receives
+    # the WA send_message forwarded by the gateway.
+
+    # Baseline Meta record count BEFORE this section so we can assert deltas.
+    meta_baseline = len(mock_meta)
+
+    # Configure WA channel on the Edge agent.
+    r = await http.post(
+        f"/api/agents/{edge_agent_id}/whatsapp-channel",
+        headers=headers,
+        json=fake_creds,
+    )
+    assert r.status_code == 201, f"edge WA config: {r.status_code} {r.text}"
+
+    edge_customer_wa = "15559998877"
+    edge_msg_id = f"wamid.edge-e15-{suffix}"
+    edge_user_text = f"Edge path test {suffix}"
+
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": fake_creds["waba_id"],
+            "changes": [{
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {
+                        "display_phone_number": "17678180001",
+                        "phone_number_id": fake_creds["phone_number_id"],
+                    },
+                    "contacts": [{
+                        "profile": {"name": "Edge Tester"},
+                        "wa_id": edge_customer_wa,
+                    }],
+                    "messages": [{
+                        "from": edge_customer_wa,
+                        "id": edge_msg_id,
+                        "timestamp": str(int(time.time())),
+                        "type": "text",
+                        "text": {"body": edge_user_text},
+                    }],
+                },
+                "field": "messages",
+            }],
+        }],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    signature = _sign(body, fake_creds["app_secret"])
+
+    r = await http.post(
+        f"/api/channel/whatsapp/{edge_agent_id}/webhook",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-hub-signature-256": signature,
+        },
+    )
+    assert r.status_code == 200, f"edge webhook POST: {r.status_code} {r.text}"
+
+    # Wait for the background task to queue the gateway message (fast: no LLM call).
+    deadline = time.monotonic() + 10.0
+    edge_queued_msg_id = None
+    while time.monotonic() < deadline:
+        from app.models.gateway_message import GatewayMessage as _GwMsg
+        async with db_session() as db:
+            r2 = await db.execute(
+                _select(_GwMsg)
+                .where(_GwMsg.agent_id == uuid.UUID(edge_agent_id))
+                .order_by(_GwMsg.created_at.desc())
+                .limit(1)
+            )
+            latest = r2.scalar_one_or_none()
+            if latest and latest.content == edge_user_text and latest.status == "pending":
+                edge_queued_msg_id = str(latest.id)
+                break
+        await asyncio.sleep(0.3)
+    assert edge_queued_msg_id, (
+        f"Edge webhook did not queue a gateway_message within 10s "
+        f"(agent={edge_agent_id}, expected content={edge_user_text!r})"
+    )
+
+    # Critical assertion: NO text-reply went to Meta during this step.
+    # Native path would have called LLM and sent body.text.body; Edge path
+    # defers the reply until /gateway/report is called.
+    # (Read-receipts / typing indicators from the webhook ack flow are fine —
+    # those have no body.text.body.)
+    text_replies_during_inbound = [
+        r for r in mock_meta[meta_baseline:]
+        if r.get("op") == "send_message"
+        and r.get("body", {}).get("text", {}).get("body")
+    ]
+    assert not text_replies_during_inbound, (
+        f"Edge inbound should NOT trigger a WA text reply (that is the daemon's job); "
+        f"got {text_replies_during_inbound}"
+    )
+
+    # Now simulate the Edge daemon: poll -> pick up the queued message -> report a reply.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": rotated})
+    assert r.status_code == 200, f"edge-path poll: {r.status_code}"
+    polled = r.json().get("messages", [])
+    assert any(m["id"] == edge_queued_msg_id for m in polled), (
+        f"polled messages did not include the edge-queued msg {edge_queued_msg_id}: {polled}"
+    )
+
+    edge_reply = f"Noted — I will follow up on {suffix}."
+    r = await http.post(
+        "/api/gateway/report",
+        headers={"X-Api-Key": rotated},
+        json={"message_id": edge_queued_msg_id, "result": edge_reply},
+    )
+    assert r.status_code == 200, f"edge report: {r.status_code} {r.text}"
+
+    # Now the gateway should have forwarded the reply via WhatsApp to the customer.
+    deadline = time.monotonic() + 10.0
+    edge_wa_send_seen = False
+    while time.monotonic() < deadline:
+        recent = [r for r in mock_meta[meta_baseline:] if r.get("op") == "send_message"]
+        for rec in recent:
+            body_field = rec.get("body", {})
+            if (
+                body_field.get("to") == edge_customer_wa
+                and body_field.get("text", {}).get("body") == edge_reply
+            ):
+                edge_wa_send_seen = True
+                break
+        if edge_wa_send_seen:
+            break
+        await asyncio.sleep(0.3)
+    assert edge_wa_send_seen, (
+        f"/gateway/report did not forward reply via WhatsApp; "
+        f"mock_meta post-baseline={mock_meta[meta_baseline:]}"
+    )
+
+
 async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paperclip, db_session):
     """Run B.1 -> B.2 -> B.3 -> B.4 -> B.5 -> B.6 as one dependent chain.
 
@@ -971,3 +1217,7 @@ async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paper
         http, test_state, fake_creds, mock_meta, mock_paperclip, db_session
     )
     print("Phase B.6 PASS")
+
+    print("--- Phase E.1: Edge (OpenClaw) gateway lifecycle ---")
+    await _phase_e1_openclaw_gateway(http, test_state, fake_creds, mock_meta, db_session)
+    print("Phase E.1 PASS")
