@@ -238,6 +238,70 @@ async def report_result(
 
     await db.commit()
 
+    # ── Phase E.1.5: forward result via WhatsApp when conversation originated there ──
+    # If the chat_session's source_channel=="whatsapp", send the Edge reply to the
+    # customer via Meta Graph API. external_conv_id holds the customer WA phone id;
+    # agent's channel_config holds phone_number_id + access_token.
+    if body.result and msg.conversation_id:
+        try:
+            from app.models.chat_session import ChatSession
+            from app.models.channel_config import ChannelConfig
+            from app.services.whatsapp_service import WhatsAppService
+
+            sess_r = await db.execute(
+                select(ChatSession).where(ChatSession.id == msg.conversation_id)
+            )
+            sess = sess_r.scalar_one_or_none()
+            if sess and sess.source_channel == "whatsapp" and sess.external_conv_id:
+                cfg_r = await db.execute(
+                    select(ChannelConfig).where(
+                        ChannelConfig.agent_id == agent.id,
+                        ChannelConfig.channel_type == "whatsapp",
+                    )
+                )
+                cfg = cfg_r.scalar_one_or_none()
+                if cfg and cfg.extra_config:
+                    phone_number_id = cfg.extra_config.get("phone_number_id", "")
+                    access_token = cfg.extra_config.get("access_token", "")
+                    if phone_number_id and access_token:
+                        wa_svc = WhatsAppService()
+                        # external_conv_id is stored as 'wa:<phone>' in whatsapp.py;
+                        # strip the prefix before calling the Meta Graph API.
+                        wa_customer = sess.external_conv_id
+                        if wa_customer.startswith("wa:"):
+                            wa_customer = wa_customer[3:]
+                        await wa_svc.send_text_message(
+                            phone_number_id=phone_number_id,
+                            access_token=access_token,
+                            to=wa_customer,
+                            text=body.result,
+                        )
+                        logger.info(
+                            f"[Gateway] Edge reply forwarded via WhatsApp "
+                            f"agent={agent.id} to={sess.external_conv_id} "
+                            f"({len(body.result)} chars)"
+                        )
+
+                        # Mirror outbound to Paperclip if configured
+                        if sess.paperclip_issue_id:
+                            try:
+                                from app.services import paperclip_mirror
+                                if paperclip_mirror.is_enabled():
+                                    await paperclip_mirror.mirror_message(
+                                        issue_id=sess.paperclip_issue_id,
+                                        direction="outbound",
+                                        body=body.result,
+                                    )
+                            except Exception as mirror_e:
+                                logger.warning(
+                                    f"[Gateway] Paperclip mirror failed: {mirror_e}"
+                                )
+        except Exception as e:
+            logger.error(
+                f"[Gateway] Failed to forward Edge reply via WhatsApp "
+                f"agent={agent.id} msg={msg.id}: {e}"
+            )
+
     # Push to WebSocket if user is connected
     if body.result and msg.conversation_id and msg.sender_user_id:
         try:
