@@ -43,7 +43,15 @@ class AgentManager:
         template_dir = self._template_dir()
 
         if agent_dir.exists():
-            logger.warning(f"Agent dir already exists: {agent_dir}")
+            logger.info(f"Agent dir already exists: {agent_dir} — overlaying role pack only")
+            # Phase F.1.c-1 fix: still overlay the role-skill pack so agents
+            # created before the pack existed pick up new skills on next
+            # bridge hit. Pack merges idempotently (dirs_exist_ok=True) and
+            # newer SKILL.md files from the pack replace older ones on disk.
+            try:
+                await self._apply_role_skill_pack(db, agent, agent_dir)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Role pack re-overlay failed for agent {agent.id}: {e}")
             return
 
         if template_dir.exists():
