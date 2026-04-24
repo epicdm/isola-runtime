@@ -203,16 +203,16 @@ async def _phase_c1_provision_vertical(http, test_state, db_session):
         assert tmpl.role == "rex"
         assert tmpl.vertical == "hotel"
 
-    # Missing-role still 404s (fail-fast, no partial create). Post-C.2
-    # 'mara' is now seeded, so the gap role is 'joey' — updated when C.3 lands.
+    # Missing-role still 404s (fail-fast, no partial create). Post-C.3
+    # 'joey' is now seeded, so the gap role is 'cash' (C.5 adds it).
     r = await http.post(
         "/api/agents/provision-vertical",
         headers=test_state["headers"],
-        json={"vertical": "hotel", "roles": ["rex", "joey"]},
+        json={"vertical": "hotel", "roles": ["rex", "cash"]},
     )
-    assert r.status_code == 404, f"expected 404 for missing Joey template, got {r.status_code}: {r.text}"
+    assert r.status_code == 404, f"expected 404 for missing Cash template, got {r.status_code}: {r.text}"
     detail = r.json().get("detail", "")
-    assert "joey" in str(detail).lower()
+    assert "cash" in str(detail).lower()
 
     # And unknown vertical -> 404 with descriptive message.
     r = await http.post(
@@ -307,8 +307,98 @@ async def _phase_c2_mara_verticals(http, test_state, db_session):
         assert mara_agent.autonomy_policy.get("send_external_message") == "L3"
 
 
+async def _phase_c3_joey_verticals(http, test_state, db_session):
+    """C.3: Joey × Restaurant / Hotel / Clinic seeded + trio-provision works.
+
+    Depends on C.2. Proves the full Rex + Mara + Joey trio provisions
+    cleanly for every vertical.
+    """
+    from app.models.agent import Agent, AgentTemplate
+
+    # DB: 3 Joey verticals present with sales category
+    Session = db_session
+    async with Session() as db:
+        joey_r = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.role == "joey",
+                AgentTemplate.vertical.in_(["restaurant", "hotel", "clinic"]),
+            )
+        )
+        joey = {t.vertical: t for t in joey_r.scalars().all()}
+        assert set(joey.keys()) == {"restaurant", "hotel", "clinic"}, (
+            f"expected 3 Joey verticals, got {sorted(joey.keys())}"
+        )
+        for t in joey.values():
+            assert t.category == "sales"
+            assert t.is_builtin is True
+            # Joey autonomy invariants:
+            # - send_external_message L2 (DMs prospects live)
+            # - financial_operations L3 (quotes always approved)
+            # - access_business_system_write L3 (contracts always approved)
+            pol = t.default_autonomy_policy
+            assert pol.get("send_external_message") == "L2", (
+                f"{t.name}: Joey should DM prospects (L2 send), got "
+                f"{pol.get('send_external_message')}"
+            )
+            assert pol.get("financial_operations") == "L3"
+            assert pol.get("access_business_system_write") == "L3"
+
+    # API filter — role=joey yields 3
+    r = await http.get(
+        "/api/agents/templates", headers=test_state["headers"], params={"role": "joey"}
+    )
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 3
+    assert sorted(row["vertical"] for row in rows) == ["clinic", "hotel", "restaurant"]
+
+    # API filter — vertical=hotel now includes rex + mara + joey (3 roles)
+    r = await http.get(
+        "/api/agents/templates",
+        headers=test_state["headers"],
+        params={"vertical": "hotel"},
+    )
+    assert r.status_code == 200
+    rows = r.json()
+    roles_seen = sorted({row["role"] for row in rows if row["role"]})
+    assert "rex" in roles_seen and "mara" in roles_seen and "joey" in roles_seen, (
+        f"vertical=hotel should include rex + mara + joey, got {roles_seen}"
+    )
+
+    # Full-trio provisioning for a clinic tenant.
+    r = await http.post(
+        "/api/agents/provision-vertical",
+        headers=test_state["headers"],
+        json={
+            "vertical": "clinic",
+            "roles": ["rex", "mara", "joey"],
+            "name_prefix": f"Care {test_state['suffix']}",
+        },
+    )
+    assert r.status_code == 201, f"trio provision failed: {r.status_code} {r.text}"
+    out = r.json()
+    created = out["agents"]
+    assert len(created) == 3
+    by_role = {a["role"]: a for a in created}
+    assert set(by_role.keys()) == {"rex", "mara", "joey"}
+    for role, ag in by_role.items():
+        assert ag["vertical"] == "clinic"
+        assert ag["name"].startswith(f"Care {test_state['suffix']}")
+
+    # DB: Joey agent autonomy reflects L2 outbound + L3 financial
+    async with Session() as db:
+        joey_agent_r = await db.execute(
+            select(Agent).where(Agent.id == uuid.UUID(by_role["joey"]["agent_id"]))
+        )
+        joey_agent = joey_agent_r.scalar_one_or_none()
+        assert joey_agent is not None
+        pol = joey_agent.autonomy_policy or {}
+        assert pol.get("send_external_message") == "L2"
+        assert pol.get("financial_operations") == "L3"
+
+
 async def test_phase_c_chain(http, test_state, db_session):
-    """C.1 -> C.2 dependent chain.
+    """C.1 -> C.2 -> C.3 dependent chain.
 
     Single test function so fixtures stay on one event loop (same
     pattern as test_phase_b.py). Each phase's assertions must pass
@@ -325,3 +415,7 @@ async def test_phase_c_chain(http, test_state, db_session):
     print("--- Phase C.2: Mara × 3 verticals seeded + provisionable ---")
     await _phase_c2_mara_verticals(http, test_state, db_session)
     print("Phase C.2 PASS")
+
+    print("--- Phase C.3: Joey × 3 verticals + full rex+mara+joey trio provisioning ---")
+    await _phase_c3_joey_verticals(http, test_state, db_session)
+    print("Phase C.3 PASS")
