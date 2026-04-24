@@ -30,6 +30,10 @@ class Agent(Base):
     role_description: Mapped[str] = mapped_column(String(500), default="")
     bio: Mapped[str | None] = mapped_column(Text)
     welcome_message: Mapped[str | None] = mapped_column(Text, default=None)
+    # Phase F.1.a — bridge to apps/isola agents.id for idempotent ensure-agent
+    external_id: Mapped[str | None] = mapped_column(String(200), index=True)
+    # Phase F.1.a — tenant-configurable tone 0=formal 1=balanced 2=casual
+    tone: Mapped[int] = mapped_column(Integer, default=1)
 
     # Ownership
     creator_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
