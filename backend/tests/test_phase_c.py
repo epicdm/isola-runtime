@@ -203,16 +203,16 @@ async def _phase_c1_provision_vertical(http, test_state, db_session):
         assert tmpl.role == "rex"
         assert tmpl.vertical == "hotel"
 
-    # Now provision the same tenant with roles=['rex','mara'] — missing
-    # Mara template should produce 404, not partial create.
+    # Missing-role still 404s (fail-fast, no partial create). Post-C.2
+    # 'mara' is now seeded, so the gap role is 'joey' — updated when C.3 lands.
     r = await http.post(
         "/api/agents/provision-vertical",
         headers=test_state["headers"],
-        json={"vertical": "hotel", "roles": ["rex", "mara"]},
+        json={"vertical": "hotel", "roles": ["rex", "joey"]},
     )
-    assert r.status_code == 404, f"expected 404 for missing Mara template, got {r.status_code}: {r.text}"
+    assert r.status_code == 404, f"expected 404 for missing Joey template, got {r.status_code}: {r.text}"
     detail = r.json().get("detail", "")
-    assert "mara" in str(detail).lower()
+    assert "joey" in str(detail).lower()
 
     # And unknown vertical -> 404 with descriptive message.
     r = await http.post(
@@ -223,8 +223,92 @@ async def _phase_c1_provision_vertical(http, test_state, db_session):
     assert r.status_code == 404
 
 
+async def _phase_c2_mara_verticals(http, test_state, db_session):
+    """C.2: Mara × Restaurant / Hotel / Clinic seeded + provisionable.
+
+    Depends on C.1b (proves the provision endpoint works for one role).
+    """
+    from app.models.agent import Agent, AgentTemplate
+
+    # DB: 3 Mara verticals present
+    Session = db_session
+    async with Session() as db:
+        mara_r = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.role == "mara",
+                AgentTemplate.vertical.in_(["restaurant", "hotel", "clinic"]),
+            )
+        )
+        mara = {t.vertical: t for t in mara_r.scalars().all()}
+        assert set(mara.keys()) == {"restaurant", "hotel", "clinic"}, (
+            f"expected 3 Mara verticals, got {sorted(mara.keys())}"
+        )
+        # Category should be "marketing" — distinct from Rex's "front-desk"
+        for t in mara.values():
+            assert t.category == "marketing"
+            assert t.is_builtin is True
+        # Autonomy-policy check: Mara's send_external_message is L3
+        # (never DMs customers without owner approval).
+        for t in mara.values():
+            assert t.default_autonomy_policy.get("send_external_message") == "L3", (
+                f"{t.name}: send_external_message should be L3 for Mara "
+                f"(got {t.default_autonomy_policy.get('send_external_message')})"
+            )
+
+    # API filter — role=mara yields 3
+    r = await http.get(
+        "/api/agents/templates", headers=test_state["headers"], params={"role": "mara"}
+    )
+    assert r.status_code == 200
+    rows = r.json()
+    assert len(rows) == 3
+    assert sorted(row["vertical"] for row in rows) == ["clinic", "hotel", "restaurant"]
+
+    # API filter — vertical=restaurant now returns BOTH Rex and Mara
+    r = await http.get(
+        "/api/agents/templates",
+        headers=test_state["headers"],
+        params={"vertical": "restaurant"},
+    )
+    assert r.status_code == 200
+    rows = r.json()
+    roles_seen = sorted({row["role"] for row in rows if row["role"]})
+    assert "rex" in roles_seen and "mara" in roles_seen, (
+        f"vertical=restaurant should include both rex + mara, got {roles_seen}"
+    )
+
+    # Provisioning: roles=[rex, mara] against restaurant now creates 2 agents.
+    r = await http.post(
+        "/api/agents/provision-vertical",
+        headers=test_state["headers"],
+        json={
+            "vertical": "restaurant",
+            "roles": ["rex", "mara"],
+            "name_prefix": f"Lolo {test_state['suffix']}",
+        },
+    )
+    assert r.status_code == 201, f"provision failed: {r.status_code} {r.text}"
+    out = r.json()
+    created = out["agents"]
+    assert len(created) == 2
+    by_role = {a["role"]: a for a in created}
+    assert set(by_role.keys()) == {"rex", "mara"}
+    assert by_role["rex"]["vertical"] == "restaurant"
+    assert by_role["mara"]["vertical"] == "restaurant"
+
+    # DB: both agents point at their respective template_ids, with
+    # inherited autonomy_policy (Mara's is distinctly tighter).
+    async with Session() as db:
+        mara_agent_r = await db.execute(
+            select(Agent).where(Agent.id == uuid.UUID(by_role["mara"]["agent_id"]))
+        )
+        mara_agent = mara_agent_r.scalar_one_or_none()
+        assert mara_agent is not None
+        assert mara_agent.autonomy_policy.get("send_external_message") == "L3"
+
+
 async def test_phase_c_chain(http, test_state, db_session):
-    """C.1 dependent chain: templates seeded -> provision-vertical works.
+    """C.1 -> C.2 dependent chain.
 
     Single test function so fixtures stay on one event loop (same
     pattern as test_phase_b.py). Each phase's assertions must pass
@@ -237,3 +321,7 @@ async def test_phase_c_chain(http, test_state, db_session):
     print("--- Phase C.1b: provision-vertical creates agents from templates ---")
     await _phase_c1_provision_vertical(http, test_state, db_session)
     print("Phase C.1b PASS")
+
+    print("--- Phase C.2: Mara × 3 verticals seeded + provisionable ---")
+    await _phase_c2_mara_verticals(http, test_state, db_session)
+    print("Phase C.2 PASS")
