@@ -150,6 +150,55 @@ class WhatsAppService:
             file_resp.raise_for_status()
             return file_resp.content, mime_type, sha256
 
+    async def send_location(
+        self,
+        *,
+        phone_number_id: str,
+        access_token: str,
+        to: str,
+        latitude: float,
+        longitude: float,
+        name: str = "",
+        address: str = "",
+    ) -> dict:
+        """Send a native WhatsApp location message — a tappable pin that
+        opens the user's maps app. Much richer than a maps.google.com URL.
+
+        Args:
+            latitude / longitude: decimal degrees (WGS84).
+            name: optional place name shown in the pin bubble.
+            address: optional street address shown below the name.
+        """
+        url = f"{META_GRAPH_API_BASE}/{phone_number_id}/messages"
+        location_body: dict = {
+            "latitude": str(latitude),
+            "longitude": str(longitude),
+        }
+        if name:
+            location_body["name"] = name[:100]
+        if address:
+            location_body["address"] = address[:180]
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "location",
+            "location": location_body,
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"[WhatsApp] send_location failed "
+                    f"status={resp.status_code} body={resp.text[:500]}"
+                )
+            resp.raise_for_status()
+            return resp.json()
+
     async def send_image_by_url(
         self,
         *,

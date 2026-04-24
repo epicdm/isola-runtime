@@ -8,14 +8,15 @@ This module scans the LLM's reply for those markers, dispatches the matching
 action asynchronously, and returns the cleaned reply text (with markers
 stripped) for delivery to the customer.
 
-Supported markers (Phase F.1.c-2 — escalate only):
-  [escalate: <reason>]   fire escalation ping to owner
+Supported markers:
+  [escalate: <reason>]                              fire escalation ping (F.1.c-2)
+  [location: lat=N,lon=N[,name="..."][,address="..."]]  send WA location message (F.1.c-3)
 
-Planned for F.1.c-3:
-  [attach:<path>]               send workspace file as WA media
-  [location:lat=...,lon=...,...] send WA location message
-  [pay:amount=N;ref=X]          generate Fiserv pay link
-  [template:name=X;params=...]  send Meta template (for >24h outbound)
+Planned:
+  [attach:<path>]               send workspace file as WA media (F.1.c-3b)
+  [pay:amount=N;ref=X]          generate Fiserv pay link (F.1.d)
+  [template:name=X;params=...]  Meta template send — prefer the
+                                whatsapp_send_template LLM tool instead.
 """
 
 from __future__ import annotations
@@ -28,11 +29,17 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
-# Single regex that captures ANY known marker. Each named group corresponds
-# to one marker type. Expand here when adding new markers.
+# Single regex that matches any marker. We then dispatch by kind based on
+# which alternative matched (captured in the `kind` named group).
 _MARKER_RE = re.compile(
-    r"\[escalate:\s*(?P<escalate>[^\]\n]+?)\s*\]",
+    r"\[(?P<kind>escalate|location)\s*:\s*(?P<body>[^\]\n]+?)\s*\]",
     re.IGNORECASE,
+)
+
+# [location: lat=X,lon=Y,name="...",address="..."] — body is the key=value
+# list after the colon. Values support both quoted and unquoted forms.
+_LOCATION_KV_RE = re.compile(
+    r'(?P<key>\w+)\s*=\s*(?:"(?P<qv>[^"]*)"|(?P<v>[^,]+?))(?=\s*,|\s*$)',
 )
 
 
@@ -69,9 +76,13 @@ async def parse_and_dispatch(reply_text: str, ctx: ReplyContext) -> str:
         return reply_text
 
     for m in matches:
+        kind = (m.group("kind") or "").lower()
+        body = m.group("body") or ""
         try:
-            if (reason := m.group("escalate")):
-                await _dispatch_escalate(reason, ctx)
+            if kind == "escalate":
+                await _dispatch_escalate(body, ctx)
+            elif kind == "location":
+                await _dispatch_location(body, ctx)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"[reply_markers] dispatch failed for marker "
@@ -116,3 +127,44 @@ async def _dispatch_escalate(reason: str, ctx: ReplyContext) -> None:
             f"[reply_markers] escalate suppressed (dedup or no owner_phone) "
             f"for agent={ctx.agent_id}"
         )
+
+
+async def _dispatch_location(body: str, ctx: ReplyContext) -> None:
+    """Send a native WA location message to the customer.
+
+    Marker grammar: `[location: lat=15.3,lon=-61.38,name="Isola Bistro",address="34 Great Marlborough St"]`
+    Only lat+lon are required; name/address are optional. Silently skips on
+    malformed coords so the customer still gets the cleaned reply text.
+    """
+    kv: dict[str, str] = {}
+    for m in _LOCATION_KV_RE.finditer(body):
+        key = m.group("key").lower()
+        value = m.group("qv") if m.group("qv") is not None else (m.group("v") or "").strip()
+        kv[key] = value
+
+    try:
+        lat = float(kv.get("lat") or kv.get("latitude") or "")
+        lon = float(kv.get("lon") or kv.get("longitude") or "")
+    except ValueError:
+        logger.warning(
+            f"[reply_markers] location marker missing or invalid lat/lon "
+            f"for agent={ctx.agent_id}: {body!r}"
+        )
+        return
+
+    from app.services.whatsapp_service import WhatsAppService
+
+    svc = WhatsAppService()
+    await svc.send_location(
+        phone_number_id=ctx.phone_number_id,
+        access_token=ctx.access_token,
+        to=ctx.customer_phone,
+        latitude=lat,
+        longitude=lon,
+        name=kv.get("name", ""),
+        address=kv.get("address", ""),
+    )
+    logger.info(
+        f"[reply_markers] location sent for agent={ctx.agent_id} "
+        f"lat={lat} lon={lon} name={kv.get('name', '')!r}"
+    )
