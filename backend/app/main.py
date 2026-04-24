@@ -275,6 +275,7 @@ from app.api.discord_bot import router as discord_router
 from app.api.teams import router as teams_router
 from app.api.triggers import router as triggers_router
 from app.api.gateway import router as gateway_router
+from app.api.internal import router as internal_router
 
 
 from app.api.webhooks import router as webhooks_router
@@ -310,6 +311,7 @@ app.include_router(teams_router, prefix=settings.API_PREFIX)
 
 app.include_router(triggers_router)
 app.include_router(gateway_router, prefix=settings.API_PREFIX)
+app.include_router(internal_router, prefix=settings.API_PREFIX)
 app.include_router(chat_sessions_router)
 app.include_router(plaza_router)
 app.include_router(notification_router, prefix=settings.API_PREFIX)
