@@ -516,15 +516,22 @@ async def ensure_agent(
     # empty Soul & Memory tab on first iframe load. Mirrors the Phase C
     # provision-from-template flow.
     autonomy_policy: dict = {}
+    # Default role_description to the template's description when caller
+    # didn't send one — apps/isola doesn't carry role_description on
+    # agents today, so new tenants' Rex would otherwise come up with an
+    # empty role and fall through to "a digital assistant" in soul.md.
+    role_description = data.role_description[:500]
     if template_id is not None:
         # We already loaded the template above; reuse it.
         autonomy_policy = dict(tpl.default_autonomy_policy or {})
+        if not role_description:
+            role_description = (tpl.description or "")[:500]
 
     agent = Agent(
         id=new_id,
         external_id=data.external_id,
         name=data.name[:100],
-        role_description=data.role_description[:500],
+        role_description=role_description,
         tenant_id=tenant.id,
         creator_id=user.id,
         template_id=template_id,
