@@ -128,7 +128,7 @@ Marketing site + vertical pages · 6-step HR onboarding · Drafts-on-probation �
 | Per-agent Skills management | **Medium** | Skill tuning | 2-3d |
 | Per-agent Tools management | **Medium** | Autonomy tuning | 2-3d |
 | A2A Relationships graph | **Low** | Multi-agent orgs (Team/Suite tier) | 3-4d |
-| Plaza marketplace | **Low** | Team/Suite-tier growth material | 5-7d |
+| Plaza marketplace | **Medium** | MVP-scope — surfaces the 30 role×vertical templates as a "browse + hire" catalog; tenants find agents beyond onboarding | 5-7d |
 | Enterprise Settings (LLM models) | **Low** | Platform-admin only; CLI is fine for v1 | 1-2d |
 
 ### What to drop outright
@@ -197,7 +197,7 @@ No change to what's in the sidebar today:
 - Outbound / Insights
 - Channels / Integrations / Billing / Settings
 - Ema
-- Marketplace (Team/Suite tier gated — Plaza lives here when it lands)
+- Marketplace — Plaza, available from MVP. Browse + "hire" additional agents from the 30 role×vertical templates
 
 ### What we build new on the apps/isola side
 
@@ -288,7 +288,7 @@ Net: ~1,100 LoC restored, one Alembic migration, one new integration test. Effor
 | E.1 | OpenClaw restore | isola-runtime | 1 day |
 | E.2 | Port 4 high-priority tabs: Status, Activity Log, Chat Stream, Approvals | isola-mvp | 8-12 days |
 | E.3 | Port 5 medium-priority tabs: Soul & Memory, Triggers, Tools, Skills, Workspace | isola-mvp | 10-15 days |
-| E.4 | Port 2 low-priority tabs: Relationships, Plaza (tier-gated) | isola-mvp | 8-10 days |
+| E.4 | Port 2 remaining tabs: Relationships, Plaza (MVP-scope marketplace) | isola-mvp | 8-10 days |
 | E.5 | Runtime Mode UI in settings | isola-mvp | 1-2 days |
 | E.6 | Retire `staging.isola.epic.dm` | ops | ~30 min |
 
@@ -308,16 +308,18 @@ When isola-runtime covers everything BFF v2 did.
 
 ---
 
-## 7. Decisions needed from Eric
+## 7. Decisions finalized
 
-| # | Question | My recommendation |
+All 6 decisions confirmed by Eric 2026-04-24. No open questions remaining.
+
+| # | Question | Answer |
 |:--:|---|---|
-| 1 | Plaza in MVP or Team/Suite only? | **Team/Suite only.** Isola MVP sells one-agent Starter tier; Plaza makes sense when tenants want multi-agent teams. |
-| 2 | Advanced toggle — per-agent or global? | **Per-user global.** Store in localStorage. Agency operators flip once; SMB owners never find it. |
+| 1 | Plaza in MVP or Team/Suite only? | **MVP** — surfaces the 30 role×vertical templates as a browse-and-hire catalog. Available in Starter tier from day one. |
+| 2 | Advanced toggle — per-agent or global? | **Per-user global.** localStorage-persisted. Agency operators flip once; SMB owners never find it. |
 | 3 | Runtime Mode — tenant-level or per-agent? | **Tenant-level for v1.** Simpler onboarding. Per-agent later if a tenant asks. |
 | 4 | Retire `staging.isola.epic.dm` after E.2-E.4? | **Yes.** Kill when apps/isola has the 11 tabs. Until then, keep as dev reference. |
-| 5 | Rebuild the Clawith frontend container against a temp "admin" rebrand *or* leave it as-is? | **Leave as-is.** Effort wasted if we kill it in E.6 anyway. The current English + register-first + no-Google-Translate state is fine for the eval period. |
-| 6 | Should the restored OpenClaw gateway and the Edge daemon be rebranded to "Isola Edge" in code + docs? | **Yes.** Keep `gateway` as the internal route name (less churn), but everything user-facing should say "Edge" not "OpenClaw." |
+| 5 | Rebuild the Clawith frontend container against a temp admin rebrand *or* leave it as-is? | **Leave as-is.** Effort wasted if we kill it in E.6 anyway. Current English + register-first + no-Google-Translate state is fine for eval. |
+| 6 | Rebrand "OpenClaw" → "Edge" in user-facing text? | **Yes.** Keep `/api/gateway/*` as the internal route name (less churn). Everything user-facing says "Edge." |
 
 ---
 
