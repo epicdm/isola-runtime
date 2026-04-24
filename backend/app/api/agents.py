@@ -107,14 +107,30 @@ async def _lazy_reset_token_counters(agent: Agent, db: AsyncSession) -> bool:
 
 @router.get("/templates")
 async def list_templates(
+    role: str | None = None,
+    vertical: str | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all available agent templates."""
+    """List available agent templates, optionally filtered by role and/or vertical.
+
+    Query params:
+      role     optional role filter (rex, mara, joey, cash, brief, tech)
+      vertical optional vertical filter (restaurant, hotel, clinic, retail, service)
+    """
     from app.models.agent import AgentTemplate
-    result = await db.execute(
-        select(AgentTemplate).order_by(AgentTemplate.is_builtin.desc(), AgentTemplate.created_at.asc())
+    stmt = select(AgentTemplate)
+    if role:
+        stmt = stmt.where(AgentTemplate.role == role)
+    if vertical:
+        stmt = stmt.where(AgentTemplate.vertical == vertical)
+    stmt = stmt.order_by(
+        AgentTemplate.is_builtin.desc(),
+        AgentTemplate.role.asc(),
+        AgentTemplate.vertical.asc(),
+        AgentTemplate.created_at.asc(),
     )
+    result = await db.execute(stmt)
     templates = result.scalars().all()
     return [
         {
@@ -123,6 +139,8 @@ async def list_templates(
             "description": t.description,
             "icon": t.icon,
             "category": t.category,
+            "role": t.role,
+            "vertical": t.vertical,
             "is_builtin": t.is_builtin,
             "soul_template": t.soul_template,
             "default_skills": t.default_skills,
@@ -130,6 +148,118 @@ async def list_templates(
         }
         for t in templates
     ]
+
+
+@router.post("/provision-vertical", status_code=201)
+async def provision_vertical_agents(
+    data: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create agents from a vertical + role list (Phase C.1 provisioning).
+
+    Body:
+      vertical   required — one of (restaurant, hotel, clinic, retail, service)
+      roles      required — non-empty list of role codes
+      name_prefix optional — prefix applied to each created agent's name;
+                  defaults to the tenant's display name
+      tenant_id  optional platform-admin override; otherwise the current
+                  user's tenant is used.
+
+    For each role, look up the matching AgentTemplate (role + vertical)
+    and create an Agent backed by it. Agents inherit the template's
+    soul_template, default_skills, and default_autonomy_policy.
+    """
+    from app.models.agent import AgentTemplate, Agent, AgentPermission
+    from app.models.participant import Participant
+
+    vertical = (data.get("vertical") or "").strip().lower()
+    roles_in = data.get("roles") or []
+    if not vertical:
+        raise HTTPException(status_code=422, detail="vertical is required")
+    if not isinstance(roles_in, list) or not roles_in:
+        raise HTTPException(status_code=422, detail="roles must be a non-empty list")
+    roles = [str(r).strip().lower() for r in roles_in if str(r).strip()]
+    if not roles:
+        raise HTTPException(status_code=422, detail="roles must contain at least one role")
+
+    # Scope to current user's tenant unless platform_admin passes an override.
+    target_tenant_id = current_user.tenant_id
+    override = data.get("tenant_id")
+    if override and current_user.role == "platform_admin":
+        target_tenant_id = uuid.UUID(str(override))
+
+    name_prefix = (data.get("name_prefix") or "").strip()
+
+    # Look up templates for this vertical + role set.
+    stmt = select(AgentTemplate).where(
+        AgentTemplate.vertical == vertical,
+        AgentTemplate.role.in_(roles),
+    )
+    tmpl_r = await db.execute(stmt)
+    templates_by_role = {t.role: t for t in tmpl_r.scalars().all()}
+
+    missing = [r for r in roles if r not in templates_by_role]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No template for vertical='{vertical}' roles={missing}",
+        )
+
+    created = []
+    for role in roles:
+        t = templates_by_role[role]
+        role_label = role.capitalize()
+        if name_prefix:
+            display_name = f"{name_prefix} {role_label}"
+        else:
+            display_name = role_label
+        agent = Agent(
+            name=display_name[:100],
+            role_description=t.description[:500],
+            creator_id=current_user.id,
+            tenant_id=target_tenant_id,
+            template_id=t.id,
+            autonomy_policy=dict(t.default_autonomy_policy or {}),
+            status="creating",
+        )
+        db.add(agent)
+        await db.flush()
+
+        # Create the Participant identity row.
+        db.add(Participant(
+            type="agent", ref_id=agent.id,
+            display_name=agent.name, avatar_url=agent.avatar_url,
+        ))
+        # Creator gets manage access by default.
+        db.add(AgentPermission(
+            agent_id=agent.id, scope_type="user",
+            scope_id=current_user.id, access_level="manage",
+        ))
+        await db.flush()
+
+        # Seed agent workspace from template (soul.md customized with
+        # this role × vertical's soul). Uses the same path as the regular
+        # create_agent flow.
+        from app.services.agent_manager import agent_manager
+        await agent_manager.initialize_agent_files(
+            db, agent, personality="", boundaries=""
+        )
+
+        created.append({
+            "agent_id": str(agent.id),
+            "name": agent.name,
+            "role": t.role,
+            "vertical": t.vertical,
+            "template_id": str(t.id),
+        })
+
+    await db.commit()
+    return {
+        "vertical": vertical,
+        "roles_requested": roles,
+        "agents": created,
+    }
 
 
 @router.get("/", response_model=list[AgentOut])

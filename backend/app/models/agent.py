@@ -146,6 +146,12 @@ class AgentTemplate(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     icon: Mapped[str] = mapped_column(String(50), default="🤖")
     category: Mapped[str] = mapped_column(String(50), default="general")
+    # Phase C: role × vertical matrix for Isola's quiz-driven provisioning.
+    # NULL on both = a non-vertical / legacy template.
+    # role: 'rex' | 'mara' | 'joey' | 'cash' | 'brief' | 'tech'
+    # vertical: 'restaurant' | 'hotel' | 'clinic' | 'retail' | 'service'
+    role: Mapped[str | None] = mapped_column(String(32), index=True)
+    vertical: Mapped[str | None] = mapped_column(String(32), index=True)
     soul_template: Mapped[str] = mapped_column(Text, default="")
     default_skills: Mapped[list] = mapped_column(JSON, default=[])
     default_autonomy_policy: Mapped[dict] = mapped_column(JSON, default={})
