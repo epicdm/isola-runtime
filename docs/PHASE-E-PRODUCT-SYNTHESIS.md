@@ -1,10 +1,36 @@
 # Phase E — Product Synthesis: merging Clawith's depth with Isola's clarity
 
-**Decision output for Audience C** (everyone — SMB owner + operator + agency + EPIC team). Single UI. Progressive disclosure. OpenClaw as a premium privacy tier.
+**Decision output for Audience C** (everyone — SMB owner + operator + agency + EPIC team). Hybrid architecture. Progressive disclosure. OpenClaw as a premium privacy tier. Gate at ~30 paying tenants to decide whether to unify further.
 
 ## TL;DR
 
-Isola's `apps/isola` is a tight customer-facing funnel (marketing → 6-step HR-metaphor onboarding → business dashboard) but has a weak agent-workspace that can't tell the operator what the agent is doing. Clawith's UI is an 11-tab operator cockpit (soul, memory, triggers, tools, skills, A2A, workspace, chat-stream, activity log, approvals, settings) with no buyer funnel and no business-ops surfaces. **The merge: one UI at `isola.epic.dm`, apps/isola's front door intact, Clawith's depth progressively disclosed per-agent behind an Advanced toggle. OpenClaw (the edge-runtime we stripped in Phase A.2) returns as a premium privacy-tier differentiator for clinics / law / banks.**
+Isola's `apps/isola` is a tight customer-facing funnel (marketing → 6-step HR-metaphor onboarding → business dashboard) but has a weak agent-workspace that can't tell the operator what the agent is doing. Clawith's UI is an 11-tab operator cockpit (soul, memory, triggers, tools, skills, A2A, workspace, chat-stream, activity log, approvals, settings) with no buyer funnel and no business-ops surfaces.
+
+**Architecture: Option C — Hybrid, two stacks under one brand.**
+
+- `isola.epic.dm/` = apps/isola (Next.js on Vercel) serves marketing, auth, onboarding, top-level dashboard (catalog, bookings, contacts, inbox, billing).
+- `isola.epic.dm/dashboard/agents/*` = Clawith UI served via reverse proxy, untouched — the 11-tab agent workspace + Plaza marketplace come through as-is.
+- Design tokens (colors, typography, nav chrome) aligned so the seam is invisible to users.
+- `admin.epic.dm` = EPIC staff ops console (Clawith's admin pages rehomed).
+- `staging.isola.epic.dm` = Clawith pristine frontend, permanent reference (not retiring).
+- `runtime.epic.dm` = single backend serving both UIs.
+
+**Gate at ~30 paying tenants.** At that milestone, decide whether to unify into one stack (rewrite Clawith tabs natively into apps/isola) or keep the hybrid long-term. Data drives the call: if the seam bothers users, unify; if nobody notices, keep shipping.
+
+**OpenClaw returns** as "Edge" runtime mode — premium privacy-tier differentiator for clinics / law / banks / cost-conscious high-volume tenants.
+
+**Clawith's capabilities are Isola's offer.** Don't hold back — expose them all:
+- **Marketplace** (Plaza) for browsing + hiring agents from 30 role×vertical templates
+- **Edge** (BYO OpenClaw) for tenants running LLM on their own hardware
+- **Approvals queue** for L3-autonomy high-stakes actions
+- **Per-agent Tools** catalog — MCP + built-in, per-agent configurable
+- **Per-agent Skills** — file-level SKILL.md management
+- **Multi-channel adapters** — WhatsApp (priority), Slack, Discord, Teams, per-agent enable + config
+- **Soul & Memory editors** — markdown editors for agent personality + memory
+- **Triggers** — cron / interval / poll / on-message pulse engine
+- **Streaming chat** with tool-call viz for agent training
+
+**Token-credit economy replaces message-count pricing.** Tenants pick their model (Haiku / Sonnet / Opus / Gemini / GPT-4o) and burn credits at model-specific rates. BYO LLM keys available at Business tier.
 
 ---
 
@@ -36,13 +62,15 @@ Isola's `apps/isola` is a tight customer-facing funnel (marketing → 6-step HR-
 - Drafts-on-probation — the trust-building wedge for new agents
 - Next.js 15 + Vercel + shadcn/ui = fast to iterate
 
-### Weaknesses to fix
+### Weaknesses to fix (via Clawith integration)
 - **Agent workspace is shallow.** 5 tabs (ported from a Lovable prototype). Owner can edit settings but can't see what the agent is doing or thinking.
 - **No chat transparency.** No streaming, no tool-call viz. Owner doesn't know what the LLM did between receiving and replying.
 - **No soul / memory editor.** Agent personality is baked at onboarding; can't be directly edited without SQL.
 - **No trigger editor.** Can't add "send review request 2h after reservation" or "morning briefing at 9am" without engineer help.
 - **No activity log.** "Did the agent actually send that reply?" requires opening Chatwoot or BFF logs.
 - **No approvals queue.** L3 actions from the autonomy policy exist in the backend but are invisible to operators.
+
+→ All of these are solved by routing `/dashboard/agents/*` to Clawith's workspace under Option C. No rewrite required.
 
 ---
 
@@ -78,24 +106,22 @@ Isola's `apps/isola` is a tight customer-facing funnel (marketing → 6-step HR-
 | **Approvals** | L3 autonomy request queue — owner approves / rejects high-stakes actions here |
 | **Settings** | Autonomy policy, expiry, token caps, context window, heartbeat |
 
-### Strengths worth porting forward
-- The 11-tab workspace is **6–12 months of work** to recreate from scratch
-- Streaming chat + tool-call viz is product-grade
-- Approvals queue operationalizes L3 autonomy (without it, L3 is a setting nobody sees)
-- Activity log is the "is the agent actually working" answer in one view
-- Trigger editor (Aware tab) is what turns passive agents into proactive ones
-- Plaza marketplace is credible Team/Suite-tier growth material
-- Zustand + react-query state management is clean
+### Strengths that come through via reverse proxy (Option C)
+- The 11-tab workspace is **6–12 months of work** to recreate from scratch — and under Option C we don't.
+- Streaming chat + tool-call viz is product-grade — arrives intact.
+- Approvals queue operationalizes L3 autonomy (without it, L3 is a setting nobody sees).
+- Activity log is the "is the agent actually working" answer in one view.
+- Trigger editor (Aware tab) is what turns passive agents into proactive ones.
+- Plaza marketplace is credible Team/Suite-tier growth material.
+- Zustand + react-query state management is clean.
 
-### Weaknesses that justify dropping or hiding for the SMB buyer
-- Terminology assumes a technical operator: *autonomy_policy, context_window_size, A2A relationships*
-- No marketing funnel / no vertical positioning / no Caribbean presence
-- No business-ops surfaces (no catalog, no bookings, no contacts, no hours)
-- Invitation-gated signup assumes enterprise adoption model
-- "Enterprise Settings" exposes LLM model config to every platform-admin (wrong for multi-tenant)
-- Plaza marketplace is premature for MVP
-- Chinese strings leak through in ~7% of UI text
-- Dead code still in repo: `OpenClawSettings.tsx`, `AgentBayLivePanel.tsx`
+### Weaknesses — handled in Option C by hide/gate/rename, not rewrite
+- Technical terminology (*autonomy_policy, context_window_size*) — rename via i18n en.json overrides.
+- Chinese strings in ~7% of UI — override en.json.
+- Invitation-gated signup — signup funnel lives in apps/isola Next.js, Clawith's `/login` is unreachable for tenants.
+- Enterprise Settings LLM management — gate behind staff role OR tier (see §3a + §9).
+- Plaza premature — kept at MVP per decision #1.
+- Dead code (`AgentBayLivePanel.tsx`) — route hidden, file stays in repo.
 
 ---
 
@@ -105,35 +131,33 @@ Isola's `apps/isola` is a tight customer-facing funnel (marketing → 6-step HR-
 
 | Feature | apps/isola | Clawith | Merged product wins |
 |---|---|---|---|
-| Register / login | Better-Auth, clean | Enterprise email flow | **apps/isola** (better UX) |
-| Agent create | Quiz, vertical-aware | 5-step wizard, generic | **apps/isola** — wire to `/api/agents/provision-vertical` |
-| Chat UI | Basic | Streaming + tool-call viz | **Clawith** (port to apps/isola) |
-| Agent settings | Keywords / owner / probation | Autonomy / tokens / expiry | **Combined** — Isola fields + Clawith fields on one page |
+| Register / login | Better-Auth, clean | Enterprise email flow | **apps/isola** (Clawith's auth routes hidden) |
+| Agent create | Quiz, vertical-aware | 5-step wizard, generic | **Clawith wizard reachable at `/dashboard/agents/new`** — faster than rewriting Isola's weak version. Provision-vertical endpoint powers both. |
+| Chat UI | Basic | Streaming + tool-call viz | **Clawith** (proxied intact) |
+| Agent settings | Keywords / owner / probation | Autonomy / tokens / expiry | **Clawith's page** — Isola fields migrated into it via Settings tab extension |
+| Agent list | Minimal | Rich card layout | **Clawith** (proxied) |
 
-### Where only Isola has it (preserve)
+### Where only Isola has it (preserve in apps/isola)
 
 Marketing site + vertical pages · 6-step HR onboarding · Drafts-on-probation · Catalog · Bookings · Contacts · Hours · Knowledge · Outbound campaigns · Insights · Ema (EPIC assistant) · QA-bot admin · Channels config · Billing
 
-### Where only Clawith has it (port in priority order)
+### Where only Clawith has it (comes through via proxy)
 
-| Capability | Priority | Why | Rough effort |
-|---|:---:|---|:---:|
-| Agent Status card (tokens, activity, model) | **High** | Visible on every agent page | 1-2d |
-| Streaming chat + tool-call viz | **High** | Trust-building: "what did my agent do?" | 3-5d |
-| Activity Log | **High** | Operator answer to "is it working?" | 2-3d |
-| Approvals queue | **High** | Operationalizes L3 autonomy | 2-3d |
-| Soul / Memory editor | **Medium** | Power users + agencies love it | 2-3d |
-| Triggers editor | **Medium** | Proactive agents (morning briefings, review asks, follow-ups) | 3-4d |
-| Workspace file browser | **Medium** | Deep debugging + knowledge edit | 2-3d |
-| Per-agent Skills management | **Medium** | Skill tuning | 2-3d |
-| Per-agent Tools management | **Medium** | Autonomy tuning | 2-3d |
-| A2A Relationships graph | **Low** | Multi-agent orgs (Team/Suite tier) | 3-4d |
-| Plaza marketplace | **Medium** | MVP-scope — surfaces the 30 role×vertical templates as a "browse + hire" catalog; tenants find agents beyond onboarding | 5-7d |
-| Enterprise Settings (LLM models) | **Low** | Platform-admin only; CLI is fine for v1 | 1-2d |
+| Capability | Status in Option C |
+|---|---|
+| Agent Status card (tokens, activity, model) | ✅ proxied |
+| Streaming chat + tool-call viz | ✅ proxied |
+| Activity Log | ✅ proxied |
+| Approvals queue | ✅ proxied |
+| Soul / Memory editor | ✅ proxied |
+| Triggers editor | ✅ proxied |
+| Workspace file browser | ✅ proxied |
+| Per-agent Skills management | ✅ proxied |
+| Per-agent Tools management | ✅ proxied |
+| A2A Relationships graph | ✅ proxied |
+| Plaza marketplace | ✅ proxied at `/dashboard/marketplace` |
 
-### What to drop outright
-
-`OpenClawSettings.tsx` (replaced by Runtime Mode setting) · `AgentBayLivePanel.tsx` (Alibaba sandbox, deleted in A.1b) · Invitation-only signup gate · Chinese default locale
+**Net build effort saved vs current synthesis: ~26-37 days.** Previous plan was rewriting each tab as shadcn/Next.js (100-400 LoC × 11 tabs + Plaza). Option C delivers the same capabilities in ~1 week of token-alignment + proxy + gating work.
 
 ---
 
@@ -141,37 +165,48 @@ Marketing site + vertical pages · 6-step HR onboarding · Drafts-on-probation �
 
 Eric's directive: *"expose all from Clawith OR indicate which will not be in the Isola UI."* This is the complete list. Nothing is quietly dropped.
 
-### ✅ Ported into Isola UI (behind Advanced toggle where applicable)
+### ✅ Reachable in Isola UI (proxied under isola.epic.dm/dashboard/*)
 
-| Clawith surface | Lands in Isola as | Notes |
+| Clawith surface | Lands at | Notes |
 |---|---|---|
-| Dashboard | `/dashboard` (apps/isola) — already exists | apps/isola wins, Clawith version deprecated |
-| AgentDetail **Status** tab | `/dashboard/agent/[agentId]` Overview tab | Default-visible |
-| AgentDetail **Inbox** (chat history) | `/dashboard/agent/[agentId]` Inbox tab | Default-visible |
-| AgentDetail **Settings** | `/dashboard/agent/[agentId]` Settings tab | Default-visible; Isola fields + Clawith fields merged |
-| AgentDetail **Activity Log** | Same page, Advanced | Advanced toggle — E.2 |
-| AgentDetail **Chat Stream** | Same page, Advanced | Advanced toggle — E.2 (typewriter + tool-call viz) |
-| AgentDetail **Approvals** | Same page, Advanced | Advanced toggle — E.2 (L3 autonomy queue) |
-| AgentDetail **Soul & Memory (Mind)** | Same page, Advanced | Advanced toggle — E.3 |
-| AgentDetail **Triggers (Aware)** | Same page, Advanced | Advanced toggle — E.3 |
-| AgentDetail **Tools** | Same page, Advanced | Advanced toggle — E.3 |
-| AgentDetail **Skills** | Same page, Advanced | Advanced toggle — E.3 |
-| AgentDetail **Workspace** (file browser) | Same page, Advanced | Advanced toggle — E.3 |
-| AgentDetail **Relationships** (A2A) | Same page, Advanced | Advanced toggle — E.4 |
-| Plaza (marketplace) | `/dashboard/marketplace` | **MVP-scope** per decision #1 |
-| Messages (cross-agent inbox) | `/dashboard/inbox` (apps/isola) | apps/isola version is better |
-| CompanySetup | Replaced by apps/isola's 6-step onboarding | apps/isola wins |
-| AgentCreate wizard | Replaced by apps/isola `/dashboard/agents/new` + `provision-vertical` | apps/isola wins |
+| Agent list (dashboard main) | `/dashboard/agents` | Proxied, nav chrome replaced with apps/isola's |
+| AgentDetail **Status** tab | `/dashboard/agents/:id` (default tab) | Proxied intact |
+| AgentDetail **Aware** (Triggers) tab | `/dashboard/agents/:id/aware` | Proxied, i18n rename to "Triggers" |
+| AgentDetail **Mind** (Soul + Memory) tab | `/dashboard/agents/:id/mind` | Proxied, i18n rename to "Soul & Memory" |
+| AgentDetail **Tools** tab | `/dashboard/agents/:id/tools` | Proxied |
+| AgentDetail **Skills** tab | `/dashboard/agents/:id/skills` | Proxied |
+| AgentDetail **Relationships** tab | `/dashboard/agents/:id/relationships` | Proxied, i18n rename to "Team Relationships" |
+| AgentDetail **Workspace** tab | `/dashboard/agents/:id/workspace` | Proxied |
+| AgentDetail **Chat** tab | `/dashboard/agents/:id/chat` | Proxied, i18n rename to **"Train"** (see §11) |
+| AgentDetail **Activity Log** tab | `/dashboard/agents/:id/activity` | Proxied, i18n rename to "Timeline" |
+| AgentDetail **Approvals** tab | `/dashboard/agents/:id/approvals` | Proxied |
+| AgentDetail **Settings** tab | `/dashboard/agents/:id/settings` | Proxied; Isola fields lifted into same page |
+| **Plaza / Marketplace** | `/dashboard/marketplace` | **Flagship feature.** Browse + hire from the 30 role×vertical templates. Surfaced in the sidebar from day one — not a "future" card. |
+| Agent create wizard | `/dashboard/agents/new` | Clawith wizard + provision-vertical endpoint |
+| **Channel adapters** (per-agent enable + config) | Part of AgentDetail → Channels subsection | WhatsApp, Slack, Discord, Teams — per-agent toggle + credential config. WhatsApp lit up in MVP; others reachable when tenant asks. |
+| Messages (cross-agent) | — | apps/isola's `/dashboard/inbox` wins, Clawith route unreachable |
+| LLM provider management | `/dashboard/settings/models` | See §9 — tier-gated + BYO logic layered on top. This is NOT dropped — it's refined. |
 
 ### 🔁 Replaced by Isola-native equivalents (same capability, better-branded)
 
 | Clawith surface | Isola equivalent |
 |---|---|
-| Login / Register | `/auth/[pathname]` (Better-Auth) |
+| Login / Register | `/auth/[pathname]` (Better-Auth) — Clawith login routes hidden |
 | ForgotPassword | Better-Auth flow |
 | ResetPassword | Better-Auth flow |
 | VerifyEmail | Better-Auth flow |
+| CompanySetup | Replaced by apps/isola's 6-step onboarding |
 | OpenClawSettings page | **Runtime Mode** section in `/dashboard/settings` (Hosted / Edge toggle — see §5) |
+
+### 🏢 Rehomed to EPIC admin console (admin.epic.dm, staff-only)
+
+These are kept intact but moved out of the tenant UI to a separate staff-gated surface. See §10.
+
+| Clawith surface | Why rehomed |
+|---|---|
+| **Admin Companies** (cross-tenant admin) | EPIC operational need — seed for the Tenants list at admin.epic.dm. Must not appear in tenant UI. |
+| **Platform Dashboard** (cross-tenant metrics) | Feeds admin.epic.dm's Cost dashboard. |
+| **Enterprise Settings — model routing** (per-tier allow-list, default models, fallback chains) | EPIC operational lever. Tenants see only their choices; EPIC sees the routing policy. |
 
 ### ⏸️ Deferred (not MVP — surfaces later when a tenant asks)
 
@@ -187,48 +222,42 @@ Some Clawith pages have **good options inside them** even if the page as a whole
 
 | Clawith surface | Fields/options worth keeping | Where they land in apps/isola |
 |---|---|---|
-| **Enterprise Settings** (tenant-admin page) | Company timezone · logo upload · token-spend cap (per-agent + tenant-wide) · agent-default autonomy policy · retention period for chat history · heartbeat schedule defaults · operator language preference | `/dashboard/settings` — new "Company" section alongside existing Business / Channels / Billing subsections |
-| **User Management** (team roles) | Role names · per-role permissions matrix (future Team tier) | `/dashboard/team` — merges with existing Team surface when Team tier opens |
-| **Platform Dashboard** (ops metrics per tenant) | Per-agent status badges · global token usage graph · active-session count | Integrated into `/dashboard` landing as an owner-facing "Operations" card (MVP surface, not a separate page) |
-| **Invitation Codes** (operator onboarding) | Deferred to Team tier per §3a; but the *concept* of an invite link stays (apps/isola already has a lighter version for the QA-bot flow) | Reuse apps/isola's existing invite-link pattern when Team tier opens |
+| **Enterprise Settings** (tenant fields only) | Company timezone · logo upload · retention period for chat history · operator language preference | `/dashboard/settings` — new "Company" section alongside existing Business / Channels / Billing subsections |
+| **Token / autonomy defaults** | Per-agent token cap default · autonomy policy default · heartbeat schedule default | Rolled into `/dashboard/settings` Company subsection — these are tenant-level defaults that cascade to new agents |
 
 ### ❌ Dropped — will NOT surface in Isola UI ever
 
 | Clawith surface | Why |
 |---|---|
 | **AgentBay Live Panel** (browser sandbox) | Deleted in Phase A.1b. Alibaba Cloud paid service; no Caribbean SMB use case. If we ever need browser automation, it goes via Playwright or an MCP server — not AgentBay. |
-| **Enterprise Settings — LLM model management UI** (only this specific field, not the whole page — see Partial Port above) | Platform-level concern, NOT tenant-facing. LLM models managed centrally by EPIC via CLI / env. Exposing this to tenants is a footgun. |
-| **Admin Companies** (cross-tenant admin) | EPIC-internal. Multi-tenant admin doesn't belong in a single tenant's UI. |
 | **Chinese default locale** | English default everywhere. `zh.json` stays in repo for tenant toggle, but not the default; not marketed as multi-lingual in MVP. |
-| **Invitation-only signup gate** | Isola MVP is open self-serve. Anyone with a payment method registers. |
-
----
-
-## 3b. Integration principle — port capabilities, not components
-
-**The rule: no tenant should be able to tell which features came from Clawith versus built from scratch in Isola.**
-
-Concretely:
-
-- **Visual:** Every ported tab rebuilds in apps/isola's existing stack: **shadcn/ui + Tailwind + lucide-react icons + Sonner toasts**. We do NOT import Clawith's CSS or its `@tabler/icons-react` or its handwritten modal components. Components match whatever's already in `apps/isola/src/components/ui/`.
-- **Voice:** HR metaphor everywhere — *hire, team, probation, draft, on-shift, review*. Clawith's tabs get renamed: "Aware" → **Triggers**, "Mind" → **Soul & Memory**, "Relationships" → **Team Relationships**, "Activity Log" → **Timeline**, "Approvals" → **Approvals** (already neutral).
-- **Layout:** apps/isola's existing agent page shell (breadcrumb, title, tab bar, sidebar). New tabs slot into the existing structure, not a Clawith-style layout imported wholesale.
-- **Color / typography:** Inter font (already used by both) stays. Color palette is apps/isola's — not Clawith's dark navy. Dark mode optional; light default for SMB owners.
-- **Endpoints:** Clawith's backend routes on `runtime.epic.dm` stay the same shape — the UI just calls them. No wrapper layer translating "Clawith schema" → "Isola schema"; apps/isola speaks the runtime's API directly.
-
-What this means for the E.2–E.4 ports: each tab is a **rewrite**, sized at roughly 100–400 lines of Next.js + shadcn components, not a component copy. The Clawith source file is the **specification** (what data, what interactions, what state), not the implementation template.
-
----
+| **Invitation-only signup gate** | Isola MVP is open self-serve. Anyone with a payment method registers. Clawith's `/login` and `/setup-company` are unreachable from the tenant funnel. |
 
 ### Where the EPIC team's admin needs go
 
-Everything under ❌ "Dropped" above that EPIC might still need operationally (AdminCompanies, PlatformDashboard, LLM model management) lives on a **separate EPIC-only surface** — NOT in the tenant UI. For MVP, that surface is:
+Everything under 🏢 Rehomed above goes to **admin.epic.dm** — see §10 for full scope. No platform/ops admin surfaces appear inside a tenant UI, ever.
 
-- CLI scripts in the `isola-runtime` repo (`backend/scripts/` — managed via `docker exec`)
-- Direct DB access for one-offs
-- Optionally: an internal `admin.epic.dm` URL later with the Clawith admin pages intact, locked to EPIC staff only (separate decision; not blocking MVP)
+---
 
-Tenant UI = tenant concerns only. Platform UI = EPIC-internal, separate URL.
+## 3b. Integration principle — make the seam invisible
+
+**The rule: no tenant should be able to tell which features came from Clawith versus Isola.**
+
+Under Option C (hybrid proxy), this is a **design-token alignment problem**, not a rewrite problem. What changes in the Clawith UI:
+
+- **Color palette:** override Clawith's CSS variables to match apps/isola's Tailwind theme (primary, secondary, accent, surface). Light default; dark optional.
+- **Typography:** Inter everywhere (both stacks already use it — no change).
+- **Nav chrome:** apps/isola's topbar + sidebar render as the outer shell. Clawith's UI drops its own top nav when served under isola.epic.dm; we intercept at the proxy layer or use a Clawith build flag (`VITE_EMBEDDED=true`) to hide its nav.
+- **Voice (via en.json overrides):** HR metaphor terms. "Aware" → **Triggers**. "Mind" → **Soul & Memory**. "Relationships" → **Team Relationships**. "Activity Log" → **Timeline**. "Chat" (agent workspace) → **Train**. "Plaza" → **Marketplace**.
+- **Icons:** Clawith uses `@tabler/icons-react`, apps/isola uses `lucide-react`. We don't swap Tabler out wholesale (too invasive) — we curate the 10-15 most-visible icons (sidebar, tab bar, header actions) and swap to lucide via a small icon shim. Deeper surfaces keep Tabler.
+- **Toasts:** Clawith's toasts align to Sonner styling via CSS.
+- **Endpoints:** both UIs call `runtime.epic.dm` directly. No translation layer.
+
+**What doesn't change:** Clawith's tab layout, its streaming chat pane, its component architecture. We align the chrome; the depth stays as-is.
+
+**Effort:** ~3-5 days of token + CSS + i18n work, vs 4-6 weeks to rewrite 11 tabs natively.
+
+**The "unify or don't" decision at 30 tenants** reopens this: if users genuinely can't tell, keep hybrid. If the seam bleeds through (different font weights, different spacing rhythms, different toast styles), unify by rewriting tabs natively into apps/isola.
 
 ---
 
@@ -237,81 +266,98 @@ Tenant UI = tenant concerns only. Platform UI = EPIC-internal, separate URL.
 ### Domains + services (after Phase E)
 
 ```
-isola.epic.dm   (Vercel)          apps/isola — the single UI
-       │
-       │  calls …
-       ▼
-runtime.epic.dm (deepseek)         isola-runtime — single backend
-  /api/auth/*        auth + tenants
-  /api/agents/*      agents + templates + settings
-  /api/channel/*     WhatsApp (and Slack/Discord/Teams for future)
-  /api/gateway/*     OpenClaw edge protocol (restored)
-  /ws/chat/*         streaming chat
-  /api/triggers/*    pulse engine
-  /api/approvals/*   L3 queue
+isola.epic.dm (Vercel — Next.js)
+  /                      → marketing
+  /for/{clinics,...}     → vertical pages
+  /auth/*                → Better-Auth
+  /onboarding            → 6-step HR quiz
+  /pricing · /privacy · /terms
+  /dashboard             → business-ops landing (owner metrics, recent activity)
+  /dashboard/catalog · /bookings · /contacts · /hours · /knowledge · /outbound · /insights
+  /dashboard/inbox       → Chatwoot iframe (customer conversations)
+  /dashboard/channels · /integrations · /billing · /settings
+  /dashboard/ema · /ema/reports · /ema/settings
+  /dashboard/agents/*    → REVERSE PROXY to Clawith frontend container
+                           (agent list, 11-tab workspace, Plaza marketplace)
+
+runtime.epic.dm (deepseek — FastAPI)
+  /api/auth/*            tenants + users (shared session with Better-Auth)
+  /api/agents/*          agents + templates + settings + provision-vertical
+  /api/channel/*         WhatsApp, future Slack/Discord/Teams
+  /api/gateway/*         OpenClaw edge protocol (restored in E.1)
+  /ws/chat/*             streaming chat
+  /api/triggers/*        pulse engine
+  /api/approvals/*       L3 queue
+  /api/activity-log/*    event stream
+  /api/billing/*         credit balance + top-up
+  /api/models/*          per-tenant model choice + BYO keys
   …
+
+admin.epic.dm (Clawith admin, rehomed)
+  Staff-only, 2FA.
+  Tenants list · Tenant drill-down · Impersonate · Credit grants
+  Model routing · Provider health · Cost dashboard
+  Feature flags · Audit log · Meta number pool
+
+staging.isola.epic.dm (permanent — NOT retiring)
+  Clawith pristine frontend for side-by-side reference as we iterate.
+  Cheap to keep; valuable for eval.
+
+inbox.epic.dm (Chatwoot)
+  Customer inbox — embedded at isola.epic.dm/dashboard/inbox via iframe.
 ```
 
-No separate admin URL. No `staging.isola.epic.dm`. Just the two domains above.
+### Nginx reverse-proxy sketch (isola.epic.dm)
 
-### Agent page structure (Audience C)
+```nginx
+# Most routes → Next.js (Vercel)
+location / {
+    proxy_pass https://isola-mvp-prod.vercel.app;
+    # normal Next.js proxy headers
+}
+
+# Agent workspace paths → Clawith frontend on deepseek
+location /dashboard/agents {
+    proxy_pass http://66.118.37.12:3308;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+
+location /dashboard/marketplace {
+    proxy_pass http://66.118.37.12:3308/plaza;
+    # same headers
+}
+
+# Auth cookie is set for .isola.epic.dm — both sides see the session
+```
+
+Clawith's frontend container is configured at build time with `VITE_BASE_PATH=/dashboard/agents` and `VITE_EMBEDDED=true` so its router and asset URLs work under the sub-path and its top chrome is hidden.
+
+### Agent page structure (what the tenant sees)
+
+Owner clicks "Agents" in the apps/isola sidebar. URL becomes `isola.epic.dm/dashboard/agents`. Under the hood it's Clawith rendering, but inside apps/isola's outer shell:
 
 ```
-/dashboard/agent/[agentId]/
-
-┌─ Default tabs (always visible to the owner):
-│   ├─ Overview   (status card + last 10 activity lines + quick actions)
-│   ├─ Inbox      (per-agent WhatsApp threads)
-│   ├─ Drafts     (probation queue, if agent is on probation)
-│   └─ Settings   (keywords + owner phone + probation + autonomy + quotas)
-│
-├─ [●──○] Show Advanced  ← toggle, persisted in localStorage per user
-│
-└─ When Advanced is ON, reveal 9 more tabs:
-    ├─ Activity Log     (full auto-refreshing event stream)
-    ├─ Chat Stream      (WebSocket chat with tool-call viz)
-    ├─ Soul & Memory    (markdown editors for soul.md + memory.md)
-    ├─ Triggers         (cron / interval / poll editor)
-    ├─ Tools            (per-agent tool enable + config)
-    ├─ Skills           (SKILL.md file browser)
-    ├─ Workspace        (file tree of agent's workspace dir)
-    ├─ Relationships    (A2A graph — Team/Suite tier surfaces this fully)
-    └─ Approvals        (L3 request queue)
+┌─ apps/isola topbar + sidebar (always) ────────────────────┐
+│                                                           │
+│  Agents                                 [+ Hire new agent] │  ← Clawith's header, restyled
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Rex (Front Desk) — Active — 12 convos today       │  │
+│  │  Cash (Billing)    — Probation — 3 drafts pending  │  │
+│  │  …                                                  │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
 ```
 
-The Caribbean restaurant owner defaults to 4 tabs, never finds the toggle, ships their agents, collects payments. The agency operator flips the toggle once and lives in 13 tabs. Same UI.
+Click a row → `/dashboard/agents/:id` → 11-tab Clawith workspace, same outer shell.
 
-### Dashboard sidebar stays apps/isola
+### Auth handoff
 
-No change to what's in the sidebar today:
-
-- Your Team (multi-agent overview) — renames to "Team" in team mode
-- Inbox (cross-agent)
-- Drafts
-- Catalog / Bookings / Contacts / Hours / Knowledge
-- Outbound / Insights
-- Channels / Integrations / Billing / Settings
-- Ema
-- Marketplace — Plaza, available from MVP. Browse + "hire" additional agents from the 30 role×vertical templates
-
-### What we build new on the apps/isola side
-
-Each of the 9 new tabs is a **Next.js route** that reads/writes to isola-runtime. Most endpoints already exist — we're surfacing them.
-
-| Tab | Runtime endpoint |
-|---|---|
-| Overview | `GET /api/agents/{id}` + `GET /api/activity-log/{id}?limit=10` |
-| Activity Log | `GET /api/activity-log/{id}` (streaming SSE) |
-| Chat Stream | `WS /ws/chat/{agent_id}` |
-| Soul & Memory | `GET/PUT /api/agents/{id}/files?path=soul.md` |
-| Triggers | `GET/POST/DELETE /api/triggers?agent_id={id}` |
-| Tools | `GET/POST /api/agents/{id}/tools` |
-| Skills | `GET/POST/DELETE /api/agents/{id}/files?path=skills/` |
-| Workspace | `GET /api/agents/{id}/files` (list + download) |
-| Relationships | `GET /api/relationships?agent_id={id}` |
-| Approvals | `GET/POST /api/agents/{id}/approvals` |
-
-Port the component shapes from Clawith into apps/isola's shadcn/ui + Tailwind conventions. **Not a lift-and-shift — a rewrite.** Each tab is maybe 100-400 lines of Next.js.
+Both stacks share the same backend. Better-Auth writes a session cookie for `.isola.epic.dm`; Clawith reads it on first load via `/api/auth/me`. No separate login screen, no token translation.
 
 ---
 
@@ -334,7 +380,7 @@ Three segments pay premium for this:
 
 1. **Clinics (privacy tier).** *"Your patient data never leaves your clinic computer."* Compliance-adjacent argument even without US HIPAA. Caribbean regulators (Cayman, BVI, Trinidad) are catching up on AI data residency.
 2. **Credit unions + banks + law firms.** Client confidentiality + regulator scrutiny. One law firm on this tier covers 20 restaurant tenants economically.
-3. **Cost-conscious high-volume.** A 500-message/day restaurant might prefer Ollama on a $50 VPS over $300/mo of GPT tokens.
+3. **Cost-conscious high-volume.** A 500-message/day restaurant might prefer Ollama on a $50 VPS over burning credits on OpenAI.
 
 ### How it surfaces in the merged UI
 
@@ -344,7 +390,7 @@ Tenant-level **Runtime Mode** setting in `/dashboard/settings`:
 Runtime
   ⦿ Hosted (default)
     Isola runs your agents on our infrastructure. Fast, no setup.
-    Per-message metered.
+    Credit-metered.
   ○ Edge — Bring Your Own Runtime
     Run agents on your own hardware. Customer messages never leave
     your premises. Requires a $49/mo box or better.
@@ -376,18 +422,22 @@ Net: ~1,100 LoC restored, one Alembic migration, one new integration test. Effor
 
 ## 6. Rollout
 
-### Phase E — merge + OpenClaw
+### Phase E — proxy + OpenClaw + token economy + admin
 
-| Sub-phase | Scope | Repo | Estimate |
+| Sub-phase | Scope | Repo / surface | Estimate |
 |---|---|---|---|
-| E.1 | OpenClaw restore | isola-runtime | 1 day |
-| E.2 | Port 4 high-priority tabs: Status, Activity Log, Chat Stream, Approvals | isola-mvp | 8-12 days |
-| E.3 | Port 5 medium-priority tabs: Soul & Memory, Triggers, Tools, Skills, Workspace | isola-mvp | 10-15 days |
-| E.4 | Port 2 remaining tabs: Relationships, Plaza (MVP-scope marketplace) | isola-mvp | 8-10 days |
-| E.5 | Runtime Mode UI in settings | isola-mvp | 1-2 days |
-| E.6 | Retire `staging.isola.epic.dm` | ops | ~30 min |
+| **E.1** | OpenClaw restore (backend) | isola-runtime | 1 day |
+| **E.2** | Nginx reverse-proxy setup: isola.epic.dm/dashboard/agents/* → Clawith frontend. Clawith rebuilt with VITE_BASE_PATH + VITE_EMBEDDED | ops + isola-runtime | 2-3 days |
+| **E.3** | Design token alignment: CSS variable overrides, hide Clawith nav in embedded mode, curated icon swap (10-15 icons), Sonner toast style | isola-runtime frontend | 3-5 days |
+| **E.4** | i18n rename pass: Aware→Triggers, Mind→Soul & Memory, Chat→Train, Plaza→Marketplace, Activity Log→Timeline, Relationships→Team Relationships. Verify no Chinese leakage | isola-runtime | 1 day |
+| **E.5** | Hide/gate dropped surfaces: AgentBay route 404, Admin Companies 403 for non-staff, invitation-only signup bypassed (Next.js owns signup) | isola-runtime | 1 day |
+| **E.6** | Runtime Mode UI (Hosted / Edge toggle) in `/dashboard/settings` | isola-mvp | 1-2 days |
+| **E.7** | Token-credit economy backend: credit ledger, model consumption tracking, top-up endpoint (§9) | isola-runtime | 4-6 days |
+| **E.8** | Token-credit economy UI: credits meter in topbar, billing page top-up button, model picker with multiplier | isola-mvp + runtime frontend | 3-4 days |
+| **E.9** | BYO LLM keys: encrypted key storage per-tenant, provider fallback chain, Business-tier gating | isola-runtime | 3-4 days |
+| **E.10** | EPIC admin console at admin.epic.dm (MVP scope from §10: tenants list, drill-down, credit grants, impersonation) | isola-runtime + ops | 5-7 days |
 
-**Total Phase E ≈ 4–6 weeks of focused work** split across two repos.
+**Total Phase E ≈ 4-6 weeks** (significantly less than the 4-6 weeks of native-rewrite work in the previous plan, while also delivering the token economy and admin console that the previous plan deferred).
 
 ### Phase F — real-tenant UAT
 
@@ -401,29 +451,228 @@ After F passes, decommission BFF v2's Meta webhook. DNS / nginx change. BFF v2 s
 
 When isola-runtime covers everything BFF v2 did.
 
+### Phase I — 30-tenant gate check
+
+At ~30 paying tenants, review UX telemetry + user feedback:
+
+- **Signal: keep hybrid.** Seam is invisible, no tickets about "weird navigation", token alignment held up through tenant adds.
+- **Signal: unify.** Tenants comment on style breaks, stack-specific bugs (Clawith-side issues vs Next.js-side issues), design-debt from maintaining two frontends is slowing feature work.
+
+If unify: Phase I.1-I.N rewrites Clawith tabs natively into apps/isola (the original synthesis plan). Effort estimate at that time: 4-6 weeks, but with real user data to prioritize which tabs get which polish.
+
+If keep hybrid: set a new gate (60 tenants? 100?).
+
 ---
 
 ## 7. Decisions finalized
 
-All 6 decisions confirmed by Eric 2026-04-24. No open questions remaining.
+All decisions confirmed by Eric 2026-04-24.
 
 | # | Question | Answer |
 |:--:|---|---|
 | 1 | Plaza in MVP or Team/Suite only? | **MVP** — surfaces the 30 role×vertical templates as a browse-and-hire catalog. Available in Starter tier from day one. |
-| 2 | Advanced toggle — per-agent or global? | **Per-user global.** localStorage-persisted. Agency operators flip once; SMB owners never find it. |
+| 2 | Advanced toggle — per-agent or global? | **Deferred.** Option C serves all tabs intact via proxy; no progressive disclosure needed at MVP. Revisit at 30-tenant gate if tabs overwhelm SMB owners. |
 | 3 | Runtime Mode — tenant-level or per-agent? | **Tenant-level for v1.** Simpler onboarding. Per-agent later if a tenant asks. |
-| 4 | Retire `staging.isola.epic.dm` after E.2-E.4? | **Yes.** Kill when apps/isola has the 11 tabs. Until then, keep as dev reference. |
-| 5 | Rebuild the Clawith frontend container against a temp admin rebrand *or* leave it as-is? | **Leave as-is.** Effort wasted if we kill it in E.6 anyway. Current English + register-first + no-Google-Translate state is fine for eval. |
+| 4 | Retire `staging.isola.epic.dm`? | **NO.** Kept permanently as pristine Clawith reference for side-by-side eval. Cost is trivial. |
+| 5 | Rebuild the Clawith frontend container against a temp admin rebrand? | **Yes, once** — for VITE_BASE_PATH + VITE_EMBEDDED flags in E.2. Pristine staging.isola.epic.dm keeps its own build. |
 | 6 | Rebrand "OpenClaw" → "Edge" in user-facing text? | **Yes.** Keep `/api/gateway/*` as the internal route name (less churn). Everything user-facing says "Edge." |
+| 7 | Architecture direction: apps/isola primary + port Clawith IN, or Clawith primary + port Isola ON, or hybrid? | **Option C — Hybrid.** Reverse proxy, align design tokens. Revisit at 30-tenant gate. |
+| 8 | LLM model choice for tenants? | **Yes — per-tier curated dropdown + BYO at Business tier.** See §9. |
+| 9 | Token-credit economy vs message-count pricing? | **Credit economy.** Model-specific multipliers, top-ups, tier-level allowances. See §9. |
+| 10 | Where do EPIC cross-tenant ops surfaces live? | **admin.epic.dm**, staff-only. Rehomed from Clawith admin pages. See §10. |
 
 ---
 
 ## 8. Net summary
 
-- **One UI** at isola.epic.dm. apps/isola's buyer funnel + business-ops dashboard **stay**. Clawith's 11-tab depth **gets ported in** behind an Advanced toggle.
-- **OpenClaw comes back** as Phase E.1, surfaces as a "Runtime Mode: Edge" tenant setting for privacy-tier customers (clinics / law / banks / cost-conscious high-volume).
-- **`staging.isola.epic.dm` retires** once E.2-E.4 ship the ported tabs.
+- **One brand at isola.epic.dm, two stacks under the hood.** apps/isola owns the buyer funnel, auth, onboarding, and business-ops surfaces (catalog / bookings / contacts / hours / inbox / billing). Clawith serves the agent workspace + Plaza under `/dashboard/agents/*` via reverse proxy.
+- **Design tokens aligned** so the seam is invisible to tenants. HR-metaphor i18n renames applied.
+- **OpenClaw returns** (Phase E.1) as "Edge" runtime mode — privacy tier for clinics / law / banks.
+- **Token-credit economy** replaces message-count ceilings. Customers pick their model; higher models burn faster; top-ups + BYO keys available. EPIC's margin made visible in the admin cost dashboard.
+- **admin.epic.dm** hosts EPIC staff ops — tenants list, impersonation, credit grants, model routing, cost dashboard — gated 2FA, staff-only. Seeded from Clawith's admin pages.
+- **staging.isola.epic.dm stays** as permanent pristine reference.
 - **BFF v2 starts sunset** after Phase F UAT passes on isola-runtime + the merged UI.
-- **Audience C is served by one UI**: SMB owner sees 4 tabs, agency operator toggles to 13, both work on the same app.
+- **30-tenant gate** decides whether to unify stacks or keep the hybrid long-term.
 
-The merged product is apps/isola's buyer-facing clarity wrapped around Clawith's operator depth, with OpenClaw as a premium privacy tier. Nothing's thrown away. Everything's on one domain.
+---
+
+## 9. Token-credit economy
+
+Replaces the current "X messages per month" ceiling. Customer picks their model; cost expressed in a single universal credit unit. EPIC's inference economics stay hidden behind the credit layer.
+
+### Credit rates (multiplier vs Haiku baseline)
+
+| Model | Credit rate | Rough messages per 100k credits* | When to pick |
+|---|:---:|:---:|---|
+| Gemini 2.5 Flash | 0.5× | ~1,000 msgs | High volume, simple intents |
+| **Haiku 4.5** (default) | **1×** | **~500 msgs** | Standard front-desk work |
+| GPT-4o | 3× | ~165 msgs | Complex reasoning on a budget |
+| Sonnet 4.6 | 4× | ~125 msgs | Complex conversations, light reasoning |
+| Opus 4.7 | 20× | ~25 msgs | Deep reasoning, low volume, concierge service |
+
+*assuming ~200 tokens in + 200 tokens out per WhatsApp turn
+
+### Tier → credit bucket
+
+| Tier | EC$/mo | Credits/mo | Haiku equiv | Sonnet equiv | Opus equiv |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Starter | 149 | 100k | 500 msgs | 125 msgs | 25 msgs |
+| Pro | 249 | 500k | 2,500 msgs | 625 msgs | 125 msgs |
+| Business | 449 | 2M | 10,000 msgs | 2,500 msgs | 500 msgs |
+
+**Top-up:** EC$50 per 100k credits, any tier, instant.
+
+### The design insight
+
+A low-volume small restaurant (20 customer questions/month) can run **Opus on Starter** and stay within plan — they get concierge-quality replies for EC$149/mo.
+
+A busy clinic on **Haiku** gets 500 msgs on the same EC$149 — same plan, different model strategy.
+
+Neither customer needs to upgrade until their volume grows past their model choice.
+
+### Growth path when credits run low
+
+1. **Buy credits** — EC$50 per 100k, instant, no commitment.
+2. **Upgrade tier** — Starter → Pro (5× credits for 1.67× price); recommended at sustained overflow.
+3. **Downgrade model** — same credits last longer; recommended when conversations are simple.
+4. **Auto-downgrade toggle** — "when credits run out, fall back to Haiku instead of pausing agent." Default on for Starter/Pro (service never stops); opt-in for Business (might prefer pause + notify over degraded model).
+
+### BYO LLM keys (Business tier only)
+
+A separate track for tenants who want direct provider relationships:
+
+- Tenant pastes own OpenAI / Anthropic / Google / DeepSeek keys in `/dashboard/settings/models`
+- Inference billed directly by provider to the tenant
+- Platform fee reduced (sticker: **EC$99/mo flat** for Business BYO, vs EC$449 for Business Hosted inference)
+- **Business tier only** — keeps Starter/Pro simple, BYO needs knobs Starter customers shouldn't touch
+- Hard monthly cap required (tenant sets EC$ equivalent), alert at 80%, hard-stop at 100% to prevent runaway loops
+- Credits don't apply to BYO — their spend lives at the provider
+- Per-agent model override still supported (agent A on GPT-4o, agent B on Claude), as long as both providers are wired
+
+### Tenant-side UX
+
+- **Topbar meter:** `34,500 / 100,000 credits — 12 days left at current rate`
+- **Model picker** on Agent → Settings → Model: dropdown, each option shows multiplier in parentheses (`Sonnet (4×)`). On change, modal warns: "Rex will use credits ~4× faster — you have ~12 days at current rate, will drop to ~3 days."
+- **Billing page** (`/dashboard/billing`): current balance, burn rate graph, projected run-out date, `[Buy 100k credits — EC$50]` button, usage history (date · agent · model · credits used · customer turns).
+- **Auto-downgrade setting:** one toggle in `/dashboard/billing` plus per-agent override.
+
+### EPIC-side (admin dashboard — see §10)
+
+- Per-tenant token burn rate, model mix, credit balance.
+- EPIC's actual provider spend vs credits consumed = margin per tenant.
+- Alert: tenant burns 3× plan rate in 48h (possible loop, possible abuse, possible legit growth).
+- Provider outage triggers fallback routing; credits unaffected.
+
+### Backend schema sketch
+
+```sql
+credit_balance (tenant_id, balance_credits, updated_at)
+credit_ledger  (id, tenant_id, delta, reason, ref_id, created_at)
+  -- delta negative for consumption, positive for top-up / grant / refund
+  -- reason: 'consumption', 'topup', 'plan_grant', 'staff_grant', 'refund'
+model_usage    (id, tenant_id, agent_id, turn_id, model, input_tokens, output_tokens, credits_consumed, created_at)
+byo_keys       (tenant_id, provider, encrypted_key, monthly_cap_ec, spend_this_month_ec, created_at, rotated_at)
+  -- encrypted with tenant-scoped KMS envelope key
+tenant_model_prefs (tenant_id, default_model, auto_downgrade_enabled)
+agent_model_override (agent_id, model)  -- nullable; null means fall through to tenant default
+```
+
+---
+
+## 10. EPIC Admin console (admin.epic.dm)
+
+Separate surface, staff-only, **not inside tenant UI**. Seeded from Clawith's admin pages (Admin Companies, Enterprise Settings model routing, Platform Dashboard) — those get rehomed here, not rewritten.
+
+### Auth + access
+- Separate hostname: `admin.epic.dm`
+- Gate: EPIC staff emails only + hardware 2FA required
+- Every action audit-logged (who / when / what / tenant-id / before-after)
+- Impersonation mode adds a banner on the tenant side ("EPIC staff is viewing") to satisfy trust expectations
+
+### MVP scope — Phase E.10
+
+| Section | What it shows / does |
+|---|---|
+| **Tenants list** | All tenants. Columns: plan, status, MRR, credit balance, credits burned this month, last active, signup date, Meta WA number status. Sortable, filterable. |
+| **Tenant drill-down** | Usage per agent, per model. Credit ledger (consumption + top-ups). Provisioning state. Health. Stripe/Fiserv status. |
+| **Impersonate** | One-click "log in as this tenant" — opens isola.epic.dm in a new tab with staff session → tenant session. Audit-logged. Banner visible on tenant side. |
+| **Credit grants** | Manually add credits to a tenant (support refund, comp, makegood). Reason required (free text); ledger row tagged `staff_grant`. |
+| **Model routing** | Per-tier model allow-list (what Starter / Pro / Business see in their picker). Default model per tier. Fallback chain (Anthropic down → route to Gemini). Saved as config, hot-reloaded. |
+| **Provider health** | Real-time status of Anthropic / OpenAI / Google / DeepSeek. Error rate, p50/p95 latency, rate-limit headroom. Alerts when provider error rate > 5% over 5 min. |
+| **Cost dashboard** | EPIC inference spend this month across all tenants. Gross margin per tenant (credits consumed × EC$ per credit) − (actual provider cost). Break-even tenant count. |
+| **Meta number pool** | 1767818XXXX pool state. Flag stale WABAs. Quick-provision / quick-retire actions. |
+| **Feature flags** | Roll out features to % of tenants, or to a named list. Hot-reloadable from UI. |
+| **Audit log** | Every staff action, sortable by staff member / tenant / action type / date. Exportable for compliance. |
+
+### Phase 2 adds (post-MVP, after Phase F UAT)
+
+- Load balancer policy editor (cheapest provider for Starter, fastest for Business, sticky for conversation continuity)
+- Auto-throttle on cost overrun (pause a tenant's agents if they exceed 10× plan rate in an hour)
+- Per-tenant alerts (Slack/email) on provisioning state changes, credit exhaustion, Meta number drift
+- Revenue + COGS graphs over time
+- Churn signals dashboard
+- Tenant health score (engagement, growth, support load)
+
+### Build effort
+
+**MVP ~5-7 days** (mostly reusing Clawith's admin pages — gate them behind `is_staff`, rehome them at admin.epic.dm, add the observability pieces Clawith doesn't have). Phase 2 adds land incrementally as volume justifies them.
+
+### Hosting
+
+- admin.epic.dm DNS → deepseek
+- Same nginx reverse proxy, different vhost, path: `/` → Clawith frontend with admin routes mounted
+- Auth middleware checks `is_staff` flag on user session; non-staff → 403
+- Separate session cookie (don't share with tenant isola.epic.dm session — even though same backend, admin context should require re-auth)
+
+---
+
+## 11. Chat surfaces — Clawith chat vs Chatwoot (both stay, different jobs)
+
+Two different chat surfaces for two different users. Not alternatives.
+
+| Surface | Who's talking | Purpose | Where it lives |
+|---|---|---|---|
+| **Clawith chat** (AgentDetail → "Train" tab) | Tenant ↔ their own agent | Train, test, instruct, debug. Stream tokens, inspect tool calls, approve actions. | `isola.epic.dm/dashboard/agents/:id/chat` (proxied from Clawith) |
+| **Chatwoot** (customer inbox) | Customer ↔ agent, with tenant observing | See live customer convos, intervene, assign to humans, tag, note, ticket close. Multi-channel inbox. | `inbox.epic.dm` — embedded at `isola.epic.dm/dashboard/inbox` via iframe |
+
+### How they relate
+
+```
+Customer (WhatsApp) → Meta → BFF v1 webhook → runtime → Agent → reply → Meta → Customer
+                                                 │
+                                                 ▼
+                                       mirrored into Chatwoot ticket
+                                                 │
+                                                 ▼
+                                   tenant monitors + overrides in /dashboard/inbox
+
+Tenant (Isola UI) → Clawith chat ("Train") → Agent (directly, not via WA)
+                                              │
+                                              ▼
+                                    streaming tokens, tool calls, thinking
+                                    — private workspace, no customer involved
+```
+
+### Labeling to avoid confusion
+
+- Clawith's Chat tab **renamed "Train"** via en.json override. Subtitle: *"Private chat with Rex — use this to test and tune your agent. Customers can't see this."*
+- `/dashboard/inbox` labeled **"Customer Inbox."** Subtitle: *"Live conversations between your agents and customers."*
+- Cross-link: agent workspace header shows `[View customer convos in Inbox →]` bridging the two mental models.
+
+### Feature comparison (why neither replaces the other)
+
+**Clawith chat** has: streaming tokens, tool-call traces, thinking-trail inspection, approval prompts inline, memory write visibility, soul context injection. **Purpose-built for agent-building.**
+
+**Chatwoot** has: multi-channel inbox (WA + email + web widget + IG), ticket lifecycle, assignment/routing, contact CRM, canned responses, team collaboration, SLA tracking, tags, notes. **Purpose-built for support inbox.**
+
+If we only shipped Chatwoot, tenants couldn't train agents — they'd have to debug by sending their own WhatsApp messages (terrible UX, pollutes production logs). If we only shipped Clawith chat, tenants couldn't see what customers actually said in production — blind to the real work.
+
+### Future unification (revisit at 30-tenant gate)
+
+Eventually `/dashboard/inbox` could become a native apps/isola UI built on top of Chatwoot's API (replaces the iframe, uses Chatwoot purely as the backend). That's worth doing when:
+
+- iframe breaks (cookie scoping, style mismatches) annoy tenants repeatedly
+- we want inbox features that Chatwoot doesn't ship (e.g., agent-specific filtering baked into the UI chrome)
+- branded cohesion with the rest of apps/isola becomes the limiting factor
+
+Not now. Iframe works. Ships fast. Revisit at the same 30-tenant gate as the broader stack-unification decision.
