@@ -128,19 +128,21 @@ async def _phase_c1_templates_seeded(http, test_state, db_session):
             )
         )
         isola = {t.vertical: t for t in isola_r.scalars().all()}
-        assert set(isola.keys()) == {"restaurant", "hotel", "clinic"}, (
-            f"expected 3 Rex verticals, got {sorted(isola.keys())}"
+        # Presence-based so later phases can add more verticals without
+        # breaking this assertion. Core 3 must always be here.
+        assert {"restaurant", "hotel", "clinic"}.issubset(set(isola.keys())), (
+            f"Rex core verticals missing: {set(['restaurant','hotel','clinic']) - set(isola.keys())}"
         )
 
-    # API filter — role=rex yields exactly 3 results
+    # API filter — role=rex yields at least the 3 core verticals
     r = await http.get(
         "/api/agents/templates", headers=test_state["headers"], params={"role": "rex"}
     )
     assert r.status_code == 200
     rows = r.json()
-    assert len(rows) == 3, f"role=rex filter returned {len(rows)} rows"
-    verticals_seen = sorted(row["vertical"] for row in rows)
-    assert verticals_seen == ["clinic", "hotel", "restaurant"]
+    assert len(rows) >= 3, f"role=rex filter returned {len(rows)} rows"
+    verticals_seen = {row["vertical"] for row in rows}
+    assert {"clinic", "hotel", "restaurant"}.issubset(verticals_seen)
     for row in rows:
         assert row["role"] == "rex"
         assert row["is_builtin"] is True
@@ -255,14 +257,15 @@ async def _phase_c2_mara_verticals(http, test_state, db_session):
                 f"(got {t.default_autonomy_policy.get('send_external_message')})"
             )
 
-    # API filter — role=mara yields 3
+    # API filter — role=mara includes at least the 3 core verticals
     r = await http.get(
         "/api/agents/templates", headers=test_state["headers"], params={"role": "mara"}
     )
     assert r.status_code == 200
     rows = r.json()
-    assert len(rows) == 3
-    assert sorted(row["vertical"] for row in rows) == ["clinic", "hotel", "restaurant"]
+    assert len(rows) >= 3
+    verticals_seen = {row["vertical"] for row in rows}
+    assert {"clinic", "hotel", "restaurant"}.issubset(verticals_seen)
 
     # API filter — vertical=restaurant now returns BOTH Rex and Mara
     r = await http.get(
@@ -343,14 +346,15 @@ async def _phase_c3_joey_verticals(http, test_state, db_session):
             assert pol.get("financial_operations") == "L3"
             assert pol.get("access_business_system_write") == "L3"
 
-    # API filter — role=joey yields 3
+    # API filter — role=joey includes at least the 3 core verticals
     r = await http.get(
         "/api/agents/templates", headers=test_state["headers"], params={"role": "joey"}
     )
     assert r.status_code == 200
     rows = r.json()
-    assert len(rows) == 3
-    assert sorted(row["vertical"] for row in rows) == ["clinic", "hotel", "restaurant"]
+    assert len(rows) >= 3
+    verticals_seen = {row["vertical"] for row in rows}
+    assert {"clinic", "hotel", "restaurant"}.issubset(verticals_seen)
 
     # API filter — vertical=hotel now includes rex + mara + joey (3 roles)
     r = await http.get(
@@ -397,8 +401,104 @@ async def _phase_c3_joey_verticals(http, test_state, db_session):
         assert pol.get("financial_operations") == "L3"
 
 
+async def _phase_c4_retail_service(http, test_state, db_session):
+    """C.4: Retail + Service verticals added for Rex / Mara / Joey.
+
+    Matrix grows from 9 templates (3 roles × 3 verticals) to 15
+    (3 roles × 5 verticals). Provisioning for a Retail tenant should
+    return a full 3-agent trio.
+    """
+    from app.models.agent import Agent, AgentTemplate
+
+    # DB: 6 new templates present — 3 roles × {retail, service}
+    Session = db_session
+    async with Session() as db:
+        rr = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.role.in_(["rex", "mara", "joey"]),
+                AgentTemplate.vertical.in_(["retail", "service"]),
+            )
+        )
+        new_six = list(rr.scalars().all())
+        assert len(new_six) == 6, f"expected 6 new retail+service templates, got {len(new_six)}"
+
+        # Every combination should be present
+        seen = {(t.role, t.vertical) for t in new_six}
+        expected = {
+            (role, vertical)
+            for role in ("rex", "mara", "joey")
+            for vertical in ("retail", "service")
+        }
+        assert seen == expected, f"missing: {expected - seen}"
+
+        # Category + autonomy invariants hold
+        for t in new_six:
+            if t.role == "rex":
+                assert t.category == "front-desk"
+            elif t.role == "mara":
+                assert t.category == "marketing"
+                assert t.default_autonomy_policy.get("send_external_message") == "L3"
+            elif t.role == "joey":
+                assert t.category == "sales"
+                assert t.default_autonomy_policy.get("financial_operations") == "L3"
+
+    # API filter — vertical=retail returns rex + mara + joey
+    r = await http.get(
+        "/api/agents/templates",
+        headers=test_state["headers"],
+        params={"vertical": "retail"},
+    )
+    assert r.status_code == 200
+    rows = r.json()
+    roles_seen = {row["role"] for row in rows if row["role"]}
+    assert {"rex", "mara", "joey"}.issubset(roles_seen), (
+        f"vertical=retail should include all 3 roles, got {roles_seen}"
+    )
+
+    # API filter — vertical=service same story
+    r = await http.get(
+        "/api/agents/templates",
+        headers=test_state["headers"],
+        params={"vertical": "service"},
+    )
+    rows = r.json()
+    roles_seen = {row["role"] for row in rows if row["role"]}
+    assert {"rex", "mara", "joey"}.issubset(roles_seen)
+
+    # Provisioning: full trio for a retail tenant
+    r = await http.post(
+        "/api/agents/provision-vertical",
+        headers=test_state["headers"],
+        json={
+            "vertical": "retail",
+            "roles": ["rex", "mara", "joey"],
+            "name_prefix": f"Shop {test_state['suffix']}",
+        },
+    )
+    assert r.status_code == 201, f"retail trio provision failed: {r.status_code} {r.text}"
+    created = r.json()["agents"]
+    assert len(created) == 3
+    by_role = {a["role"]: a for a in created}
+    assert {a["vertical"] for a in created} == {"retail"}
+    assert set(by_role.keys()) == {"rex", "mara", "joey"}
+
+    # Spot-check: the Rex retail agent's DB row carries the right template_id
+    async with Session() as db:
+        rex_agent_r = await db.execute(
+            select(Agent).where(Agent.id == uuid.UUID(by_role["rex"]["agent_id"]))
+        )
+        rex_agent = rex_agent_r.scalar_one_or_none()
+        assert rex_agent is not None
+        tmpl_r = await db.execute(
+            select(AgentTemplate).where(AgentTemplate.id == rex_agent.template_id)
+        )
+        tmpl = tmpl_r.scalar_one_or_none()
+        assert tmpl is not None
+        assert tmpl.role == "rex" and tmpl.vertical == "retail"
+
+
 async def test_phase_c_chain(http, test_state, db_session):
-    """C.1 -> C.2 -> C.3 dependent chain.
+    """C.1 -> C.2 -> C.3 -> C.4 dependent chain.
 
     Single test function so fixtures stay on one event loop (same
     pattern as test_phase_b.py). Each phase's assertions must pass
@@ -419,3 +519,7 @@ async def test_phase_c_chain(http, test_state, db_session):
     print("--- Phase C.3: Joey × 3 verticals + full rex+mara+joey trio provisioning ---")
     await _phase_c3_joey_verticals(http, test_state, db_session)
     print("Phase C.3 PASS")
+
+    print("--- Phase C.4: Retail + Service verticals (matrix 9 -> 15 templates) ---")
+    await _phase_c4_retail_service(http, test_state, db_session)
+    print("Phase C.4 PASS")
