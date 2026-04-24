@@ -649,3 +649,257 @@ async def ensure_agent(
         odoo_company_id=odoo_company_id,
     )
 
+
+# ─── Self-learning Tier 1 (F.1.c-batch + #99) ───────────────────────
+# Knowledge gap → owner teaches → knowledge.md → Rex remembers loop.
+
+
+def _agent_workspace_path(agent_id: uuid.UUID):
+    """Resolve the on-disk workspace dir for an agent."""
+    from pathlib import Path
+    from app.config import get_settings
+    return Path(get_settings().AGENT_DATA_DIR) / str(agent_id) / "workspace"
+
+
+def _read_workspace_text(path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+class KnowledgeGapOut(BaseModel):
+    question: str
+    asked_count: int
+    last_asked_at: str
+    representative_row: str
+
+
+class KnowledgeGapsResponse(BaseModel):
+    pending: list[KnowledgeGapOut]
+    total_pending: int
+    total_taught: int
+
+
+@router.get(
+    "/agents/{agent_id}/knowledge-gaps",
+    response_model=KnowledgeGapsResponse,
+)
+async def list_knowledge_gaps(
+    agent_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """List unanswered knowledge gaps, deduplicated and ranked by ask
+    frequency × recency. Skips rows already marked `taught`."""
+    import re
+    from app.models.agent import Agent
+
+    a = (
+        await db.execute(select(Agent).where(Agent.id == agent_id))
+    ).scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    raw = _read_workspace_text(_agent_workspace_path(agent_id) / "knowledge-gaps.md")
+
+    pending_by_q: dict[str, dict] = {}
+    taught_count = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("- "):
+            continue
+        if "taught" in line:
+            taught_count += 1
+            continue
+        m = re.search(r'asked:\s*"([^"]+)"', line)
+        if not m:
+            continue
+        question_raw = m.group(1).strip()
+        norm = re.sub(r"[?!.,\s]+$", "", question_raw.lower().strip())
+        ts_match = re.match(r"-\s*!?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", line)
+        ts = ts_match.group(1) if ts_match else ""
+        bucket = pending_by_q.setdefault(
+            norm,
+            {
+                "question": question_raw,
+                "asked_count": 0,
+                "last_asked_at": ts,
+                "row": line,
+            },
+        )
+        bucket["asked_count"] += 1
+        if ts > bucket["last_asked_at"]:
+            bucket["last_asked_at"] = ts
+            bucket["question"] = question_raw
+
+    ranked = sorted(
+        pending_by_q.values(),
+        key=lambda b: (b["asked_count"], b["last_asked_at"]),
+        reverse=True,
+    )
+    return KnowledgeGapsResponse(
+        pending=[
+            KnowledgeGapOut(
+                question=b["question"],
+                asked_count=b["asked_count"],
+                last_asked_at=b["last_asked_at"],
+                representative_row=b["row"],
+            )
+            for b in ranked
+        ],
+        total_pending=sum(b["asked_count"] for b in ranked),
+        total_taught=taught_count,
+    )
+
+
+class TeachRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+    answer: str = Field(..., min_length=1, max_length=4000)
+    topic: str | None = Field(default=None, max_length=80)
+    teacher_name: str | None = Field(default=None, max_length=80)
+
+
+class TeachResponse(BaseModel):
+    topic: str
+    knowledge_md_path: str
+    gaps_marked_taught: int
+
+
+@router.post(
+    "/agents/{agent_id}/teach",
+    response_model=TeachResponse,
+)
+async def teach_agent(
+    agent_id: uuid.UUID,
+    data: TeachRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Append a Q&A entry to workspace/knowledge.md and mark matching
+    knowledge-gaps rows as taught. Idempotent: re-teaching the same
+    topic replaces the existing section in place."""
+    import re
+    from datetime import datetime, timezone as _tz
+    from app.models.agent import Agent
+
+    a = (
+        await db.execute(select(Agent).where(Agent.id == agent_id))
+    ).scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    ws = _agent_workspace_path(agent_id)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    topic = (data.topic or data.question[:60]).strip()
+    topic = topic.rstrip("?.!").strip()
+    if topic:
+        topic = topic[0].upper() + topic[1:]
+
+    today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+    teacher_line = f"*Source: {data.teacher_name or 'owner'} - taught {today}*"
+
+    knowledge_path = ws / "knowledge.md"
+    existing = _read_workspace_text(knowledge_path)
+    if not existing:
+        existing = (
+            "# Knowledge\n\n"
+            "_Q&A taught by the owner. Rex consults this when answering FAQs._\n"
+        )
+
+    section_pattern = re.compile(
+        rf"^## {re.escape(topic)}\s*$.*?(?=^## |\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    new_section = f"## {topic}\n{data.answer.strip()}\n{teacher_line}\n\n"
+
+    if section_pattern.search(existing):
+        new_content = section_pattern.sub(new_section, existing)
+    else:
+        new_content = existing.rstrip() + "\n\n" + new_section
+    knowledge_path.write_text(new_content, encoding="utf-8")
+
+    gaps_path = ws / "knowledge-gaps.md"
+    gaps_marked = 0
+    if gaps_path.exists():
+        norm_q = re.sub(r"[?!.,\s]+$", "", data.question.lower().strip())
+        new_lines = []
+        for line in gaps_path.read_text(encoding="utf-8").splitlines():
+            m = re.search(r'asked:\s*"([^"]+)"', line)
+            if m and "taught" not in line:
+                line_q = re.sub(r"[?!.,\s]+$", "", m.group(1).lower().strip())
+                if line_q == norm_q:
+                    line = f"{line.rstrip()} - taught {today}"
+                    gaps_marked += 1
+            new_lines.append(line)
+        gaps_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+
+    return TeachResponse(
+        topic=topic,
+        knowledge_md_path=str(knowledge_path.relative_to(ws.parent)),
+        gaps_marked_taught=gaps_marked,
+    )
+
+
+class KnowledgeStatsResponse(BaseModel):
+    total_taught: int
+    pending_unique: int
+    pending_total_asks: int
+    learned_this_week: int
+    top_pending: list[str]
+
+
+@router.get(
+    "/agents/{agent_id}/knowledge-stats",
+    response_model=KnowledgeStatsResponse,
+)
+async def knowledge_stats(
+    agent_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Counters for the home-page 'Rex learned X things this week' widget."""
+    import re
+    from datetime import datetime, timezone as _tz, timedelta
+    from app.models.agent import Agent
+
+    a = (
+        await db.execute(select(Agent).where(Agent.id == agent_id))
+    ).scalar_one_or_none()
+    if not a:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    ws = _agent_workspace_path(agent_id)
+    knowledge = _read_workspace_text(ws / "knowledge.md")
+    gaps = _read_workspace_text(ws / "knowledge-gaps.md")
+
+    total_taught = len(re.findall(r"^## ", knowledge, re.MULTILINE))
+
+    week_ago = (datetime.now(_tz.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    learned_this_week = sum(
+        1
+        for m in re.finditer(r"taught (\d{4}-\d{2}-\d{2})", knowledge)
+        if m.group(1) >= week_ago
+    )
+
+    pending_by_q: dict[str, int] = {}
+    for line in gaps.splitlines():
+        if "taught" in line or not line.startswith("- "):
+            continue
+        m = re.search(r'asked:\s*"([^"]+)"', line)
+        if m:
+            norm = re.sub(r"[?!.,\s]+$", "", m.group(1).lower().strip())
+            pending_by_q[norm] = pending_by_q.get(norm, 0) + 1
+
+    sorted_q = sorted(pending_by_q.items(), key=lambda kv: kv[1], reverse=True)
+    top_pending = [q for q, _ in sorted_q[:5]]
+    pending_total_asks = sum(pending_by_q.values())
+
+    return KnowledgeStatsResponse(
+        total_taught=total_taught,
+        pending_unique=len(pending_by_q),
+        pending_total_asks=pending_total_asks,
+        learned_this_week=learned_this_week,
+        top_pending=top_pending,
+    )
+
