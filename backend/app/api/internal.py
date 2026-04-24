@@ -157,3 +157,111 @@ async def internal_update_tenant(
     out = InternalTenantOut.model_validate(tenant).model_dump()
     out["created"] = False
     return out
+
+# ─── User auth bridge (Phase E.2.1) ─────────────────────────────────
+
+
+class InternalUserEnsureRequest(BaseModel):
+    tenant_runtime_id: uuid.UUID = Field(
+        ...,
+        description="Runtime tenant id returned by /api/internal/tenants/ensure.",
+    )
+    external_user_id: str = Field(
+        ...,
+        description="Stable id from caller (apps/isola users.id). Used as idempotency key.",
+        min_length=1,
+        max_length=200,
+    )
+    email: str = Field(..., min_length=3, max_length=255)
+    display_name: str = Field(..., min_length=1, max_length=100)
+
+
+class InternalUserEnsureResponse(BaseModel):
+    user_id: uuid.UUID
+    access_token: str
+    expires_in_minutes: int
+    created: bool = False
+
+
+@router.post(
+    "/users/ensure-and-mint",
+    response_model=InternalUserEnsureResponse,
+)
+async def ensure_user_and_mint(
+    data: InternalUserEnsureRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create-or-return a runtime User tied to the given tenant, mint a JWT.
+
+    Idempotency:
+      - Identity looked up by email; created if not found.
+      - User looked up by (tenant_id, identity_id); created if not found.
+      - Repeat calls with the same (email, tenant_runtime_id) return the same user_id.
+    """
+    from app.core.security import create_access_token
+    from app.models.tenant import Tenant
+    from app.models.user import Identity, User
+
+    # 1. Tenant must exist.
+    t_r = await db.execute(select(Tenant).where(Tenant.id == data.tenant_runtime_id))
+    tenant = t_r.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Runtime tenant {data.tenant_runtime_id} not found",
+        )
+
+    created = False
+
+    # 2. Identity by email (global across tenants).
+    email = data.email.lower().strip()
+    i_r = await db.execute(select(Identity).where(Identity.email == email))
+    identity = i_r.scalar_one_or_none()
+    if identity is None:
+        identity = Identity(
+            email=email,
+            is_active=True,
+            email_verified=False,
+        )
+        db.add(identity)
+        await db.flush()
+        created = True
+
+    # 3. User by (tenant_id, identity_id).
+    u_r = await db.execute(
+        select(User).where(
+            User.tenant_id == tenant.id,
+            User.identity_id == identity.id,
+        )
+    )
+    user = u_r.scalar_one_or_none()
+    if user is None:
+        user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name=data.display_name[:100],
+            role="org_admin",  # apps/isola tenants are single-operator at MVP
+            registration_source="apps_isola_bridge",
+            is_active=True,
+            quota_message_limit=tenant.default_message_limit,
+            quota_message_period=tenant.default_message_period,
+            quota_max_agents=tenant.default_max_agents,
+            quota_agent_ttl_hours=tenant.default_agent_ttl_hours,
+        )
+        db.add(user)
+        await db.flush()
+        created = True
+
+    await db.commit()
+
+    # 4. Mint JWT (uses existing JWT_SECRET_KEY + JWT_ALGORITHM from config).
+    from app.config import get_settings
+    settings = get_settings()
+    token = create_access_token(str(user.id), user.role)
+    return InternalUserEnsureResponse(
+        user_id=user.id,
+        access_token=token,
+        expires_in_minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES,
+        created=created,
+    )
+
