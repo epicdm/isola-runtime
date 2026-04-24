@@ -45,6 +45,7 @@ async def main():
     import app.models.participant     # noqa
     import app.models.chat_session   # noqa
     import app.models.trigger        # noqa
+    import app.models.gateway_message # noqa
     import app.models.notification   # noqa
 
     # Create all tables that don't exist yet (safe to run on every startup)
