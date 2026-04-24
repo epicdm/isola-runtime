@@ -2,6 +2,23 @@
 <html lang="en" translate="no" class="notranslate">
 
 <head>
+  <script>
+    // Phase E.2.2b — apps/isola auth bridge: copy isola_runtime_session
+    // cookie (set on .isola.epic.dm by isola.epic.dm/api/runtime/bridge)
+    // into localStorage so api.ts uses it as Bearer. Runs before any
+    // module to beat the /login redirect on first paint.
+    (function () {
+      try {
+        var m = document.cookie.match(/(?:^|;\s*)isola_runtime_session=([^;]+)/);
+        if (m && m[1]) {
+          var v = decodeURIComponent(m[1]);
+          if (v && v !== localStorage.getItem('token')) {
+            localStorage.setItem('token', v);
+          }
+        }
+      } catch (e) { /* swallow — not app-blocking */ }
+    })();
+  </script>
   <meta charset="UTF-8" />
   <meta name="google" content="notranslate" />
   <link rel="icon" type="image/png" href="/logo.png" />

@@ -21,10 +21,10 @@
   --text-tertiary: #5c5c70;
   --text-inverse: #0a0a0f;
 
-  --accent-primary: #e1e1e8;
-  --accent-hover: #ffffff;
-  --accent-subtle: rgba(225, 225, 232, 0.08);
-  --accent-text: #c0c0cc;
+  --accent-primary: #25d366;  /* Phase E.2.4: Isola green */
+  --accent-hover: #2ee674;  /* Phase E.2.4: Isola green lighter */
+  --accent-subtle: rgba(37, 211, 102, 0.12);  /* Phase E.2.4: Isola green tint */
+  --accent-text: #2ee674;  /* Phase E.2.4: Isola green lighter */
 
   --segment-active-bg: var(--accent-primary);
   --segment-active-text: var(--text-inverse);
