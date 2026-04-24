@@ -431,6 +431,56 @@ async def ensure_agent(
         if data.escalation_keywords is not None:
             existing.escalation_keywords = data.escalation_keywords
         await db.commit()
+
+        # Backfill identity + workspace for agents created before the fix.
+        # Each step is independently idempotent so retries are safe.
+        from app.models.participant import Participant
+        from app.models.agent import AgentPermission as _AgentPermission
+
+        p_r = await db.execute(
+            select(Participant).where(
+                Participant.type == "agent",
+                Participant.ref_id == existing.id,
+            )
+        )
+        if p_r.scalar_one_or_none() is None:
+            db.add(Participant(
+                type="agent",
+                ref_id=existing.id,
+                display_name=existing.name,
+                avatar_url=existing.avatar_url,
+            ))
+
+        perm_r = await db.execute(
+            select(_AgentPermission).where(
+                _AgentPermission.agent_id == existing.id,
+                _AgentPermission.scope_type == "user",
+                _AgentPermission.scope_id == user.id,
+            )
+        )
+        if perm_r.scalar_one_or_none() is None:
+            db.add(_AgentPermission(
+                agent_id=existing.id,
+                scope_type="user",
+                scope_id=user.id,
+                access_level="manage",
+            ))
+
+        await db.commit()
+
+        # Workspace files (no-ops if agent_dir already exists).
+        from app.services.agent_manager import agent_manager
+        try:
+            await agent_manager.initialize_agent_files(
+                db, existing, personality="", boundaries=""
+            )
+        except Exception:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).exception(
+                "ensure-agent: backfill initialize_agent_files failed for %s",
+                existing.id,
+            )
+
         return InternalAgentEnsureResponse(
             id=existing.id,
             created=False,
@@ -445,6 +495,15 @@ async def ensure_agent(
     except (ValueError, AttributeError):
         new_id = uuid.uuid4()
 
+    # Resolve template defaults so the agent isn't a hollow shell. Without
+    # these, the workspace UI shows "Role: unchanged", "Model: —", and an
+    # empty Soul & Memory tab on first iframe load. Mirrors the Phase C
+    # provision-from-template flow.
+    autonomy_policy: dict = {}
+    if template_id is not None:
+        # We already loaded the template above; reuse it.
+        autonomy_policy = dict(tpl.default_autonomy_policy or {})
+
     agent = Agent(
         id=new_id,
         external_id=data.external_id,
@@ -453,6 +512,7 @@ async def ensure_agent(
         tenant_id=tenant.id,
         creator_id=user.id,
         template_id=template_id,
+        autonomy_policy=autonomy_policy,
         status="idle",
         agent_type="native",
         tone=data.tone if data.tone is not None else 1,
@@ -460,8 +520,50 @@ async def ensure_agent(
         escalation_keywords=data.escalation_keywords or [],
     )
     db.add(agent)
+    await db.flush()
+
+    # Identity row — the chat surface uses Participant for display names
+    # and avatars across all conversation participants.
+    from app.models.participant import Participant
+
+    db.add(Participant(
+        type="agent",
+        ref_id=agent.id,
+        display_name=agent.name,
+        avatar_url=agent.avatar_url,
+    ))
+
+    # Creator gets manage access by default.
+    from app.models.agent import AgentPermission
+
+    db.add(AgentPermission(
+        agent_id=agent.id,
+        scope_type="user",
+        scope_id=user.id,
+        access_level="manage",
+    ))
+
     await db.commit()
     await db.refresh(agent)
+
+    # Seed workspace files (soul.md / memory.md / HEARTBEAT.md / state.json)
+    # so Soul & Memory tab in the workspace shows real content instead of
+    # blank placeholders. Idempotent — initialize_agent_files no-ops if the
+    # agent_dir already exists, so safe across retries.
+    from app.services.agent_manager import agent_manager
+
+    try:
+        await agent_manager.initialize_agent_files(
+            db, agent, personality="", boundaries=""
+        )
+    except Exception:  # noqa: BLE001
+        # Workspace seeding is best-effort — if AGENT_DATA_DIR isn't
+        # writable in this deploy, log but don't fail the bridge call.
+        # User can recover later via /agents/{id}/reinitialize.
+        import logging
+        logging.getLogger(__name__).exception(
+            "ensure-agent: initialize_agent_files failed for %s", agent.id
+        )
 
     # F.1.c will add skill-seeding here. F.1.b-3 will add Odoo ensure_company.
     return InternalAgentEnsureResponse(
