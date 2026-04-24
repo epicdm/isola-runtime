@@ -13,7 +13,7 @@ export default function Login() {
     const invitedEmail = searchParams.get('email') || '';
     const setAuth = useAuthStore((s) => s.setAuth);
     // Default to register if there's an invitation code — will be overridden after email check
-    const [isRegister, setIsRegister] = useState(!!invitationCode);
+    const [isRegister, setIsRegister] = useState(true);  // OD-49 Phase D: default to register for open self-signup (was: !!invitationCode)
     const [error, setError] = useState('');
     const [successMessage, setSuccessMessage] = useState('');
     const [loading, setLoading] = useState(false);
