@@ -234,8 +234,16 @@ function VersionDisplay() {
 export default function Layout() {
     // Phase E.2.8 — when served inside an iframe at isola.epic.dm, hide our
     // own sidebar/top chrome. The apps/isola shell provides all of that.
-    const isEmbedded = typeof window !== 'undefined' &&
-        new URLSearchParams(window.location.search).get('embedded') === '1';
+    //
+    // Detect via iframe-check (window.top !== window.self) so the flag
+    // stays sticky across client-side nav — React Router's internal
+    // transitions drop the ?embedded=1 query param, but iframe-ness is
+    // constant. Query param is still honored as a fallback for direct
+    // /?embedded=1 testing.
+    const isEmbedded = typeof window !== 'undefined' && (
+        window.top !== window.self ||
+        new URLSearchParams(window.location.search).get('embedded') === '1'
+    );
 
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
