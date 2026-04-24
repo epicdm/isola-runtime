@@ -526,6 +526,27 @@ async def _process_whatsapp_message(
         paperclip_issue_id_for_outbound = sess.paperclip_issue_id
         await db.commit()
 
+    # Phase F.1.c-2 — scan the LLM reply for outbound markers ([escalate: …]
+    # for now; attach/location/pay/template in F.1.c-3) and dispatch their
+    # side-effects before we deliver the clean text to the customer.
+    from app.services.reply_markers import ReplyContext, parse_and_dispatch
+
+    reply_text = await parse_and_dispatch(
+        reply_text,
+        ReplyContext(
+            agent_id=agent_id,
+            agent_name=agent.name,
+            owner_phone=agent.owner_phone,
+            phone_number_id=phone_number_id,
+            access_token=access_token,
+            customer_phone=from_wa_id,
+            customer_name=sender_name,
+            conversation_id=session_conv_id,
+            paperclip_issue_id=paperclip_issue_id_for_outbound,
+            last_inbound=user_text,
+        ),
+    )
+
     # Send the reply outside the DB session so we aren't holding a connection
     # during the Meta Graph API round-trip.
     try:
