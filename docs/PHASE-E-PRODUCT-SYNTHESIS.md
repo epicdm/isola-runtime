@@ -137,6 +137,73 @@ Marketing site + vertical pages · 6-step HR onboarding · Drafts-on-probation �
 
 ---
 
+## 3a. Explicit audit: every Clawith page, ruled in or out
+
+Eric's directive: *"expose all from Clawith OR indicate which will not be in the Isola UI."* This is the complete list. Nothing is quietly dropped.
+
+### ✅ Ported into Isola UI (behind Advanced toggle where applicable)
+
+| Clawith surface | Lands in Isola as | Notes |
+|---|---|---|
+| Dashboard | `/dashboard` (apps/isola) — already exists | apps/isola wins, Clawith version deprecated |
+| AgentDetail **Status** tab | `/dashboard/agent/[agentId]` Overview tab | Default-visible |
+| AgentDetail **Inbox** (chat history) | `/dashboard/agent/[agentId]` Inbox tab | Default-visible |
+| AgentDetail **Settings** | `/dashboard/agent/[agentId]` Settings tab | Default-visible; Isola fields + Clawith fields merged |
+| AgentDetail **Activity Log** | Same page, Advanced | Advanced toggle — E.2 |
+| AgentDetail **Chat Stream** | Same page, Advanced | Advanced toggle — E.2 (typewriter + tool-call viz) |
+| AgentDetail **Approvals** | Same page, Advanced | Advanced toggle — E.2 (L3 autonomy queue) |
+| AgentDetail **Soul & Memory (Mind)** | Same page, Advanced | Advanced toggle — E.3 |
+| AgentDetail **Triggers (Aware)** | Same page, Advanced | Advanced toggle — E.3 |
+| AgentDetail **Tools** | Same page, Advanced | Advanced toggle — E.3 |
+| AgentDetail **Skills** | Same page, Advanced | Advanced toggle — E.3 |
+| AgentDetail **Workspace** (file browser) | Same page, Advanced | Advanced toggle — E.3 |
+| AgentDetail **Relationships** (A2A) | Same page, Advanced | Advanced toggle — E.4 |
+| Plaza (marketplace) | `/dashboard/marketplace` | **MVP-scope** per decision #1 |
+| Messages (cross-agent inbox) | `/dashboard/inbox` (apps/isola) | apps/isola version is better |
+| CompanySetup | Replaced by apps/isola's 6-step onboarding | apps/isola wins |
+| AgentCreate wizard | Replaced by apps/isola `/dashboard/agents/new` + `provision-vertical` | apps/isola wins |
+
+### 🔁 Replaced by Isola-native equivalents (same capability, better-branded)
+
+| Clawith surface | Isola equivalent |
+|---|---|
+| Login / Register | `/auth/[pathname]` (Better-Auth) |
+| ForgotPassword | Better-Auth flow |
+| ResetPassword | Better-Auth flow |
+| VerifyEmail | Better-Auth flow |
+| OpenClawSettings page | **Runtime Mode** section in `/dashboard/settings` (Hosted / Edge toggle — see §5) |
+
+### ⏸️ Deferred (not MVP — surfaces later when a tenant asks)
+
+| Clawith surface | Why deferred | When |
+|---|---|---|
+| **SSO Entry** (Feishu/enterprise SAML) | Isola MVP is self-serve. SSO matters when a Caribbean bank / credit union asks for it. | Phase I (enterprise-tier feature) |
+| **Invitation Codes** page | MVP is single-operator-per-tenant. Team invites are a Team/Suite tier feature. | Team/Suite tier (post-MVP) |
+| **User Management** page (invite teammates) | Same reason — tenant-side team invites land with Team tier. | Team/Suite tier (post-MVP) |
+
+### ❌ Dropped — will NOT surface in Isola UI ever
+
+| Clawith surface | Why |
+|---|---|
+| **AgentBay Live Panel** (browser sandbox) | Deleted in Phase A.1b. Alibaba Cloud paid service; no Caribbean SMB use case. If we ever need browser automation, it goes via Playwright or an MCP server — not AgentBay. |
+| **Enterprise Settings — LLM model management UI** | Platform-level concern, NOT tenant-facing. LLM models managed by EPIC via CLI / env / admin script. Exposing this to tenants is a footgun (every tenant reconfiguring their OpenAI key would break support). |
+| **Platform Dashboard** | EPIC-internal ops view. Never customer-facing. If we need it, it lives at an EPIC-only URL, not in the tenant app. |
+| **Admin Companies** (cross-tenant admin) | Same reason — EPIC-internal. Multi-tenant admin doesn't belong in a single tenant's UI. |
+| **Chinese default locale** | English default everywhere. `zh.json` stays in the repo for a tenant who wants to toggle, but the app defaults to English and is not marketed as multi-lingual in MVP. |
+| **Invitation-only signup gate** | Isola MVP is open self-serve. Anyone with a payment method can register. |
+
+### Where the EPIC team's admin needs go
+
+Everything under ❌ "Dropped" above that EPIC might still need operationally (AdminCompanies, PlatformDashboard, LLM model management) lives on a **separate EPIC-only surface** — NOT in the tenant UI. For MVP, that surface is:
+
+- CLI scripts in the `isola-runtime` repo (`backend/scripts/` — managed via `docker exec`)
+- Direct DB access for one-offs
+- Optionally: an internal `admin.epic.dm` URL later with the Clawith admin pages intact, locked to EPIC staff only (separate decision; not blocking MVP)
+
+Tenant UI = tenant concerns only. Platform UI = EPIC-internal, separate URL.
+
+---
+
 ## 4. The merged product — architecture
 
 ### Domains + services (after Phase E)
