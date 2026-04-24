@@ -205,16 +205,17 @@ async def _phase_c1_provision_vertical(http, test_state, db_session):
         assert tmpl.role == "rex"
         assert tmpl.vertical == "hotel"
 
-    # Missing-role still 404s (fail-fast, no partial create). Post-C.3
-    # 'joey' is now seeded, so the gap role is 'cash' (C.5 adds it).
+    # Missing-role still 404s (fail-fast, no partial create). After C.5
+    # every role is seeded — use a nonexistent role name to exercise the
+    # 404 path without pretending a real role is missing.
     r = await http.post(
         "/api/agents/provision-vertical",
         headers=test_state["headers"],
-        json={"vertical": "hotel", "roles": ["rex", "cash"]},
+        json={"vertical": "hotel", "roles": ["rex", "ghost-role"]},
     )
-    assert r.status_code == 404, f"expected 404 for missing Cash template, got {r.status_code}: {r.text}"
+    assert r.status_code == 404, f"expected 404 for unknown role, got {r.status_code}: {r.text}"
     detail = r.json().get("detail", "")
-    assert "cash" in str(detail).lower()
+    assert "ghost-role" in str(detail).lower()
 
     # And unknown vertical -> 404 with descriptive message.
     r = await http.post(
@@ -497,8 +498,118 @@ async def _phase_c4_retail_service(http, test_state, db_session):
         assert tmpl.role == "rex" and tmpl.vertical == "retail"
 
 
+async def _phase_c5_back_of_house(http, test_state, db_session):
+    """C.5: Cash / Brief / Tech roles × 5 verticals -> matrix complete at 30.
+
+    Depends on C.4. Completes the full 6 roles × 5 verticals = 30
+    template grid. Provisioning a tenant with all 6 roles yields a
+    6-agent back-of-house + front-of-house team.
+    """
+    from app.models.agent import Agent, AgentTemplate
+
+    Session = db_session
+
+    # DB: 15 new templates — 3 back-of-house roles × 5 verticals
+    async with Session() as db:
+        rr = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.role.in_(["cash", "brief", "tech"]),
+                AgentTemplate.vertical.in_(
+                    ["restaurant", "hotel", "clinic", "retail", "service"]
+                ),
+            )
+        )
+        new_fifteen = list(rr.scalars().all())
+        assert len(new_fifteen) == 15, (
+            f"expected 15 new back-of-house templates, got {len(new_fifteen)}"
+        )
+
+        # Every (role, vertical) combination in the grid
+        seen = {(t.role, t.vertical) for t in new_fifteen}
+        expected = {
+            (role, vertical)
+            for role in ("cash", "brief", "tech")
+            for vertical in ("restaurant", "hotel", "clinic", "retail", "service")
+        }
+        assert seen == expected, f"missing: {expected - seen}"
+
+        # Category invariants
+        for t in new_fifteen:
+            if t.role == "cash":
+                assert t.category == "billing"
+                # Cash never negotiates finances without approval
+                assert t.default_autonomy_policy.get("financial_operations") == "L3"
+            elif t.role == "brief":
+                assert t.category == "ops"
+                # Brief never DMs customers
+                assert t.default_autonomy_policy.get("send_external_message") == "L3"
+            elif t.role == "tech":
+                assert t.category == "systems"
+                # Tech never writes to production business systems
+                assert t.default_autonomy_policy.get("access_business_system_write") == "L3"
+
+        # Matrix is complete: 6 roles × 5 verticals = 30 total Isola templates
+        all_r = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.is_builtin == True,  # noqa: E712
+                AgentTemplate.role.isnot(None),
+                AgentTemplate.vertical.isnot(None),
+            )
+        )
+        total = list(all_r.scalars().all())
+        assert len(total) == 30, f"expected 30 Isola templates, got {len(total)}"
+
+    # API filter — role=cash returns 5 rows (one per vertical)
+    for role in ("cash", "brief", "tech"):
+        r = await http.get(
+            "/api/agents/templates",
+            headers=test_state["headers"],
+            params={"role": role},
+        )
+        assert r.status_code == 200
+        rows = r.json()
+        verticals_seen = {row["vertical"] for row in rows}
+        assert {"restaurant", "hotel", "clinic", "retail", "service"}.issubset(
+            verticals_seen
+        ), f"role={role} missing verticals: {verticals_seen}"
+
+    # Full 6-role provisioning for a restaurant tenant.
+    r = await http.post(
+        "/api/agents/provision-vertical",
+        headers=test_state["headers"],
+        json={
+            "vertical": "restaurant",
+            "roles": ["rex", "mara", "joey", "cash", "brief", "tech"],
+            "name_prefix": f"FullTeam {test_state['suffix']}",
+        },
+    )
+    assert r.status_code == 201, f"6-role provision failed: {r.status_code} {r.text}"
+    created = r.json()["agents"]
+    assert len(created) == 6
+    by_role = {a["role"]: a for a in created}
+    assert set(by_role.keys()) == {"rex", "mara", "joey", "cash", "brief", "tech"}
+    assert {a["vertical"] for a in created} == {"restaurant"}
+
+    # Spot-check — Cash agent carries L3 financial_ops; Brief carries L3
+    # send_external_message; Tech carries L3 business_system_write.
+    async with Session() as db:
+        for role, ag in by_role.items():
+            agent_r = await db.execute(
+                select(Agent).where(Agent.id == uuid.UUID(ag["agent_id"]))
+            )
+            agent = agent_r.scalar_one_or_none()
+            assert agent is not None
+            pol = agent.autonomy_policy or {}
+            if role == "cash":
+                assert pol.get("financial_operations") == "L3"
+            elif role == "brief":
+                assert pol.get("send_external_message") == "L3"
+            elif role == "tech":
+                assert pol.get("access_business_system_write") == "L3"
+
+
 async def test_phase_c_chain(http, test_state, db_session):
-    """C.1 -> C.2 -> C.3 -> C.4 dependent chain.
+    """C.1 -> C.2 -> C.3 -> C.4 -> C.5 dependent chain (matrix complete at 30).
 
     Single test function so fixtures stay on one event loop (same
     pattern as test_phase_b.py). Each phase's assertions must pass
@@ -523,3 +634,7 @@ async def test_phase_c_chain(http, test_state, db_session):
     print("--- Phase C.4: Retail + Service verticals (matrix 9 -> 15 templates) ---")
     await _phase_c4_retail_service(http, test_state, db_session)
     print("Phase C.4 PASS")
+
+    print("--- Phase C.5: Cash / Brief / Tech roles (matrix 15 -> 30, complete) ---")
+    await _phase_c5_back_of_house(http, test_state, db_session)
+    print("Phase C.5 PASS")
