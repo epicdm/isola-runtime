@@ -811,7 +811,7 @@ _REX_CLINIC_SOUL = """# Soul — {{agent_name}}
 # seed/update; tenant-authored templates (is_builtin=False) are preserved.
 ISOLA_TEMPLATES = [
     {
-        "name": "Rex — Restaurant",
+        "name": "Front Desk (Rex) — Restaurant",
         "description": "Front-desk agent tuned for restaurants. Takes reservations, answers FAQs, and manages takeout traffic on WhatsApp.",
         "icon": "🍽",
         "category": "front-desk",
@@ -826,7 +826,7 @@ ISOLA_TEMPLATES = [
         },
     },
     {
-        "name": "Rex — Hotel",
+        "name": "Front Desk (Rex) — Hotel",
         "description": "Concierge agent tuned for small hotels and guesthouses. Handles pre-arrival questions, in-house requests, and post-stay follow-ups on WhatsApp.",
         "icon": "🏖",
         "category": "front-desk",
@@ -840,7 +840,7 @@ ISOLA_TEMPLATES = [
         },
     },
     {
-        "name": "Rex — Clinic",
+        "name": "Front Desk (Rex) — Clinic",
         "description": "Front-desk agent tuned for clinics and private practices. Schedules appointments, sends reminders, and handles non-clinical questions on WhatsApp. Never gives medical advice.",
         "icon": "🩺",
         "category": "front-desk",
@@ -857,7 +857,7 @@ ISOLA_TEMPLATES = [
     },
     # ── Mara — Marketer ─────────────────────────────────────────
     {
-        "name": "Mara — Restaurant",
+        "name": "Marketer (Mara) — Restaurant",
         "description": "Marketing agent tuned for restaurants. Drafts weekly specials, seasonal campaigns, and review nudges. Drafts only — every outbound goes through the owner first.",
         "icon": "📣",
         "category": "marketing",
@@ -868,7 +868,7 @@ ISOLA_TEMPLATES = [
         "default_autonomy_policy": dict(_MARA_AUTONOMY_BASE),
     },
     {
-        "name": "Mara — Hotel",
+        "name": "Marketer (Mara) — Hotel",
         "description": "Marketing agent tuned for small hotels. Drafts seasonal campaigns, package copy, and guest-review journeys. Hands group-booking leads to Joey.",
         "icon": "🌴",
         "category": "marketing",
@@ -879,7 +879,7 @@ ISOLA_TEMPLATES = [
         "default_autonomy_policy": dict(_MARA_AUTONOMY_BASE),
     },
     {
-        "name": "Mara — Clinic",
+        "name": "Marketer (Mara) — Clinic",
         "description": "Marketing agent tuned for clinics. Drafts patient-education content, seasonal campaigns, and reminder copy. Privacy-first — never uses PHI; never writes clinical advice.",
         "icon": "📝",
         "category": "marketing",
@@ -896,7 +896,7 @@ ISOLA_TEMPLATES = [
     },
     # ── Joey — Sales / Closer ───────────────────────────────────
     {
-        "name": "Joey — Restaurant",
+        "name": "Sales (Joey) — Restaurant",
         "description": "Sales agent tuned for restaurants. Qualifies private events, catering, and large bookings; drafts quotes for owner approval; hands day-of logistics to Rex.",
         "icon": "🥂",
         "category": "sales",
@@ -907,7 +907,7 @@ ISOLA_TEMPLATES = [
         "default_autonomy_policy": dict(_JOEY_AUTONOMY_BASE),
     },
     {
-        "name": "Joey — Hotel",
+        "name": "Sales (Joey) — Hotel",
         "description": "Sales agent tuned for small hotels. Qualifies group bookings, weddings, retreats; builds all-in quotes; contracts + deposits go through owner approval.",
         "icon": "💼",
         "category": "sales",
@@ -918,7 +918,7 @@ ISOLA_TEMPLATES = [
         "default_autonomy_policy": dict(_JOEY_AUTONOMY_BASE),
     },
     {
-        "name": "Joey — Clinic",
+        "name": "Sales (Joey) — Clinic",
         "description": "Sales + new-patient intake agent tuned for clinics. Qualifies non-clinical fit, schedules consults, and drafts membership quotes. Never discusses symptoms or diagnoses.",
         "icon": "🤝",
         "category": "sales",
@@ -934,7 +934,7 @@ ISOLA_TEMPLATES = [
     },
     # ── Retail vertical ─────────────────────────────────────────
     {
-        "name": "Rex — Retail",
+        "name": "Front Desk (Rex) — Retail",
         "description": "Front-desk agent tuned for retail stores and boutiques. Answers product questions, checks order status, and books in-store appointments on WhatsApp.",
         "icon": "🛍",
         "category": "front-desk",
@@ -948,7 +948,7 @@ ISOLA_TEMPLATES = [
         },
     },
     {
-        "name": "Mara — Retail",
+        "name": "Marketer (Mara) — Retail",
         "description": "Marketing agent tuned for retail. Drafts new-arrival posts, sale campaigns, and review nudges. Drafts only — no claims without knowledge-base backup.",
         "icon": "🪟",
         "category": "marketing",
@@ -959,7 +959,7 @@ ISOLA_TEMPLATES = [
         "default_autonomy_policy": dict(_MARA_AUTONOMY_BASE),
     },
     {
-        "name": "Joey — Retail",
+        "name": "Sales (Joey) — Retail",
         "description": "Sales agent tuned for retail. Qualifies wholesale + B2B + custom orders, schedules private shoppings, and drafts quotes for owner approval.",
         "icon": "🏷",
         "category": "sales",
@@ -971,7 +971,7 @@ ISOLA_TEMPLATES = [
     },
     # ── Service vertical ────────────────────────────────────────
     {
-        "name": "Rex — Service",
+        "name": "Front Desk (Rex) — Service",
         "description": "Front-desk agent for trade + service businesses. Schedules appointments, captures access details, routes emergencies, and sends dispatch updates on WhatsApp.",
         "icon": "🔧",
         "category": "front-desk",
@@ -985,7 +985,7 @@ ISOLA_TEMPLATES = [
         },
     },
     {
-        "name": "Mara — Service",
+        "name": "Marketer (Mara) — Service",
         "description": "Marketing agent for service businesses. Drafts seasonal reminders, testimonials, and referral-program copy. Trust-first voice.",
         "icon": "📬",
         "category": "marketing",
@@ -996,7 +996,7 @@ ISOLA_TEMPLATES = [
         "default_autonomy_policy": dict(_MARA_AUTONOMY_BASE),
     },
     {
-        "name": "Joey — Service",
+        "name": "Sales (Joey) — Service",
         "description": "Sales agent for service businesses. Qualifies commercial + multi-property + maintenance-contract leads, schedules site walks, and drafts proposals for owner approval.",
         "icon": "📑",
         "category": "sales",
@@ -1008,50 +1008,50 @@ ISOLA_TEMPLATES = [
     },
     # ── Cash × 5 verticals (billing + collections) ────────────
     {
-        "name": "Cash — Restaurant", "description": "Billing + collections for restaurants. Reconciles deposits, catering invoices, no-show fees. Dunning beyond first reminder requires owner approval.",
+        "name": "Billing (Cash) — Restaurant", "description": "Billing + collections for restaurants. Reconciles deposits, catering invoices, no-show fees. Dunning beyond first reminder requires owner approval.",
         "icon": "💳", "category": "billing", "role": "cash", "vertical": "restaurant",
         "soul_template": _CASH_RESTAURANT_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_CASH_AUTONOMY_BASE),
     },
     {
-        "name": "Cash — Hotel", "description": "Billing + collections for hotels. Folio reconciliation, deposit tracking, group-booking invoicing. Refunds + write-offs owner-approved.",
+        "name": "Billing (Cash) — Hotel", "description": "Billing + collections for hotels. Folio reconciliation, deposit tracking, group-booking invoicing. Refunds + write-offs owner-approved.",
         "icon": "💰", "category": "billing", "role": "cash", "vertical": "hotel",
         "soul_template": _CASH_HOTEL_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_CASH_AUTONOMY_BASE),
     },
     {
-        "name": "Cash — Clinic", "description": "Billing + collections for clinics. Balance-due reminders, payment-plan inquiries, insurance routing. Never discusses diagnosis or visit details.",
+        "name": "Billing (Cash) — Clinic", "description": "Billing + collections for clinics. Balance-due reminders, payment-plan inquiries, insurance routing. Never discusses diagnosis or visit details.",
         "icon": "🏥", "category": "billing", "role": "cash", "vertical": "clinic",
         "soul_template": _CASH_CLINIC_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_CASH_AUTONOMY_BASE),
     },
     {
-        "name": "Cash — Retail", "description": "Billing + wholesale AR for retail. Term tracking (NET-15/30), late-fee escalation, custom-order deposit reconciliation. Owner-approved credit terms.",
+        "name": "Billing (Cash) — Retail", "description": "Billing + wholesale AR for retail. Term tracking (NET-15/30), late-fee escalation, custom-order deposit reconciliation. Owner-approved credit terms.",
         "icon": "🧾", "category": "billing", "role": "cash", "vertical": "retail",
         "soul_template": _CASH_RETAIL_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_CASH_AUTONOMY_BASE),
     },
     {
-        "name": "Cash — Service", "description": "Billing + collections for service businesses. Per-job invoicing with photo proof, retainer-client monthly cycle, late-payment escalation.",
+        "name": "Billing (Cash) — Service", "description": "Billing + collections for service businesses. Per-job invoicing with photo proof, retainer-client monthly cycle, late-payment escalation.",
         "icon": "🧮", "category": "billing", "role": "cash", "vertical": "service",
         "soul_template": _CASH_SERVICE_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_CASH_AUTONOMY_BASE),
     },
     # ── Brief × 5 verticals (internal ops briefings) ──────────
     {
-        "name": "Brief — Restaurant", "description": "Internal ops briefings for restaurants. Morning cover + no-show + events digest; weekly top-seller + sentiment report. Internal only.",
+        "name": "Ops Briefing (Brief) — Restaurant", "description": "Internal ops briefings for restaurants. Morning cover + no-show + events digest; weekly top-seller + sentiment report. Internal only.",
         "icon": "📊", "category": "ops", "role": "brief", "vertical": "restaurant",
         "soul_template": _BRIEF_RESTAURANT_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_BRIEF_AUTONOMY_BASE),
     },
     {
-        "name": "Brief — Hotel", "description": "Internal ops briefings for hotels. Shift-change digests, occupancy + ADR, maintenance backlog, upcoming groups. Internal only.",
+        "name": "Ops Briefing (Brief) — Hotel", "description": "Internal ops briefings for hotels. Shift-change digests, occupancy + ADR, maintenance backlog, upcoming groups. Internal only.",
         "icon": "📈", "category": "ops", "role": "brief", "vertical": "hotel",
         "soul_template": _BRIEF_HOTEL_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_BRIEF_AUTONOMY_BASE),
     },
     {
-        "name": "Brief — Clinic", "description": "Internal ops briefings for clinics. Appointment throughput, no-show risk, intake queue, supply alerts. Never includes PHI.",
+        "name": "Ops Briefing (Brief) — Clinic", "description": "Internal ops briefings for clinics. Appointment throughput, no-show risk, intake queue, supply alerts. Never includes PHI.",
         "icon": "📋", "category": "ops", "role": "brief", "vertical": "clinic",
         "soul_template": _BRIEF_CLINIC_SOUL, "default_skills": [],
         "default_autonomy_policy": {
@@ -1060,32 +1060,32 @@ ISOLA_TEMPLATES = [
         },
     },
     {
-        "name": "Brief — Retail", "description": "Internal ops briefings for retail. Top-moving SKU, low-stock, staff roster, return-rate, wholesale-pipeline digest. Internal only.",
+        "name": "Ops Briefing (Brief) — Retail", "description": "Internal ops briefings for retail. Top-moving SKU, low-stock, staff roster, return-rate, wholesale-pipeline digest. Internal only.",
         "icon": "🗂", "category": "ops", "role": "brief", "vertical": "retail",
         "soul_template": _BRIEF_RETAIL_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_BRIEF_AUTONOMY_BASE),
     },
     {
-        "name": "Brief — Service", "description": "Internal ops briefings for service businesses. Tech utilization, stuck-job flags, pending parts, retainer compliance. Internal only.",
+        "name": "Ops Briefing (Brief) — Service", "description": "Internal ops briefings for service businesses. Tech utilization, stuck-job flags, pending parts, retainer compliance. Internal only.",
         "icon": "📇", "category": "ops", "role": "brief", "vertical": "service",
         "soul_template": _BRIEF_SERVICE_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_BRIEF_AUTONOMY_BASE),
     },
     # ── Tech × 5 verticals (system health + on-call) ──────────
     {
-        "name": "Tech — Restaurant", "description": "Systems + on-call for restaurants. Monitors WhatsApp, Paperclip, POS, kitchen printers. Pings owner on outage; never auto-remediates.",
+        "name": "On-Call Tech (Tech) — Restaurant", "description": "Systems + on-call for restaurants. Monitors WhatsApp, Paperclip, POS, kitchen printers. Pings owner on outage; never auto-remediates.",
         "icon": "🛠", "category": "systems", "role": "tech", "vertical": "restaurant",
         "soul_template": _TECH_RESTAURANT_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_TECH_AUTONOMY_BASE),
     },
     {
-        "name": "Tech — Hotel", "description": "Systems + on-call for hotels. Monitors PMS, WiFi, door-lock gateway, payment terminal, WhatsApp, Paperclip. Guest-impact-aware escalations.",
+        "name": "On-Call Tech (Tech) — Hotel", "description": "Systems + on-call for hotels. Monitors PMS, WiFi, door-lock gateway, payment terminal, WhatsApp, Paperclip. Guest-impact-aware escalations.",
         "icon": "🧰", "category": "systems", "role": "tech", "vertical": "hotel",
         "soul_template": _TECH_HOTEL_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_TECH_AUTONOMY_BASE),
     },
     {
-        "name": "Tech — Clinic", "description": "Systems + on-call for clinics. HIPAA-aware monitoring of EMR, scheduling, backups, access logs. PHI-exposure risk flagged at escalation.",
+        "name": "On-Call Tech (Tech) — Clinic", "description": "Systems + on-call for clinics. HIPAA-aware monitoring of EMR, scheduling, backups, access logs. PHI-exposure risk flagged at escalation.",
         "icon": "🔐", "category": "systems", "role": "tech", "vertical": "clinic",
         "soul_template": _TECH_CLINIC_SOUL, "default_skills": [],
         "default_autonomy_policy": {
@@ -1094,13 +1094,13 @@ ISOLA_TEMPLATES = [
         },
     },
     {
-        "name": "Tech — Retail", "description": "Systems + on-call for retail. Monitors POS, e-comm, payment provider, inventory sync, WhatsApp, Paperclip. Revenue-impact-aware escalations.",
+        "name": "On-Call Tech (Tech) — Retail", "description": "Systems + on-call for retail. Monitors POS, e-comm, payment provider, inventory sync, WhatsApp, Paperclip. Revenue-impact-aware escalations.",
         "icon": "🖥", "category": "systems", "role": "tech", "vertical": "retail",
         "soul_template": _TECH_RETAIL_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_TECH_AUTONOMY_BASE),
     },
     {
-        "name": "Tech — Service", "description": "Systems + on-call for service businesses. Monitors dispatch software, GPS fleet, payment provider, invoicing, WhatsApp, Paperclip.",
+        "name": "On-Call Tech (Tech) — Service", "description": "Systems + on-call for service businesses. Monitors dispatch software, GPS fleet, payment provider, invoicing, WhatsApp, Paperclip.",
         "icon": "📡", "category": "systems", "role": "tech", "vertical": "service",
         "soul_template": _TECH_SERVICE_SOUL, "default_skills": [],
         "default_autonomy_policy": dict(_TECH_AUTONOMY_BASE),
