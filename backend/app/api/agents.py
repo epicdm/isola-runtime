@@ -150,6 +150,18 @@ async def list_templates(
     ]
 
 
+
+
+def _default_agent_type_for_tenant(runtime_mode: str) -> str:
+    """Map tenant.runtime_mode to the default agent_type for new agents.
+
+    Phase E.6a. Hosted tenants default to 'native' (platform-managed LLM);
+    Edge tenants default to 'openclaw' (tenant daemon runs LLM locally).
+    An explicit agent_type in the create-agent request body still wins.
+    """
+    return "openclaw" if runtime_mode == "edge" else "native"
+
+
 @router.post("/provision-vertical", status_code=201)
 async def provision_vertical_agents(
     data: dict,
@@ -350,6 +362,7 @@ async def create_agent(
     default_min_poll = 5
     default_webhook_rate = 5
     default_heartbeat_interval = 240  # model default
+    tenant_runtime_mode = "hosted"  # Phase E.6a: tenant-level default for agent_type
     if target_tenant_id:
         from app.models.tenant import Tenant
         tenant_result = await db.execute(select(Tenant).where(Tenant.id == target_tenant_id))
@@ -362,6 +375,8 @@ async def create_agent(
             # Enforce heartbeat floor: new agents must respect company minimum
             if tenant.min_heartbeat_interval_minutes and tenant.min_heartbeat_interval_minutes > default_heartbeat_interval:
                 default_heartbeat_interval = tenant.min_heartbeat_interval_minutes
+            if tenant.runtime_mode in ("hosted", "edge"):
+                tenant_runtime_mode = tenant.runtime_mode
 
     agent = Agent(
         name=data.name,
@@ -370,13 +385,13 @@ async def create_agent(
         avatar_url=data.avatar_url,
         creator_id=current_user.id,
         tenant_id=target_tenant_id,
-        agent_type=data.agent_type or "native",
+        agent_type=(data.agent_type if data.agent_type else _default_agent_type_for_tenant(tenant_runtime_mode)),
         primary_model_id=data.primary_model_id,
         fallback_model_id=data.fallback_model_id,
         max_tokens_per_day=data.max_tokens_per_day,
         max_tokens_per_month=data.max_tokens_per_month,
         template_id=data.template_id,
-        status="creating" if data.agent_type != "openclaw" else "idle",
+        status=("idle" if (data.agent_type == "openclaw" or (not data.agent_type and tenant_runtime_mode == "edge")) else "creating"),
         expires_at=expires_at,
         max_llm_calls_per_day=max_llm_calls,
         max_triggers=default_max_triggers,

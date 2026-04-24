@@ -53,3 +53,11 @@ class Tenant(Base):
     # When False, all agent-to-agent messages use synchronous consult mode
     a2a_async_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Runtime Mode: 'hosted' (platform-managed LLM, default) or 'edge' (tenant
+    # runs their own OpenClaw daemon on own hardware — data never leaves their
+    # premises). Flipping to 'edge' causes new agents to default to
+    # agent_type='openclaw'. Existing agents keep their agent_type until the
+    # operator converts them explicitly via /agents/{id}/api-key.
+    # See docs/PHASE-E-PRODUCT-SYNTHESIS.md Section 5.
+    runtime_mode: Mapped[str] = mapped_column(String(20), default="hosted", nullable=False)
+

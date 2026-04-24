@@ -38,6 +38,7 @@ class TenantOut(BaseModel):
     sso_enabled: bool = False
     sso_domain: str | None = None
     a2a_async_enabled: bool = False
+    runtime_mode: str = "hosted"  # hosted | edge
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
@@ -51,6 +52,7 @@ class TenantUpdate(BaseModel):
     sso_enabled: bool | None = None
     sso_domain: str | None = None
     a2a_async_enabled: bool | None = None
+    runtime_mode: str | None = None  # hosted | edge
 
 
 # ─── Helpers ────────────────────────────────────────────
@@ -458,6 +460,15 @@ async def update_tenant(
     if current_user.role == "platform_admin":
         update_data.pop("sso_enabled", None)
         update_data.pop("sso_domain", None)
+
+    # Validate runtime_mode: only 'hosted' or 'edge' allowed.
+    if "runtime_mode" in update_data:
+        rm = update_data["runtime_mode"]
+        if rm not in ("hosted", "edge"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"runtime_mode must be 'hosted' or 'edge', got {rm!r}",
+            )
 
     for field, value in update_data.items():
         setattr(tenant, field, value)
