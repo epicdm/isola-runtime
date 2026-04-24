@@ -58,6 +58,18 @@ class AgentManager:
             (agent_dir / "skills").mkdir(exist_ok=True)
             (agent_dir / "tasks.json").write_text("[]", encoding="utf-8")
 
+        # Phase F.1.c — role-specific skill pack. After the base template is
+        # in place, overlay a role pack (agent_template_packs/<role>/) if
+        # the agent's template has a resolvable role. Safe to re-run: shutil
+        # copytree with dirs_exist_ok merges without clobbering same-named
+        # files. Rex gets 13 skills; Mara/Joey/Cash/Brief/Tech to follow.
+        try:
+            await self._apply_role_skill_pack(db, agent, agent_dir)
+        except Exception as e:  # noqa: BLE001
+            # Missing role pack isn't fatal — agent still works, just without
+            # role-specific skills. Log and continue.
+            logger.warning(f"Role pack overlay failed for agent {agent.id}: {e}")
+
         # Customize soul.md
         soul_path = agent_dir / "soul.md"
         from app.models.user import User
@@ -130,6 +142,62 @@ class AgentManager:
             state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
         logger.info(f"Initialized agent files at {agent_dir}")
+
+    async def _apply_role_skill_pack(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        agent_dir: Path,
+    ) -> None:
+        """Overlay role-specific skill bundles on top of the base template.
+
+        Pack layout: `backend/agent_template_packs/<role>/skills/<skill>/SKILL.md`
+        Target:      `<agent_dir>/skills/<skill>/SKILL.md`
+
+        Discovery:
+          1. agent.template → AgentTemplate.role (e.g. "rex")
+          2. If role is None (no template), silently skip.
+          3. Pack dir = <this_file>/../../agent_template_packs/<role>
+             (container path: /app/agent_template_packs/<role>)
+          4. If pack doesn't exist, skip (unknown role = no pack).
+        """
+        if agent.template_id is None:
+            return
+
+        from app.models.agent import AgentTemplate
+
+        r = await db.execute(
+            select(AgentTemplate).where(AgentTemplate.id == agent.template_id)
+        )
+        tpl = r.scalar_one_or_none()
+        if tpl is None or not tpl.role:
+            return
+
+        # Locate the pack directory. Two candidate paths: Docker (/app) and
+        # source layout (backend/).
+        candidates = [
+            Path("/app/agent_template_packs") / tpl.role,
+            Path(__file__).resolve().parent.parent.parent
+            / "agent_template_packs"
+            / tpl.role,
+        ]
+        pack_dir = next((p for p in candidates if p.exists()), None)
+        if pack_dir is None:
+            logger.debug(f"No role pack for '{tpl.role}' — skipping overlay")
+            return
+
+        # Merge the pack's skills/ tree into agent_dir/skills/.
+        src_skills = pack_dir / "skills"
+        if not src_skills.exists():
+            return
+        dst_skills = agent_dir / "skills"
+        dst_skills.mkdir(parents=True, exist_ok=True)
+
+        shutil.copytree(str(src_skills), str(dst_skills), dirs_exist_ok=True)
+        logger.info(
+            f"Applied '{tpl.role}' skill pack to agent {agent.id} "
+            f"({len(list(src_skills.iterdir()))} skills)"
+        )
 
     async def archive_agent_files(self, agent_id: uuid.UUID) -> Path:
         """Archive agent files to a backup location and return the archive directory."""
