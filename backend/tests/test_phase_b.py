@@ -1336,6 +1336,118 @@ async def _phase_e6a_runtime_mode(http, test_state, db_session):
     )
 
 
+async def _phase_e6c_internal_auth(http, test_state):
+    """Phase E.6c: X-Internal-Secret gate on /api/internal/tenants/*.
+
+    Covers:
+      1. No header -> 401
+      2. Wrong header -> 401
+      3. Right header + non-existent tenant -> 404
+      4. POST /api/internal/tenants/ensure with right header:
+         - First call -> 200 with created=True, runtime_mode=hosted
+         - Repeat with same external_id -> same id, created=False
+      5. GET /api/internal/tenants/{id} echoes fields incl. runtime_mode
+      6. PUT /api/internal/tenants/{id} with runtime_mode=edge -> 200
+      7. GET again -> runtime_mode=edge persists
+      8. PUT with invalid runtime_mode -> 422 (Pydantic Literal validator)
+
+    Uses the ISOLA_INTERNAL_SECRET set in docker-compose.override.yml.
+    If that env var isn't set on this deployment, the endpoint 401s even
+    with the right header — we match that behaviour explicitly.
+    """
+    import os as _os
+    secret = _os.environ.get("ISOLA_INTERNAL_SECRET", "").strip()
+    if not secret:
+        # Endpoint is intentionally disabled when the server has no secret.
+        r = await http.get(
+            "/api/internal/tenants/00000000-0000-0000-0000-000000000000",
+            headers={"X-Internal-Secret": "anything"},
+        )
+        assert r.status_code == 401, (
+            f"E.6c: secret not set in server env — endpoint should 401 even "
+            f"with a header, got {r.status_code}"
+        )
+        return
+
+    # 1 + 2: missing / wrong header -> 401
+    r = await http.get("/api/internal/tenants/00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 401, f"no-header 401 expected, got {r.status_code} {r.text}"
+    r = await http.get(
+        "/api/internal/tenants/00000000-0000-0000-0000-000000000000",
+        headers={"X-Internal-Secret": "obviously-wrong"},
+    )
+    assert r.status_code == 401, f"wrong-header 401 expected, got {r.status_code} {r.text}"
+
+    hdr = {"X-Internal-Secret": secret}
+
+    # 3: right header, missing tenant -> 404
+    r = await http.get(
+        "/api/internal/tenants/00000000-0000-0000-0000-000000000000", headers=hdr
+    )
+    assert r.status_code == 404, f"missing-tenant 404 expected, got {r.status_code} {r.text}"
+
+    suffix = test_state["suffix"]
+    external_id = f"e6c-chain-{suffix}"
+
+    # 4a: ensure first-time
+    r = await http.post(
+        "/api/internal/tenants/ensure",
+        headers=hdr,
+        json={"external_id": external_id, "name": f"E6c Chain {suffix}"},
+    )
+    assert r.status_code == 200, f"ensure first-time: {r.status_code} {r.text}"
+    first = r.json()
+    assert first["created"] is True, f"first call should set created=True: {first}"
+    assert first["runtime_mode"] == "hosted", f"default hosted: {first}"
+    new_tenant_id = first["id"]
+
+    # 4b: ensure idempotent
+    r = await http.post(
+        "/api/internal/tenants/ensure",
+        headers=hdr,
+        json={"external_id": external_id, "name": f"E6c Chain {suffix}"},
+    )
+    assert r.status_code == 200, f"ensure repeat: {r.status_code} {r.text}"
+    second = r.json()
+    assert second["id"] == new_tenant_id, (
+        f"ensure not idempotent on external_id={external_id!r}: "
+        f"first={new_tenant_id} second={second['id']}"
+    )
+    assert second["created"] is False, f"repeat should set created=False: {second}"
+
+    # 5: GET
+    r = await http.get(f"/api/internal/tenants/{new_tenant_id}", headers=hdr)
+    assert r.status_code == 200, f"internal GET: {r.status_code}"
+    got = r.json()
+    assert got["id"] == new_tenant_id
+    assert got["runtime_mode"] == "hosted"
+
+    # 6: PUT runtime_mode=edge
+    r = await http.put(
+        f"/api/internal/tenants/{new_tenant_id}",
+        headers=hdr,
+        json={"runtime_mode": "edge"},
+    )
+    assert r.status_code == 200, f"internal PUT: {r.status_code} {r.text}"
+    updated = r.json()
+    assert updated["runtime_mode"] == "edge", f"PUT didn't flip: {updated}"
+
+    # 7: GET confirms persisted
+    r = await http.get(f"/api/internal/tenants/{new_tenant_id}", headers=hdr)
+    assert r.status_code == 200
+    assert r.json()["runtime_mode"] == "edge", (
+        f"runtime_mode didn't persist: {r.json()}"
+    )
+
+    # 8: invalid runtime_mode -> 422 (Pydantic Literal validator)
+    r = await http.put(
+        f"/api/internal/tenants/{new_tenant_id}",
+        headers=hdr,
+        json={"runtime_mode": "cloud"},
+    )
+    assert r.status_code == 422, f"invalid runtime_mode should 422, got {r.status_code}"
+
+
 async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paperclip, db_session):
     """Run B.1 -> B.2 -> B.3 -> B.4 -> B.5 -> B.6 as one dependent chain.
 
@@ -1376,3 +1488,7 @@ async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paper
     print("--- Phase E.6a: tenant Runtime Mode default for agent_type ---")
     await _phase_e6a_runtime_mode(http, test_state, db_session)
     print("Phase E.6a PASS")
+
+    print("--- Phase E.6c: internal auth bridge (service secret + ensure) ---")
+    await _phase_e6c_internal_auth(http, test_state)
+    print("Phase E.6c PASS")

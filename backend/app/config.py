@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     # JWT
+    # Phase E.6c: shared service secret for apps/isola <-> isola-runtime
+    # internal API calls (e.g. tenant-runtime-mode proxy). Blank in dev
+    # disables the /api/internal/* routes so they cannot be called.
+    ISOLA_INTERNAL_SECRET: str = ""
     JWT_SECRET_KEY: str = "change-me-jwt-secret"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
