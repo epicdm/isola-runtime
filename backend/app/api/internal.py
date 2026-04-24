@@ -421,15 +421,31 @@ async def ensure_agent(
                 existing.external_id = data.external_id
 
     if existing is not None:
-        # Update mutable fields, keep id + creator + template.
+        # Update mutable fields, keep id + creator. Template gets backfilled
+        # below when the existing row had no template (Rex from E.2 dogfood).
         existing.name = data.name[:100]
-        existing.role_description = data.role_description[:500]
+        # Only overwrite role_description if caller actually provided one —
+        # otherwise we'd clobber a template-derived description with "" when
+        # apps/isola doesn't carry that field today (Phase F.1 limitation).
+        if data.role_description:
+            existing.role_description = data.role_description[:500]
         if data.tone is not None:
             existing.tone = data.tone
         if data.welcome_message is not None:
             existing.welcome_message = data.welcome_message
         if data.escalation_keywords is not None:
             existing.escalation_keywords = data.escalation_keywords
+
+        # Backfill template + autonomy + role_description from template defaults
+        # for agents that were created before F.1.a-3. Without this, the
+        # workspace UI shows "Role: unchanged" and Soul & Memory stays empty.
+        if existing.template_id is None and template_id is not None:
+            existing.template_id = template_id
+            if not existing.role_description or existing.role_description == "unchanged":
+                existing.role_description = (tpl.description or "")[:500]
+            if not existing.autonomy_policy:
+                existing.autonomy_policy = dict(tpl.default_autonomy_policy or {})
+
         await db.commit()
 
         # Backfill identity + workspace for agents created before the fix.
