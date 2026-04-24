@@ -497,12 +497,37 @@ async def ensure_agent(
                 existing.id,
             )
 
+        # F.1.b-4 — ensure_company also runs on the existing-agent path so
+        # tenants onboarded before Odoo existed still get their res.company
+        # on next bridge hit.
+        odoo_company_id = tenant.odoo_company_id
+        if odoo_company_id is None:
+            from app.config import get_settings
+            if get_settings().ODOO_ENABLED:
+                from app.services.odoo_service import odoo_service, OdooError
+                try:
+                    odoo_company_id = odoo_service().ensure_company(
+                        name=tenant.name or "Isola Tenant",
+                        external_ref=str(tenant.id),
+                    )
+                    tenant.odoo_company_id = odoo_company_id
+                    await db.commit()
+                except OdooError as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "ensure_company failed for tenant %s: %s (%s)",
+                        tenant.id,
+                        e,
+                        e.detail,
+                    )
+                    odoo_company_id = None
+
         return InternalAgentEnsureResponse(
             id=existing.id,
             created=False,
             template_id=existing.template_id,
             skills_seeded=0,  # F.1.c will count existing skills
-            odoo_company_id=tenant.odoo_company_id,
+            odoo_company_id=odoo_company_id,
         )
 
     # 5. Create new agent. Reuse external_id as UUID when valid.
@@ -588,12 +613,39 @@ async def ensure_agent(
             "ensure-agent: initialize_agent_files failed for %s", agent.id
         )
 
-    # F.1.c will add skill-seeding here. F.1.b-3 will add Odoo ensure_company.
+    # F.1.b-4 — Odoo company ensure. Runs lazily on the bridge: the first
+    # time a tenant hits agent workspace we provision an Odoo res.company
+    # for them and cache the id on tenants.odoo_company_id. Skipped when
+    # already set OR when ODOO_ENABLED is False. Failures log and return
+    # odoo_company_id=None so tenant provisioning never blocks on Odoo.
+    odoo_company_id = tenant.odoo_company_id
+    if odoo_company_id is None:
+        from app.config import get_settings
+        if get_settings().ODOO_ENABLED:
+            from app.services.odoo_service import odoo_service, OdooError
+            try:
+                odoo_company_id = odoo_service().ensure_company(
+                    name=tenant.name or "Isola Tenant",
+                    external_ref=str(tenant.id),
+                )
+                tenant.odoo_company_id = odoo_company_id
+                await db.commit()
+            except OdooError as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "ensure_company failed for tenant %s: %s (%s)",
+                    tenant.id,
+                    e,
+                    e.detail,
+                )
+                odoo_company_id = None
+
+    # F.1.c will add skill-seeding here.
     return InternalAgentEnsureResponse(
         id=agent.id,
         created=True,
         template_id=template_id,
         skills_seeded=0,
-        odoo_company_id=tenant.odoo_company_id,
+        odoo_company_id=odoo_company_id,
     )
 

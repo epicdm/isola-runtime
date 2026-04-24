@@ -110,6 +110,17 @@ class Settings(BaseSettings):
     # Exa AI (Search API)
     EXA_API_KEY: str = ""
 
+    # Odoo (Phase F.1.b) — self-hosted multi-company ERP at odoo.epic.dm.
+    # ensure-agent calls OdooService.ensure_company() to create a res.company
+    # for each Isola tenant, storing the returned id on tenants.odoo_company_id.
+    ODOO_URL: str = "https://odoo.epic.dm"
+    ODOO_DB: str = "epic"
+    ODOO_ADMIN_LOGIN: str = "admin"
+    ODOO_ADMIN_PASSWORD: str = ""
+    # Toggle: when False, ensure-agent skips the Odoo call. Useful when Odoo
+    # is down or during migrations so tenant provisioning doesn't block.
+    ODOO_ENABLED: bool = True
+
 
     # Sandbox configuration
     SANDBOX_TYPE: SandboxType = SandboxType.SUBPROCESS
