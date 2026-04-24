@@ -704,13 +704,18 @@ async def list_knowledge_gaps(
 
     raw = _read_workspace_text(_agent_workspace_path(agent_id) / "knowledge-gaps.md")
 
+    # Match a "· taught YYYY-MM-DD" or " - taught YYYY-MM-DD" suffix only —
+    # NOT the literal "not yet taught" phrase that knowledge_gap_capture
+    # writes into the original row to indicate pending state.
+    taught_marker = re.compile(r"(?:·|-)\s*taught\s+\d{4}-\d{2}-\d{2}")
+
     pending_by_q: dict[str, dict] = {}
     taught_count = 0
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("- "):
             continue
-        if "taught" in line:
+        if taught_marker.search(line):
             taught_count += 1
             continue
         m = re.search(r'asked:\s*"([^"]+)"', line)
@@ -822,12 +827,13 @@ async def teach_agent(
 
     gaps_path = ws / "knowledge-gaps.md"
     gaps_marked = 0
+    taught_marker_re = re.compile(r"(?:·|-)\s*taught\s+\d{4}-\d{2}-\d{2}")
     if gaps_path.exists():
         norm_q = re.sub(r"[?!.,\s]+$", "", data.question.lower().strip())
         new_lines = []
         for line in gaps_path.read_text(encoding="utf-8").splitlines():
             m = re.search(r'asked:\s*"([^"]+)"', line)
-            if m and "taught" not in line:
+            if m and not taught_marker_re.search(line):
                 line_q = re.sub(r"[?!.,\s]+$", "", m.group(1).lower().strip())
                 if line_q == norm_q:
                     line = f"{line.rstrip()} - taught {today}"
@@ -882,9 +888,10 @@ async def knowledge_stats(
         if m.group(1) >= week_ago
     )
 
+    taught_marker_re = re.compile(r"(?:·|-)\s*taught\s+\d{4}-\d{2}-\d{2}")
     pending_by_q: dict[str, int] = {}
     for line in gaps.splitlines():
-        if "taught" in line or not line.startswith("- "):
+        if not line.startswith("- ") or taught_marker_re.search(line):
             continue
         m = re.search(r'asked:\s*"([^"]+)"', line)
         if m:
