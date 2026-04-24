@@ -265,3 +265,210 @@ async def ensure_user_and_mint(
         created=created,
     )
 
+
+# ─── Agent-sync (Phase F.1.a-2) ─────────────────────────────────────
+
+
+class InternalAgentEnsureRequest(BaseModel):
+    external_id: str = Field(
+        ...,
+        description="Stable id from caller (apps/isola agents.id). Used as idempotency key AND as the runtime agent UUID when it parses as one.",
+        min_length=1,
+        max_length=200,
+    )
+    tenant_runtime_id: uuid.UUID = Field(
+        ...,
+        description="Runtime tenant id returned by /api/internal/tenants/ensure.",
+    )
+    creator_id: uuid.UUID = Field(
+        ...,
+        description="Runtime user id returned by /api/internal/users/ensure-and-mint.",
+    )
+    name: str = Field(..., min_length=1, max_length=100)
+    role_description: str = Field(default="", max_length=500)
+    template_hint: str | None = Field(
+        default=None,
+        description=(
+            "Dash-separated role-vertical, e.g. 'rex-restaurant'. "
+            "Resolved to agent_templates row. Required for F.1 path; "
+            "optional for flexibility."
+        ),
+        max_length=100,
+    )
+    tone: int | None = Field(default=None, ge=0, le=2)
+    welcome_message: str | None = None
+    escalation_keywords: list[str] | None = None
+
+
+class InternalAgentEnsureResponse(BaseModel):
+    id: uuid.UUID
+    created: bool
+    template_id: uuid.UUID | None = None
+    skills_seeded: int = 0
+    odoo_company_id: int | None = None
+
+
+def _resolve_template_hint(hint: str | None) -> tuple[str | None, str | None]:
+    """Parse 'role-vertical' into (role, vertical). Accepts 'rex-restaurant'
+    -> ('rex', 'restaurant'). Multi-word verticals supported via remaining
+    split ('tech-restaurant' works; 'mara-retail' works)."""
+    if not hint:
+        return None, None
+    parts = hint.strip().lower().split("-", 1)
+    if len(parts) != 2:
+        return None, None
+    return parts[0], parts[1]
+
+
+@router.post("/agents/ensure", response_model=InternalAgentEnsureResponse)
+async def ensure_agent(
+    data: InternalAgentEnsureRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create-or-return a runtime agent mirrored from an apps/isola agent.
+
+    Idempotency:
+      - (external_id, tenant_id) -> returns the existing row; updates
+        mutable fields (name, role_description, tone, welcome_message,
+        escalation_keywords) and returns created=False.
+      - First call uses external_id as the runtime Agent UUID when it
+        parses as one; otherwise generates a fresh UUID.
+
+    Preconditions:
+      - tenant_runtime_id must exist (call /tenants/ensure first).
+      - creator_id must exist (call /users/ensure-and-mint first).
+
+    Post-F.1.b-3: will also call OdooService.ensure_company() inline.
+    Post-F.1.c: will auto-seed template skills onto the new agent.
+    """
+    from app.models.agent import Agent, AgentTemplate
+    from app.models.tenant import Tenant
+    from app.models.user import User
+
+    # 1. Tenant must exist.
+    t_r = await db.execute(select(Tenant).where(Tenant.id == data.tenant_runtime_id))
+    tenant = t_r.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Runtime tenant {data.tenant_runtime_id} not found",
+        )
+
+    # 2. Creator must exist + belong to this tenant.
+    u_r = await db.execute(select(User).where(User.id == data.creator_id))
+    user = u_r.scalar_one_or_none()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Creator user {data.creator_id} not found",
+        )
+    if user.tenant_id != tenant.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Creator {data.creator_id} does not belong to tenant "
+                f"{tenant.id}"
+            ),
+        )
+
+    # 3. Resolve template_hint to AgentTemplate row (role, vertical).
+    role, vertical = _resolve_template_hint(data.template_hint)
+    template_id: uuid.UUID | None = None
+    if role and vertical:
+        tpl_r = await db.execute(
+            select(AgentTemplate).where(
+                AgentTemplate.role == role,
+                AgentTemplate.vertical == vertical,
+            )
+        )
+        tpl = tpl_r.scalar_one_or_none()
+        if tpl is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"No agent_template matches role={role!r}, "
+                    f"vertical={vertical!r} (hint={data.template_hint!r})"
+                ),
+            )
+        template_id = tpl.id
+
+    # 4. Idempotency lookup — try two paths:
+    #    (a) by (external_id, tenant_id) — canonical ensure-agent key
+    #    (b) by primary key id when external_id parses as a UUID — backfills
+    #        rows that pre-dated F.1.a (e.g. Rex was manually inserted during
+    #        E.2 dogfood before external_id existed as a column).
+    a_r = await db.execute(
+        select(Agent).where(
+            Agent.external_id == data.external_id,
+            Agent.tenant_id == tenant.id,
+        )
+    )
+    existing = a_r.scalar_one_or_none()
+    if existing is None:
+        try:
+            candidate_id = uuid.UUID(data.external_id)
+        except (ValueError, AttributeError):
+            candidate_id = None
+        if candidate_id is not None:
+            a_r2 = await db.execute(
+                select(Agent).where(
+                    Agent.id == candidate_id,
+                    Agent.tenant_id == tenant.id,
+                )
+            )
+            existing = a_r2.scalar_one_or_none()
+            if existing is not None and existing.external_id is None:
+                existing.external_id = data.external_id
+
+    if existing is not None:
+        # Update mutable fields, keep id + creator + template.
+        existing.name = data.name[:100]
+        existing.role_description = data.role_description[:500]
+        if data.tone is not None:
+            existing.tone = data.tone
+        if data.welcome_message is not None:
+            existing.welcome_message = data.welcome_message
+        if data.escalation_keywords is not None:
+            existing.escalation_keywords = data.escalation_keywords
+        await db.commit()
+        return InternalAgentEnsureResponse(
+            id=existing.id,
+            created=False,
+            template_id=existing.template_id,
+            skills_seeded=0,  # F.1.c will count existing skills
+            odoo_company_id=tenant.odoo_company_id,
+        )
+
+    # 5. Create new agent. Reuse external_id as UUID when valid.
+    try:
+        new_id = uuid.UUID(data.external_id)
+    except (ValueError, AttributeError):
+        new_id = uuid.uuid4()
+
+    agent = Agent(
+        id=new_id,
+        external_id=data.external_id,
+        name=data.name[:100],
+        role_description=data.role_description[:500],
+        tenant_id=tenant.id,
+        creator_id=user.id,
+        template_id=template_id,
+        status="idle",
+        agent_type="native",
+        tone=data.tone if data.tone is not None else 1,
+        welcome_message=data.welcome_message,
+        escalation_keywords=data.escalation_keywords or [],
+    )
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    # F.1.c will add skill-seeding here. F.1.b-3 will add Odoo ensure_company.
+    return InternalAgentEnsureResponse(
+        id=agent.id,
+        created=True,
+        template_id=template_id,
+        skills_seeded=0,
+        odoo_company_id=tenant.odoo_company_id,
+    )
+
