@@ -939,6 +939,113 @@ async def _phase_b6_paperclip_escalation(
         )
 
 
+async def _phase_e1_openclaw_gateway(http, test_state, db_session):
+    """Edge (OpenClaw) gateway flow: create edge agent -> poll -> seed queue -> poll -> report.
+
+    Covers:
+      1. POST /api/agents with agent_type=openclaw returns an api_key once + status=idle
+         (no workspace init, no LLM model required).
+      2. GET /api/gateway/poll with X-Api-Key=<returned-key> authenticates + returns empty queue.
+      3. Directly insert a GatewayMessage row simulating a queued inbound customer message.
+      4. Poll again -> the gateway returns the seeded message under the authenticated agent.
+      5. POST /api/gateway/report with {"message_id": ..., "result": "..."} marks the
+         message completed and stores the Edge-generated reply.
+      6. After report, a follow-up poll returns empty again (the reported message is not
+         re-delivered).
+
+    This test chains onto B.6: runs against the same test_state and db_session fixtures,
+    verifies that Phase E.1 restored the gateway lifecycle without regressing Phase B.
+    """
+    suffix = test_state["suffix"]
+    headers = test_state["headers"]
+
+    # 1. Create an Edge agent. The creator is authenticated via test_state["jwt"].
+    r = await http.post("/api/agents", headers=headers, json={
+        "name": f"E-Edge Agent {suffix}",
+        "agent_type": "openclaw",
+        "role_description": "Phase E.1 Edge integration test agent",
+    })
+    assert r.status_code in (200, 201), f"edge agent create failed: {r.status_code} {r.text}"
+    body = r.json()
+    assert body["agent_type"] == "openclaw", f"agent_type mismatch: {body}"
+    assert body["status"] == "idle", f"edge agent should be idle, got {body['status']}"
+    api_key = body.get("api_key")
+    assert api_key and api_key.startswith("oc-"), f"api_key missing or wrong shape: {api_key!r}"
+    edge_agent_id = body["id"]
+
+    # 2. Empty poll with the returned key: expect 200 + empty messages.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r.status_code == 200, f"empty poll failed: {r.status_code} {r.text}"
+    poll_body = r.json()
+    assert isinstance(poll_body.get("messages"), list), f"messages not list: {poll_body}"
+    assert poll_body["messages"] == [], f"expected empty queue, got {poll_body['messages']}"
+
+    # 3. Wrong key -> 401.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": "oc-definitely-not-a-real-key"})
+    assert r.status_code == 401, f"wrong-key poll should 401, got {r.status_code}"
+
+    # 4. Seed a GatewayMessage directly into the DB for this agent.
+    from app.models.gateway_message import GatewayMessage
+    async with db_session() as db:
+        gw_msg = GatewayMessage(
+            agent_id=uuid.UUID(edge_agent_id),
+            sender_user_id=uuid.UUID(test_state["user_id"]),
+            content="Hey Edge agent, customer needs a quote for 3 rooms next weekend.",
+            status="pending",
+        )
+        db.add(gw_msg)
+        await db.commit()
+        seeded_message_id = str(gw_msg.id)
+
+    # 5. Poll again -> the seeded message appears.
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r.status_code == 200, f"second poll failed: {r.status_code} {r.text}"
+    poll_body = r.json()
+    msgs = poll_body.get("messages", [])
+    assert len(msgs) == 1, f"expected 1 message, got {len(msgs)}: {msgs}"
+    assert msgs[0]["id"] == seeded_message_id, f"message id mismatch: {msgs[0]}"
+    assert "customer needs a quote" in msgs[0]["content"], f"content missing: {msgs[0]}"
+
+    # 6. Report a reply for the seeded message.
+    r = await http.post("/api/gateway/report", headers={"X-Api-Key": api_key}, json={
+        "message_id": seeded_message_id,
+        "result": "Three rooms (double bed, ocean view) available Sat-Sun — EC$450/night each.",
+    })
+    assert r.status_code == 200, f"report failed: {r.status_code} {r.text}"
+
+    # 7. Verify the row is now completed in the DB.
+    async with db_session() as db:
+        from sqlalchemy import select as _select
+        row = await db.execute(
+            _select(GatewayMessage).where(GatewayMessage.id == uuid.UUID(seeded_message_id))
+        )
+        gw = row.scalar_one()
+        assert gw.status == "completed", f"expected completed, got {gw.status!r}"
+        assert gw.result and "ocean view" in gw.result, f"result not stored: {gw.result!r}"
+
+    # 8. Follow-up poll returns empty again (reported messages are not re-delivered).
+    r = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r.status_code == 200, f"follow-up poll failed: {r.status_code} {r.text}"
+    assert r.json().get("messages") == [], (
+        f"completed message should not be re-polled: {r.json()}"
+    )
+
+    # 9. Rotate API key via /agents/<id>/api-key -> old key should stop working.
+    r = await http.post(
+        f"/api/agents/{edge_agent_id}/api-key",
+        headers=headers,
+    )
+    assert r.status_code == 200, f"api-key rotate failed: {r.status_code} {r.text}"
+    rotated = r.json().get("api_key")
+    assert rotated and rotated.startswith("oc-") and rotated != api_key, (
+        f"rotation returned bad key: {rotated!r} (original {api_key!r})"
+    )
+    r_old = await http.get("/api/gateway/poll", headers={"X-Api-Key": api_key})
+    assert r_old.status_code == 401, f"old key should be revoked, got {r_old.status_code}"
+    r_new = await http.get("/api/gateway/poll", headers={"X-Api-Key": rotated})
+    assert r_new.status_code == 200, f"rotated key should work, got {r_new.status_code}"
+
+
 async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paperclip, db_session):
     """Run B.1 -> B.2 -> B.3 -> B.4 -> B.5 -> B.6 as one dependent chain.
 
@@ -971,3 +1078,7 @@ async def test_phase_b_chain(http, test_state, fake_creds, mock_meta, mock_paper
         http, test_state, fake_creds, mock_meta, mock_paperclip, db_session
     )
     print("Phase B.6 PASS")
+
+    print("--- Phase E.1: Edge (OpenClaw) gateway lifecycle ---")
+    await _phase_e1_openclaw_gateway(http, test_state, db_session)
+    print("Phase E.1 PASS")
