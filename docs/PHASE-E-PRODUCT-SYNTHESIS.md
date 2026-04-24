@@ -181,16 +181,44 @@ Eric's directive: *"expose all from Clawith OR indicate which will not be in the
 | **Invitation Codes** page | MVP is single-operator-per-tenant. Team invites are a Team/Suite tier feature. | Team/Suite tier (post-MVP) |
 | **User Management** page (invite teammates) | Same reason — tenant-side team invites land with Team tier. | Team/Suite tier (post-MVP) |
 
+### 🧬 Partial port — useful fields extracted, integrated natively into apps/isola
+
+Some Clawith pages have **good options inside them** even if the page as a whole is the wrong shape for SMB tenants. Those fields get lifted and re-implemented in the corresponding apps/isola settings surface, styled natively.
+
+| Clawith surface | Fields/options worth keeping | Where they land in apps/isola |
+|---|---|---|
+| **Enterprise Settings** (tenant-admin page) | Company timezone · logo upload · token-spend cap (per-agent + tenant-wide) · agent-default autonomy policy · retention period for chat history · heartbeat schedule defaults · operator language preference | `/dashboard/settings` — new "Company" section alongside existing Business / Channels / Billing subsections |
+| **User Management** (team roles) | Role names · per-role permissions matrix (future Team tier) | `/dashboard/team` — merges with existing Team surface when Team tier opens |
+| **Platform Dashboard** (ops metrics per tenant) | Per-agent status badges · global token usage graph · active-session count | Integrated into `/dashboard` landing as an owner-facing "Operations" card (MVP surface, not a separate page) |
+| **Invitation Codes** (operator onboarding) | Deferred to Team tier per §3a; but the *concept* of an invite link stays (apps/isola already has a lighter version for the QA-bot flow) | Reuse apps/isola's existing invite-link pattern when Team tier opens |
+
 ### ❌ Dropped — will NOT surface in Isola UI ever
 
 | Clawith surface | Why |
 |---|---|
 | **AgentBay Live Panel** (browser sandbox) | Deleted in Phase A.1b. Alibaba Cloud paid service; no Caribbean SMB use case. If we ever need browser automation, it goes via Playwright or an MCP server — not AgentBay. |
-| **Enterprise Settings — LLM model management UI** | Platform-level concern, NOT tenant-facing. LLM models managed by EPIC via CLI / env / admin script. Exposing this to tenants is a footgun (every tenant reconfiguring their OpenAI key would break support). |
-| **Platform Dashboard** | EPIC-internal ops view. Never customer-facing. If we need it, it lives at an EPIC-only URL, not in the tenant app. |
-| **Admin Companies** (cross-tenant admin) | Same reason — EPIC-internal. Multi-tenant admin doesn't belong in a single tenant's UI. |
-| **Chinese default locale** | English default everywhere. `zh.json` stays in the repo for a tenant who wants to toggle, but the app defaults to English and is not marketed as multi-lingual in MVP. |
-| **Invitation-only signup gate** | Isola MVP is open self-serve. Anyone with a payment method can register. |
+| **Enterprise Settings — LLM model management UI** (only this specific field, not the whole page — see Partial Port above) | Platform-level concern, NOT tenant-facing. LLM models managed centrally by EPIC via CLI / env. Exposing this to tenants is a footgun. |
+| **Admin Companies** (cross-tenant admin) | EPIC-internal. Multi-tenant admin doesn't belong in a single tenant's UI. |
+| **Chinese default locale** | English default everywhere. `zh.json` stays in repo for tenant toggle, but not the default; not marketed as multi-lingual in MVP. |
+| **Invitation-only signup gate** | Isola MVP is open self-serve. Anyone with a payment method registers. |
+
+---
+
+## 3b. Integration principle — port capabilities, not components
+
+**The rule: no tenant should be able to tell which features came from Clawith versus built from scratch in Isola.**
+
+Concretely:
+
+- **Visual:** Every ported tab rebuilds in apps/isola's existing stack: **shadcn/ui + Tailwind + lucide-react icons + Sonner toasts**. We do NOT import Clawith's CSS or its `@tabler/icons-react` or its handwritten modal components. Components match whatever's already in `apps/isola/src/components/ui/`.
+- **Voice:** HR metaphor everywhere — *hire, team, probation, draft, on-shift, review*. Clawith's tabs get renamed: "Aware" → **Triggers**, "Mind" → **Soul & Memory**, "Relationships" → **Team Relationships**, "Activity Log" → **Timeline**, "Approvals" → **Approvals** (already neutral).
+- **Layout:** apps/isola's existing agent page shell (breadcrumb, title, tab bar, sidebar). New tabs slot into the existing structure, not a Clawith-style layout imported wholesale.
+- **Color / typography:** Inter font (already used by both) stays. Color palette is apps/isola's — not Clawith's dark navy. Dark mode optional; light default for SMB owners.
+- **Endpoints:** Clawith's backend routes on `runtime.epic.dm` stay the same shape — the UI just calls them. No wrapper layer translating "Clawith schema" → "Isola schema"; apps/isola speaks the runtime's API directly.
+
+What this means for the E.2–E.4 ports: each tab is a **rewrite**, sized at roughly 100–400 lines of Next.js + shadcn components, not a component copy. The Clawith source file is the **specification** (what data, what interactions, what state), not the implementation template.
+
+---
 
 ### Where the EPIC team's admin needs go
 
