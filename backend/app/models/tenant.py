@@ -61,3 +61,8 @@ class Tenant(Base):
     # See docs/PHASE-E-PRODUCT-SYNTHESIS.md Section 5.
     runtime_mode: Mapped[str] = mapped_column(String(20), default="hosted", nullable=False)
 
+    # Phase F.1.a — Odoo shared-tenant link. Each Isola tenant has one Odoo
+    # company; runtime calls Odoo XML-RPC with the encrypted api_key.
+    odoo_company_id: Mapped[int | None] = mapped_column(Integer)
+    odoo_api_key: Mapped[str | None] = mapped_column(String(500))
+
