@@ -663,6 +663,15 @@ export default function Layout() {
 
                 <div className="sidebar-bottom">
                     <div className="sidebar-section" style={{ borderBottom: '1px solid var(--border-subtle)', paddingBottom: '8px', marginBottom: 0 }}>
+                        {/* Phase E.2.5 — link back to apps/isola main dashboard */}
+                        <a
+                            href="https://isola.epic.dm/dashboard"
+                            className="sidebar-item"
+                            title="Back to Isola"
+                        >
+                            <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.globe}</span>
+                            <span className="sidebar-item-text">Back to Isola</span>
+                        </a>
                         {user && (
                             <NavLink to="/agents/new" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`} title={t('nav.newAgent')}>
                                 <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.plus}</span>
