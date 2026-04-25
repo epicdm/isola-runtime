@@ -11,6 +11,7 @@ stripped) for delivery to the customer.
 Supported markers:
   [escalate: <reason>]                              fire escalation ping (F.1.c-2)
   [location: lat=N,lon=N[,name="..."][,address="..."]]  send WA location message (F.1.c-3)
+  [ask_owner: <question>]                           live owner-ask loop (F.1.5a / #109)
 
 Planned:
   [attach:<path>]               send workspace file as WA media (F.1.c-3b)
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Single regex that matches any marker. We then dispatch by kind based on
 # which alternative matched (captured in the `kind` named group).
 _MARKER_RE = re.compile(
-    r"\[(?P<kind>escalate|location)\s*:\s*(?P<body>[^\]\n]+?)\s*\]",
+    r"\[(?P<kind>escalate|location|ask_owner)\s*:\s*(?P<body>[^\]\n]+?)\s*\]",
     re.IGNORECASE,
 )
 
@@ -83,6 +84,8 @@ async def parse_and_dispatch(reply_text: str, ctx: ReplyContext) -> str:
                 await _dispatch_escalate(body, ctx)
             elif kind == "location":
                 await _dispatch_location(body, ctx)
+            elif kind == "ask_owner":
+                await _dispatch_ask_owner(body, ctx)
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"[reply_markers] dispatch failed for marker "
@@ -168,3 +171,69 @@ async def _dispatch_location(body: str, ctx: ReplyContext) -> None:
         f"[reply_markers] location sent for agent={ctx.agent_id} "
         f"lat={lat} lon={lon} name={kv.get('name', '')!r}"
     )
+
+
+async def _dispatch_ask_owner(question: str, ctx: ReplyContext) -> None:
+    """Live owner-ask loop trigger (Tier 1.5a / #109).
+
+    1. Insert OwnerAskInFlight row (so the WA inbound webhook can pair
+       the owner's reply back to this customer's conversation).
+    2. WA-ping the owner with the customer's question.
+
+    The customer-facing wait message is whatever the LLM wrote around
+    the marker (typically "Give me a moment, checking with Eric.").
+    Marker is stripped before send. If owner_phone is missing, we silently
+    drop — knowledge_gap_capture catches the same question as a fallback.
+    """
+    q = question.strip()
+    if not q:
+        logger.warning(
+            f"[reply_markers] ask_owner empty question for agent={ctx.agent_id}"
+        )
+        return
+    if not ctx.owner_phone:
+        logger.info(
+            f"[reply_markers] ask_owner skipped (no owner_phone) for "
+            f"agent={ctx.agent_id}; gap-capture will catch it"
+        )
+        return
+
+    from app.database import async_session
+    from app.services import owner_ask
+    from app.services.whatsapp_service import whatsapp_service
+
+    async with async_session() as db:
+        await owner_ask.create_ask(
+            db,
+            agent_id=ctx.agent_id,
+            customer_phone=ctx.customer_phone,
+            customer_name=ctx.customer_name,
+            customer_conversation_id=ctx.conversation_id,
+            question=q,
+            owner_phone=ctx.owner_phone,
+        )
+        await db.commit()
+
+    cust = ctx.customer_name or ctx.customer_phone
+    snippet = q[:300]
+    body = (
+        f"❓ {ctx.agent_name or 'Agent'} needs your help.\n"
+        f"{cust} just asked: \"{snippet}\"\n"
+        f"Reply with the answer (I'll teach Rex and pass it on), "
+        f"or type 'skip' to handle later."
+    )
+    try:
+        await whatsapp_service.send_text_message(
+            phone_number_id=ctx.phone_number_id,
+            access_token=ctx.access_token,
+            to=ctx.owner_phone,
+            text=body,
+        )
+        logger.info(
+            f"[reply_markers] ask_owner sent for agent={ctx.agent_id} "
+            f"q={q[:60]!r}"
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[reply_markers] ask_owner ping failed for agent={ctx.agent_id}: {e}"
+        )

@@ -387,6 +387,25 @@ async def _process_whatsapp_message(
             logger.error(f"[WhatsApp] agent={agent_id} not found during processing")
             return
 
+        # ── Tier 1.5a: live owner-ask reply path ──
+        # If this inbound is from the agent's owner_phone AND there's a
+        # pending OwnerAskInFlight row for this agent, treat the message
+        # as the owner's answer to that question. Pair it back to the
+        # waiting customer's conversation, write knowledge.md, ack owner.
+        # Falls through to the normal customer flow when no ask is pending
+        # (so an owner texting their own agent without a pending ask still
+        # gets a reply as if they were any other customer).
+        handled = await _try_handle_owner_reply(
+            db,
+            agent=agent,
+            owner_text=user_text,
+            phone_number_id=phone_number_id,
+            access_token=access_token,
+            from_wa_id=from_wa_id,
+        )
+        if handled:
+            return
+
         ext_conv = f"wa:{from_wa_id}"
         sess_r = await db.execute(
             select(ChatSession).where(
@@ -682,3 +701,122 @@ def _extract_interactive_user_text(msg: dict) -> str:
             return ""
         return f"{base} [list:{lid}]" if lid else base
     return ""
+
+
+# ─── Tier 1.5a: live owner-ask reply path ────────────────
+
+
+def _phones_match(a: str | None, b: str | None) -> bool:
+    """Compare WA-ids as digit strings, tolerating a leading '+' on either."""
+    if not a or not b:
+        return False
+    norm_a = "".join(c for c in a if c.isdigit())
+    norm_b = "".join(c for c in b if c.isdigit())
+    return bool(norm_a) and norm_a == norm_b
+
+
+async def _try_handle_owner_reply(
+    db,
+    *,
+    agent,
+    owner_text: str,
+    phone_number_id: str,
+    access_token: str,
+    from_wa_id: str,
+) -> bool:
+    """If `from_wa_id` is the agent's owner AND a question is pending,
+    treat `owner_text` as the answer. Returns True if handled (caller
+    should `return` from the webhook), False to fall through to the
+    normal customer flow.
+    """
+    if not _phones_match(agent.owner_phone, from_wa_id):
+        return False
+
+    from app.services import owner_ask
+    from app.services.knowledge_teach import record_teach
+    from app.services.whatsapp_service import whatsapp_service
+
+    ask = await owner_ask.find_oldest_pending_for_agent(db, agent.id)
+    if not ask:
+        await db.commit()  # commit any expirations
+        return False
+
+    text = (owner_text or "").strip()
+
+    if owner_ask._is_skip(text):
+        await owner_ask.mark_skipped(db, ask)
+        await db.commit()
+        try:
+            await whatsapp_service.send_text_message(
+                phone_number_id=phone_number_id,
+                access_token=access_token,
+                to=from_wa_id,
+                text=(
+                    f"👍 Skipped — I won't bother the customer about "
+                    f'"{ask.question[:80]}". You can teach me anytime '
+                    f"in the dashboard."
+                ),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[WhatsApp] owner-skip ack failed: {e}")
+        return True
+
+    if not text:
+        return False
+
+    # Write to knowledge.md + mark matching gap rows taught. Teacher
+    # name is hardcoded "owner" — the WA owner-reply path doesn't have
+    # the User row eagerly loaded and the dashboard /teach UI sets a
+    # real name when it can.
+    try:
+        result = record_teach(
+            agent_id=agent.id,
+            question=ask.question,
+            answer=text,
+            teacher_name="owner",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"[WhatsApp] record_teach failed for agent={agent.id}: {e}")
+        # Don't lose the answer — leave the row pending so a retry from
+        # the owner can succeed.
+        await db.rollback()
+        return False
+
+    await owner_ask.mark_answered(db, ask, text)
+    await db.commit()
+
+    # Reply to the customer with the owner's raw answer (v1 — no LLM
+    # rewrite). Style adaptation is enhancement #2 / Tier 1.5 P1.
+    customer_msg = text
+    try:
+        await whatsapp_service.send_text_message(
+            phone_number_id=phone_number_id,
+            access_token=access_token,
+            to=ask.customer_phone,
+            text=customer_msg,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            f"[WhatsApp] failed to relay owner answer to customer="
+            f"{ask.customer_phone}: {e}"
+        )
+
+    # Confirm to the owner.
+    try:
+        await whatsapp_service.send_text_message(
+            phone_number_id=phone_number_id,
+            access_token=access_token,
+            to=from_wa_id,
+            text=(
+                f"✓ Taught Rex \"{result.topic}\" and replied to "
+                f"{ask.customer_name or ask.customer_phone}."
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[WhatsApp] owner-ack failed: {e}")
+
+    logger.info(
+        f"[WhatsApp] owner-ask resolved agent={agent.id} topic={result.topic!r} "
+        f"customer={ask.customer_phone}"
+    )
+    return True

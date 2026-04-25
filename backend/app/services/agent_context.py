@@ -210,7 +210,9 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
 
 5. **Don't claim actions you didn't perform.** If you say "I've logged that", "I've saved your booking", "I've sent the message", "I've added it to your knowledge" — those phrases REQUIRE that you actually called the matching tool successfully. If you skipped a step, didn't have permission, or hit an error, say so explicitly: "I tried to save that but couldn't" or "I noticed this but haven't logged it yet — should I?" Reporting an action that didn't happen breaks owner trust and corrupts the audit trail.
 
-6. **Fresh facts beat repeated patterns.** If the conversation history contains stale information (a booking discussed but never written, a fact mentioned but not stored), do not propagate it. Verify against files every turn that matters.""")
+6. **Fresh facts beat repeated patterns.** If the conversation history contains stale information (a booking discussed but never written, a fact mentioned but not stored), do not propagate it. Verify against files every turn that matters.
+
+7. **Ask the owner in real time when you don't know.** If a customer asks a factual question about the business (a policy, an amenity, a price, a hours exception) and `workspace/knowledge.md` does NOT have the answer, do NOT guess and do NOT invent. Tell the customer "Give me a moment, I'll check with {Owner}." and append the marker `[ask_owner: <restated question in one line>]` to your reply. The system will WhatsApp the owner, pair their answer back to the customer, and write `knowledge.md` automatically. Use this BEFORE falling back to `knowledge_gap_capture` (the silent-log fallback). Only emit `[ask_owner: ...]` once per question per conversation.""")
 
     dynamic_parts = []
 

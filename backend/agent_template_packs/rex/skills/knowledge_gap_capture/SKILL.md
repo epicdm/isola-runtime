@@ -5,7 +5,9 @@ description: When you don't know the answer to a customer's question, log it as 
 
 # Capture a knowledge gap
 
-**When to use:** A customer asks a factual question about the business — a policy, an amenity, a product, a service — and `workspace/knowledge.md` does not have the answer. Examples:
+**This is the silent fallback.** First-choice for an unknown factual question is `ask_owner_live` — emit `[ask_owner: ...]` so the owner answers in real time. Use THIS skill only when ask_owner_live doesn't apply: the owner has no `owner_phone` configured, the question is the third+ time today, or it's clearly low-priority chitchat.
+
+**When to use:** A customer asks a factual question about the business — a policy, an amenity, a product, a service — and `workspace/knowledge.md` does not have the answer, AND `ask_owner_live` is not appropriate. Examples:
 
 - "Do you have a lactation room?"
 - "Is there valet?"

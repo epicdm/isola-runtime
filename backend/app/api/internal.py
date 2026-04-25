@@ -843,10 +843,13 @@ async def teach_agent(
 ):
     """Append a Q&A entry to workspace/knowledge.md and mark matching
     knowledge-gaps rows as taught. Idempotent: re-teaching the same
-    topic replaces the existing section in place."""
-    import re
-    from datetime import datetime, timezone as _tz
+    topic replaces the existing section in place.
+
+    Implementation lives in services.knowledge_teach so the WA
+    owner-reply path (Tier 1.5a) can call the same code without an
+    HTTP round-trip."""
     from app.models.agent import Agent
+    from app.services.knowledge_teach import record_teach
 
     a = (
         await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -854,57 +857,17 @@ async def teach_agent(
     if not a:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    ws = _agent_workspace_path(agent_id)
-    ws.mkdir(parents=True, exist_ok=True)
-
-    topic = (data.topic or data.question[:60]).strip()
-    topic = topic.rstrip("?.!").strip()
-    if topic:
-        topic = topic[0].upper() + topic[1:]
-
-    today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
-    teacher_line = f"*Source: {data.teacher_name or 'owner'} - taught {today}*"
-
-    knowledge_path = ws / "knowledge.md"
-    existing = _read_workspace_text(knowledge_path)
-    if not existing:
-        existing = (
-            "# Knowledge\n\n"
-            "_Q&A taught by the owner. Rex consults this when answering FAQs._\n"
-        )
-
-    section_pattern = re.compile(
-        rf"^## {re.escape(topic)}\s*$.*?(?=^## |\Z)",
-        re.MULTILINE | re.DOTALL,
+    result = record_teach(
+        agent_id=agent_id,
+        question=data.question,
+        answer=data.answer,
+        topic=data.topic,
+        teacher_name=data.teacher_name,
     )
-    new_section = f"## {topic}\n{data.answer.strip()}\n{teacher_line}\n\n"
-
-    if section_pattern.search(existing):
-        new_content = section_pattern.sub(new_section, existing)
-    else:
-        new_content = existing.rstrip() + "\n\n" + new_section
-    knowledge_path.write_text(new_content, encoding="utf-8")
-
-    gaps_path = ws / "knowledge-gaps.md"
-    gaps_marked = 0
-    taught_marker_re = re.compile(r"(?:·|-)\s*taught\s+\d{4}-\d{2}-\d{2}")
-    if gaps_path.exists():
-        norm_q = re.sub(r"[?!.,\s]+$", "", data.question.lower().strip())
-        new_lines = []
-        for line in gaps_path.read_text(encoding="utf-8").splitlines():
-            m = re.search(r'asked:\s*"([^"]+)"', line)
-            if m and not taught_marker_re.search(line):
-                line_q = re.sub(r"[?!.,\s]+$", "", m.group(1).lower().strip())
-                if line_q == norm_q:
-                    line = f"{line.rstrip()} - taught {today}"
-                    gaps_marked += 1
-            new_lines.append(line)
-        gaps_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-
     return TeachResponse(
-        topic=topic,
-        knowledge_md_path=str(knowledge_path.relative_to(ws.parent)),
-        gaps_marked_taught=gaps_marked,
+        topic=result.topic,
+        knowledge_md_path=result.knowledge_md_path,
+        gaps_marked_taught=result.gaps_marked_taught,
     )
 
 
