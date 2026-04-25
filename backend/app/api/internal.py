@@ -36,6 +36,15 @@ router = APIRouter(
 
 
 class InternalTenantEnsureRequest(BaseModel):
+    timezone: str | None = Field(
+        default=None,
+        max_length=50,
+        description=(
+            "IANA timezone (e.g. 'America/Dominica'). Set on creation; "
+            "ignored on subsequent ensure calls so tenants can update via "
+            "the dedicated PUT /tenants/{id} path. Defaults to 'UTC'."
+        ),
+    )
     external_id: str = Field(
         ...,
         description=(
@@ -101,7 +110,12 @@ async def ensure_tenant(
     created = False
 
     if tenant is None:
-        tenant = Tenant(name=data.name, slug=slug, im_provider="web_only")
+        tenant = Tenant(
+            name=data.name,
+            slug=slug,
+            im_provider="web_only",
+            timezone=(data.timezone or "UTC")[:50],
+        )
         db.add(tenant)
         try:
             await db.flush()
