@@ -358,6 +358,10 @@ class InternalAgentEnsureRequest(BaseModel):
     tone: int | None = Field(default=None, ge=0, le=2)
     welcome_message: str | None = None
     escalation_keywords: list[str] | None = None
+    # Owner's WhatsApp number (E.164 digits, with or without leading '+').
+    # Required for the Tier 1.5a live owner-ask loop (#109) — when missing,
+    # Rex falls back to silent knowledge_gap_capture instead of pinging.
+    owner_phone: str | None = Field(default=None, max_length=32)
 
 
 class InternalAgentEnsureResponse(BaseModel):
@@ -495,6 +499,8 @@ async def ensure_agent(
             existing.welcome_message = data.welcome_message
         if data.escalation_keywords is not None:
             existing.escalation_keywords = data.escalation_keywords
+        if data.owner_phone is not None:
+            existing.owner_phone = data.owner_phone.strip() or None
 
         # Backfill template + autonomy + role_description from template defaults
         # for agents that were created before F.1.a-3. Without this, the
@@ -626,6 +632,7 @@ async def ensure_agent(
         tone=data.tone if data.tone is not None else 1,
         welcome_message=data.welcome_message,
         escalation_keywords=data.escalation_keywords or [],
+        owner_phone=(data.owner_phone or "").strip() or None,
     )
     db.add(agent)
     await db.flush()
