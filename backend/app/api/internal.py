@@ -181,6 +181,17 @@ class InternalUserEnsureResponse(BaseModel):
     access_token: str
     expires_in_minutes: int
     created: bool = False
+    role: str = "org_admin"  # platform_admin | org_admin | agent_admin | member
+
+
+class InternalUserOut(BaseModel):
+    """Lightweight read-only view used by apps/isola dashboard layout to
+    surface the runtime role (e.g. show 'Platform Admin' menu item)."""
+    user_id: uuid.UUID
+    tenant_id: uuid.UUID | None
+    role: str
+    display_name: str
+    email: str
 
 
 @router.post(
@@ -263,6 +274,41 @@ async def ensure_user_and_mint(
         access_token=token,
         expires_in_minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES,
         created=created,
+        role=user.role,
+    )
+
+
+@router.get(
+    "/users/by-email/{email}",
+    response_model=InternalUserOut,
+)
+async def internal_get_user_by_email(
+    email: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Lookup runtime user by email — used by apps/isola dashboard layout
+    to read the user's runtime role for the admin-menu gate (#98).
+    Email is the stable join key since apps/isola users.id maps to runtime
+    Identity.email (set during ensure-and-mint)."""
+    from app.models.user import Identity, User
+
+    email_norm = email.lower().strip()
+    i_r = await db.execute(select(Identity).where(Identity.email == email_norm))
+    identity = i_r.scalar_one_or_none()
+    if not identity:
+        raise HTTPException(status_code=404, detail="User not found")
+    u_r = await db.execute(
+        select(User).where(User.identity_id == identity.id).limit(1)
+    )
+    user = u_r.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return InternalUserOut(
+        user_id=user.id,
+        tenant_id=user.tenant_id,
+        role=user.role,
+        display_name=user.display_name or "",
+        email=email_norm,
     )
 
 
