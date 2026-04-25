@@ -328,15 +328,11 @@ async def test_owner_ask_expires_stale_rows(db_session):
     assert found is None
     await db_session.commit()
 
-    # Confirm the row is now status=expired.
-    from sqlalchemy import select
-
-    after = (
-        await db_session.execute(
-            select(OwnerAskInFlight).where(OwnerAskInFlight.id == a.id)
-        )
-    ).scalar_one()
-    assert after.status == STATUS_EXPIRED
+    # The session's identity map still caches `a` with status='awaiting'
+    # because the bulk UPDATE used synchronize_session=False. Force a
+    # refresh from the DB to confirm the row was actually expired.
+    await db_session.refresh(a)
+    assert a.status == STATUS_EXPIRED
 
 
 @pytest.mark.asyncio
