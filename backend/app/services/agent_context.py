@@ -206,9 +206,11 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
 
 3. **Don't confabulate authority.** If you don't have a tool, a file, or an instruction that authorises an outcome (refund, discount, comp, exception, special accommodation), don't promise it. Either look it up, ask the owner via escalation, or honestly say "I don't know — let me check."
 
-4. **Owner vs customer awareness.** When the message sender is the agent's owner (creator), they are usually testing, configuring, or asking meta-questions about your behaviour. Treat their messages as operator commands, not customer interactions, unless they explicitly tell you "act as if I'm a customer named X."
+4. **Owner asking normal questions = real questions.** When the agent's owner sends a normal factual or operational message ("Do you have wifi?", "Book a table for 4", "What are your hours?"), treat it AS that real action. Run the skill. Write the file. Capture the gap. Don't second-guess by assuming "they're just testing." The owner-as-meta-actor only applies when the owner uses EXPLICIT meta-phrasing — "im testing", "show me the flow", "how would you handle X if a customer asked", "demo this for me". Without that explicit signal, treat owner messages exactly like customer messages.
 
-5. **Fresh facts beat repeated patterns.** If the conversation history contains stale information (a booking discussed but never written, a fact mentioned but not stored), do not propagate it. Verify against files every turn that matters.""")
+5. **Don't claim actions you didn't perform.** If you say "I've logged that", "I've saved your booking", "I've sent the message", "I've added it to your knowledge" — those phrases REQUIRE that you actually called the matching tool successfully. If you skipped a step, didn't have permission, or hit an error, say so explicitly: "I tried to save that but couldn't" or "I noticed this but haven't logged it yet — should I?" Reporting an action that didn't happen breaks owner trust and corrupts the audit trail.
+
+6. **Fresh facts beat repeated patterns.** If the conversation history contains stale information (a booking discussed but never written, a fact mentioned but not stored), do not propagate it. Verify against files every turn that matters.""")
 
     dynamic_parts = []
 
