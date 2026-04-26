@@ -20,10 +20,33 @@ from loguru import logger
 
 import os
 META_GRAPH_API_BASE = os.environ.get("WHATSAPP_GRAPH_BASE_URL") or "https://graph.facebook.com/v21.0"
+WHATSAPP_TEXT_LIMIT = 4096  # Meta hard limit; chunked in send_text_message (ADR-0073)
 
 
 class WhatsAppService:
     """Client for Meta's WhatsApp Business Cloud API."""
+
+    @staticmethod
+    def _split_text(text: str, limit: int = WHATSAPP_TEXT_LIMIT) -> list[str]:
+        """Chunk text under Meta's 4096-char per-message limit (ADR-0073).
+
+        Borrowed from upstream Clawith. Prefers paragraph breaks, then line
+        breaks, then word boundaries. Falls back to hard cut at limit if no
+        clean break available.
+        """
+        remaining = text or ""
+        chunks: list[str] = []
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
+            segment = remaining[:limit]
+            cut = max(segment.rfind("\n\n"), segment.rfind("\n"), segment.rfind(" "))
+            if cut <= 0:
+                cut = limit
+            chunks.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip()
+        return chunks or [""]
 
     @staticmethod
     def verify_webhook_signature(body_bytes: bytes, signature_header: str, app_secret: str) -> bool:
@@ -65,26 +88,26 @@ class WhatsAppService:
         on transport failure; the caller should log and continue.
         """
         url = f"{META_GRAPH_API_BASE}/{phone_number_id}/messages"
-        payload = {
-            "messaging_product": "whatsapp",
-            "recipient_type": "individual",
-            "to": to,
-            "type": "text",
-            "text": {"preview_url": preview_url, "body": text},
-        }
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        chunks = self._split_text(text)
+        if len(chunks) > 1:
+            logger.info(f"[WhatsApp] Splitting outbound into {len(chunks)} chunks")
+        last_response: dict = {}
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code >= 400:
-                logger.error(
-                    f"[WhatsApp] send_text_message failed "
-                    f"status={resp.status_code} body={resp.text[:500]}"
-                )
-            resp.raise_for_status()
-            return resp.json()
+            for chunk in chunks:
+                payload = {
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
+                    "to": to,
+                    "type": "text",
+                    "text": {"preview_url": preview_url, "body": chunk},
+                }
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code >= 400:
+                    logger.error(f"[WhatsApp] send_text_message failed status={resp.status_code}")
+                resp.raise_for_status()
+                last_response = resp.json()
+        return last_response
 
     async def send_typing_indicator(
         self,
