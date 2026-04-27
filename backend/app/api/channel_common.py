@@ -55,6 +55,8 @@ async def _call_agent_llm(
     on_chunk=None,
     on_thinking=None,
     on_tool_call=None,
+    *,
+    role_description_override: str | None = None,  # Day 4b -- ADR-0070 #2
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -107,13 +109,21 @@ async def _call_agent_llm(
     effective_user_id = user_id or agent_id
     _timeout = _get_llm_timeout(model)
 
+    # Day 4b -- ADR-0070 #2: SOUL.md from Paperclip overrides role_description
+    # when present. Falls back to existing local field for non-dispatch callers.
+    effective_role = (
+        role_description_override
+        if role_description_override is not None
+        else (agent.role_description or "")
+    )
+
     try:
         reply = await asyncio.wait_for(
             call_llm(
                 model,
                 messages,
                 agent.name,
-                agent.role_description or "",
+                effective_role,
                 agent_id=agent_id,
                 user_id=effective_user_id,
                 session_id=session_id,
@@ -142,7 +152,7 @@ async def _call_agent_llm(
                         fallback_model,
                         messages,
                         agent.name,
-                        agent.role_description or "",
+                        effective_role,
                         agent_id=agent_id,
                         user_id=effective_user_id,
                         session_id=session_id,
@@ -187,7 +197,7 @@ async def _call_agent_llm(
                         fallback_model,
                         messages,
                         agent.name,
-                        agent.role_description or "",
+                        effective_role,
                         agent_id=agent_id,
                         user_id=effective_user_id,
                         session_id=session_id,

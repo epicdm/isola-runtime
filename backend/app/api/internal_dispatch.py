@@ -1,0 +1,190 @@
+"""POST /api/internal/dispatch -- BFF->Clawith dispatch endpoint.
+
+ADR-0070 actions #2, #3, #5 / Day 4b.
+
+This endpoint is the BFF-facing dispatch entry point. BFF posts here
+after Meta webhook validation; Clawith fetches SOUL.md + desiredSkills
+from Paperclip per request, runs the agent's LLM, returns the draft.
+
+Architecturally separate from app/api/internal.py because that router
+has a router-level Depends(require_internal_secret) that applies to all
+its routes. Day-4b's design decision #1 calls for a DISTINCT trust
+boundary -- BFF uses Authorization: Bearer with its own shared secret
+(BFF_CLAWITH_SHARED_SECRET), not the apps/isola X-Internal-Secret.
+
+Failure mode (Eric's Day-4b decision #4): FAIL-CLOSED on Paperclip
+unreachability. Returns HTTP 503; BFF dead-letters the inbound message
+upstream. The /channel/whatsapp/{id}/webhook route is unaffected (and
+remains fire-and-forget on Paperclip per paperclip_mirror.py).
+
+Skills are surfaced in the response as informational metadata only --
+not yet consumed by the LLM. Step 4 wires per-skill tool definitions +
+the read_skill_md body-loader as one coherent change.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+import uuid
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from loguru import logger
+from pydantic import BaseModel, Field
+from sqlalchemy import update as _sql_update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.channel_common import _call_agent_llm
+from app.database import get_db
+from app.models.agent import Agent as _Agent
+from app.services import paperclip_client
+from app.services.paperclip_client import PaperclipUnreachable
+
+
+# Separate router from app/api/internal.py -- no router-level deps.
+# Endpoints land at /api/internal/dispatch via main.py's API_PREFIX merge.
+router = APIRouter(prefix="/internal", tags=["internal-dispatch"])
+
+
+class InternalDispatchRequest(BaseModel):
+    agent_id: uuid.UUID
+    paperclip_agent_id: str
+    paperclip_company_id: str
+    user_text: str
+    user_id: str | None = None
+    session_id: str = ""
+    history: list[dict] = Field(default_factory=list)
+
+
+class InternalDispatchResponse(BaseModel):
+    draft: str
+    soul_codepoints: int = 0
+    skills_count: int = 0
+    # Informational only in Day-4b Step 3 -- not yet consumed by the LLM.
+    # Step 4 wires per-skill tool definitions + the read_skill_md body-loader.
+    skills: list[dict] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+async def _verify_bff_shared_secret(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> None:
+    """FastAPI dep: 401 unless Authorization: Bearer <BFF_CLAWITH_SHARED_SECRET>."""
+    expected = os.environ.get("BFF_CLAWITH_SHARED_SECRET", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="dispatch_misconfigured: BFF_CLAWITH_SHARED_SECRET unset",
+        )
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing_bearer_token",
+        )
+    presented = authorization[7:]
+    if not secrets.compare_digest(presented, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="bad_bearer_token",
+        )
+
+
+@router.post("/dispatch", response_model=InternalDispatchResponse)
+async def internal_dispatch(
+    body: InternalDispatchRequest,
+    _auth: None = Depends(_verify_bff_shared_secret),
+    db: AsyncSession = Depends(get_db),
+) -> InternalDispatchResponse:
+    """BFF->Clawith dispatch entry point.
+
+    Per ADR-0070 action #3 (temporary integration mode). Pulls SOUL +
+    desiredSkills from Paperclip, invokes _call_agent_llm with SOUL as
+    role_description override. Day 4b Step 3 does NOT persist soul to
+    the local agents.soul column -- pull-on-every-invocation = always
+    fresh; the schema column (committed in migration f16) is reserved
+    for future fallback-cache use.
+    """
+    # 1. SOUL fetch (fail-closed)
+    try:
+        soul = await paperclip_client.fetch_paperclip_soul(body.paperclip_agent_id)
+    except PaperclipUnreachable as e:
+        logger.error(f"[dispatch] paperclip_unreachable on SOUL fetch: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"paperclip_unreachable: {e}",
+        )
+
+    # 2. Skills fetch (fail-closed)
+    try:
+        skill_refs = await paperclip_client.fetch_paperclip_desired_skills(
+            body.paperclip_agent_id, body.paperclip_company_id,
+        )
+    except PaperclipUnreachable as e:
+        logger.error(f"[dispatch] paperclip_unreachable on skills fetch: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"paperclip_unreachable: {e}",
+        )
+
+    soul_str = soul or ""
+    logger.info(
+        f"[dispatch] resolved SOUL={len(soul_str)} codepoints, "
+        f"skills={len(skill_refs)} agent={body.agent_id}"
+    )
+
+    # Day 4b Step 4: write paperclip bridge IDs to local Agent record.
+    # Idempotent (overwrites with same values on repeat dispatches);
+    # required so the read_skill_md tool handler can resolve Paperclip
+    # context. IDs are post-provisioning-immutable -- no stale-cache risk.
+    await db.execute(
+        _sql_update(_Agent)
+        .where(_Agent.id == body.agent_id)
+        .values(
+            paperclip_agent_id=body.paperclip_agent_id,
+            paperclip_company_id=body.paperclip_company_id,
+        )
+    )
+    await db.commit()
+
+    # 3. Build effective role: SOUL.md + Available-skills section so the
+    #    LLM knows what skills exist + that read_skill_md is the loader.
+    #    (Day 4b Step 4 wiring -- corresponds to read_skill_md in AGENT_TOOLS.)
+    if skill_refs:
+        skill_lines = "\n".join(
+            "- " + s["slug"] + ": " + s["description"] for s in skill_refs
+        )
+        skill_section = (
+            "\n\n## Available skills\n\n"
+            f"{skill_lines}\n\n"
+            "When a customer\'s request matches one of these skills, call "
+            "`read_skill_md(skill_name=\"<slug>\")` to get the full "
+            "instructions, then follow them carefully."
+        )
+        effective_role = (soul_str or "") + skill_section
+    else:
+        effective_role = soul_str or ""
+
+    # 4. Run inference. role_description_override carries SOUL + skill list.
+    try:
+        draft = await _call_agent_llm(
+            db=db,
+            agent_id=body.agent_id,
+            user_text=body.user_text,
+            history=body.history,
+            user_id=body.user_id,
+            session_id=body.session_id,
+            role_description_override=effective_role if effective_role else None,
+        )
+    except Exception as e:
+        logger.error(f"[dispatch] LLM call failed: {type(e).__name__}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"llm_error: {type(e).__name__}: {str(e)[:200]}",
+        )
+
+    return InternalDispatchResponse(
+        draft=draft,
+        soul_codepoints=len(soul_str),
+        skills_count=len(skill_refs),
+        skills=skill_refs,
+    )

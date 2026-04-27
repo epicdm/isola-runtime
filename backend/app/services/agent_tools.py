@@ -926,6 +926,30 @@ AGENT_TOOLS = [
         }
     },
     # ── AgentBay Tools ────────────────────────────────────────────
+    # ── Day 4b: read_skill_md (Paperclip pull-on-invocation) ──────
+    {
+        "type": "function",
+        "function": {
+            "name": "read_skill_md",
+            "description": (
+                "Read the full SKILL.md instructions for one of your attached skills. "
+                "The available skills (with brief descriptions) are listed in your role context. "
+                "When a customer\'s request matches one, call this tool with skill_name set to "
+                "the skill\'s slug to get the detailed instructions, then follow them. "
+                "Returns the SKILL.md markdown content as a string."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "The skill slug in hyphenated form (e.g. answer-hours, book-reservation, escalate-to-owner)",
+                    },
+                },
+                "required": ["skill_name"],
+            },
+        },
+    },
 ]
 
 
@@ -938,6 +962,7 @@ _ALWAYS_INCLUDE_CORE = {
     "send_channel_file",
     "send_file_to_agent",
     "write_file",
+    "read_skill_md",  # Day 4b -- ADR-0070 #3 (always available; routes to Paperclip)
 }
 _always_core_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _ALWAYS_INCLUDE_CORE]
 
@@ -1645,6 +1670,13 @@ async def execute_tool(
             result = await _search_clawhub(agent_id, arguments)
         elif tool_name == "install_skill":
             result = await _install_skill(agent_id, ws, arguments)
+        # ── Day 4b: read_skill_md (Paperclip pull-on-invocation) ──
+        elif tool_name == "read_skill_md":
+            skill_name = arguments.get("skill_name")
+            if not skill_name:
+                result = "❌ Missing required argument 'skill_name' for read_skill_md"
+            else:
+                result = await _read_skill_md(agent_id, skill_name)
         else:
             # Try MCP tool execution
             result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
@@ -8941,3 +8973,53 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
     except Exception as e:
         logger.exception(f"[AgentBay] File transfer failed for agent {agent_id}")
         return f"File transfer failed: {str(e)[:200]}"
+
+# ── Day 4b: read_skill_md helper (Paperclip pull-on-invocation) ──────
+async def _read_skill_md(agent_id: uuid.UUID, skill_name: str) -> str:
+    """Day 4b: fetch SKILL.md body from Paperclip on demand.
+
+    Reads agent.paperclip_agent_id + paperclip_company_id from local DB
+    (populated at dispatch time by internal_dispatch), fetches the skill\'s
+    Paperclip ID via fetch_paperclip_desired_skills, then fetches the body
+    via fetch_paperclip_skill_body. Returns the markdown body as the
+    LLM tool result.
+
+    Per Eric\'s Day-4b note: 3 Paperclip round-trips per invocation. Acceptable
+    for tenant-zero MVP latency; revisit as request-scoped cache opportunity
+    post-launch (per ADR-0070\'s run-scoped LRU mention).
+    """
+    from app.services import paperclip_client
+    from app.services.paperclip_client import PaperclipUnreachable
+
+    async with async_session() as db:
+        ag_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+        agent = ag_r.scalar_one_or_none()
+
+    if not agent:
+        return "❌ Agent not found"
+    if not agent.paperclip_agent_id or not agent.paperclip_company_id:
+        return (
+            "❌ Agent missing Paperclip bridge IDs -- dispatch must populate "
+            "paperclip_agent_id + paperclip_company_id before tools can resolve"
+        )
+
+    try:
+        skill_refs = await paperclip_client.fetch_paperclip_desired_skills(
+            agent.paperclip_agent_id, agent.paperclip_company_id,
+        )
+    except PaperclipUnreachable as e:
+        return f"❌ Paperclip unreachable resolving skill list: {e}"
+
+    skill = next((s for s in skill_refs if s["slug"] == skill_name), None)
+    if skill is None:
+        available = ", ".join(s["slug"] for s in skill_refs) or "(none)"
+        return f"❌ Skill '{skill_name}' not attached. Available: {available}"
+
+    try:
+        body = await paperclip_client.fetch_paperclip_skill_body(
+            agent.paperclip_company_id, skill["id"],
+        )
+    except PaperclipUnreachable as e:
+        return f"❌ Paperclip unreachable fetching skill body: {e}"
+
+    return body

@@ -55,6 +55,12 @@ class Agent(Base):
     paperclip_company_id: Mapped[str | None] = mapped_column(String(64))
     escalation_keywords: Mapped[list] = mapped_column(JSON, default=list)
 
+    # ADR-0070 action #2 / Day 4b — runtime cache of Paperclip's
+    # `agents.runtimeConfig.soul`. Populated by /api/internal/dispatch
+    # at request time; null if the agent has not been dispatched yet
+    # under the BFF->Clawith path.
+    soul: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Runtime
     status: Mapped[str] = mapped_column(
         Enum("creating", "running", "idle", "stopped", "error", name="agent_status_enum", create_constraint=False),
