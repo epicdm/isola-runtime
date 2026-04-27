@@ -1782,6 +1782,9 @@ function AgentDetailInner() {
     };
     interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; thinking?: string; imageUrl?: string; timestamp?: string; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+    // Transient info banner (e.g. fallback model switch notification)
+    const [chatInfoMsg, setChatInfoMsg] = useState<string | null>(null);
+    const chatInfoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Stable expanded-state map for tool groups — keyed by groupStartIndex.
     // Stored in a ref so it survives parent re-renders without causing extra renders.
     const toolGroupExpandedRef = useRef<Map<number, boolean>>(new Map());
@@ -2108,6 +2111,11 @@ function AgentDetailInner() {
             } else if (d.type === 'trigger_notification') {
                 setChatMessages(prev => [...prev, parseChatMsg({ role: 'assistant', content: d.content })]);
                 fetchMySessions(true, agentId);
+            } else if (d.type === 'info') {
+                // Subtle transient banner for system events (e.g. fallback model switch)
+                setChatInfoMsg(d.content || '');
+                if (chatInfoTimerRef.current) clearTimeout(chatInfoTimerRef.current);
+                chatInfoTimerRef.current = setTimeout(() => setChatInfoMsg(null), 6000);
             } else {
                 setChatMessages(prev => [...prev, parseChatMsg({ role: d.role, content: d.content })]);
             }
@@ -4607,9 +4615,17 @@ function AgentDetailInner() {
                                         {showScrollBtn && (
                                             <button onClick={scrollToBottom} style={{ position: 'absolute', bottom: `${chatScrollBtnBottom}px`, right: '20px', width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: 'var(--shadow-sm)', zIndex: 10 }} title="Scroll to bottom">↓</button>
                                         )}
+                                        {/* Transient info banner — e.g. fallback model switch */}
+                                        {chatInfoMsg && (
+                                            <div style={{ padding: '6px 14px', borderTop: '1px solid rgba(99,102,241,0.25)', background: 'rgba(99,102,241,0.07)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--text-secondary)', animation: 'fadeIn 0.2s ease' }}>
+                                                <span style={{ opacity: 0.7 }}>ℹ️</span>
+                                                <span style={{ flex: 1 }}>{chatInfoMsg}</span>
+                                                <button onClick={() => setChatInfoMsg(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '14px', lineHeight: 1, padding: '0 2px' }}>✕</button>
+                                            </div>
+                                        )}
                                         {agentExpired ? (
                                             <div style={{ padding: '7px 16px', borderTop: '1px solid rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.08)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'rgb(180,100,0)' }}>
-                                                <span>u23f8</span>
+                                                <span>⏸</span>
                                                 <span>This Agent has <strong>expired</strong> and is off duty. Contact your admin to extend its service.</span>
                                             </div>
                                         ) : !wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? (
