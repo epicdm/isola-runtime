@@ -1,3 +1,5 @@
+name: isolaruntime
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -62,6 +64,7 @@ services:
       - ./ss-nodes.json:/data/ss-nodes.json:ro
     networks:
       - isolaruntime_dev
+      - isola-net
     depends_on:
       postgres:
         condition: service_healthy
@@ -95,3 +98,5 @@ volumes:
 networks:
   isolaruntime_dev:
     name: isola_runtime_network
+  isola-net:
+    external: true

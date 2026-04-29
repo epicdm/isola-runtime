@@ -1,0 +1,29 @@
+# docker-compose.override.yml
+# CURRENT ROLE: host port binding for backend (8800 -> 8000)
+# + env-var propagation for the BFF→Clawith dispatch path.
+# This file is auto-merged by docker compose.
+#
+# 2026-04-26: Phase B test-harness env vars (WHATSAPP_GRAPH_BASE_URL,
+# PAPERCLIP_*) removed from this file during WA flip. Latent for
+# months, surfaced when the runtime received its first real Meta
+# webhook. Snapshot of removed content:
+#   /opt/isola-runtime/.deploy-history/override-2026-04-26-pre-wa-flip.yml
+# Backlog: consolidate port mapping into main compose, retire this file.
+#
+# 2026-04-27 (Day 4b): added environment: block for the BFF→Clawith
+# dispatch path. Three vars propagate from /opt/isola-runtime/.env into
+# the backend container so paperclip_client.py and the new
+# /api/internal/dispatch endpoint can authenticate to Paperclip and
+# accept BFF requests.
+# 2026-04-29 (Day 5 Step 18): backend now attached to isola-net
+# (external) alongside isolaruntime_dev. PAPERCLIP_API_URL switched
+# from http://172.17.0.1:3200 (docker0 host bridge) to http://paperclip:3100
+# (container DNS via isola-net alias).
+services:
+  backend:
+    ports:
+      - "8800:8000"
+    environment:
+      BFF_CLAWITH_SHARED_SECRET: ${BFF_CLAWITH_SHARED_SECRET:-}
+      PAPERCLIP_API_URL: ${PAPERCLIP_API_URL:-}
+      PAPERCLIP_API_TOKEN: ${PAPERCLIP_API_TOKEN:-}
