@@ -239,12 +239,14 @@ async def whatsapp_webhook_event(
 
     app_secret = (config.extra_config or {}).get("app_secret", "")
     signature_header = request.headers.get("x-hub-signature-256", "")
-    if app_secret:
-        if not whatsapp_service.verify_webhook_signature(
-            body_bytes, signature_header, app_secret
-        ):
-            logger.warning(f"[WhatsApp] Webhook signature mismatch for agent {agent_id}")
-            return Response(status_code=401)
+    if not app_secret:
+        logger.error(f"[WhatsApp] Webhook for agent {agent_id} has no app_secret configured — rejecting")
+        return Response(status_code=401)
+    if not whatsapp_service.verify_webhook_signature(
+        body_bytes, signature_header, app_secret
+    ):
+        logger.warning(f"[WhatsApp] Webhook signature mismatch for agent {agent_id}")
+        return Response(status_code=401)
 
     try:
         body = json.loads(body_bytes)
