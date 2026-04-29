@@ -32,3 +32,9 @@ _agents/
 # Internal docs
 docs/
 .agents/rules/deploy.md
+
+# Day-5/6 deployment-time artifacts
+.day5-backup/
+.deploy-history/
+.env.*-backup
+docker-compose.override.yml.*-backup
