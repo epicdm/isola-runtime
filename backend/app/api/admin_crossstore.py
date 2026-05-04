@@ -103,11 +103,40 @@ def _agent_view(a: Agent) -> dict[str, Any]:
         "name": a.name,
         "agent_type": a.agent_type,
         "role_description": a.role_description,
+        "welcome_message": a.welcome_message,
+        "tone": a.tone,
+        "status": a.status.value if hasattr(a.status, "value") else str(a.status),
         "owner_phone": a.owner_phone,
         "paperclip_agent_id": a.paperclip_agent_id,
         "paperclip_company_id": a.paperclip_company_id,
         "container_port": a.container_port,
+        "retired_at": a.retired_at.isoformat() if a.retired_at else None,
+        "retired_by": str(a.retired_by) if a.retired_by else None,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "updated_at": a.updated_at.isoformat() if a.updated_at else None,
     }
+
+
+async def _resolve_clawith_tenant_id(tenant_id: str) -> tuple[dict, UUID]:
+    """Verify tenant_registry row exists, return (bff_row, clawith_uuid).
+    Raises 404 if no tenant; 409 if tenant has no clawithTenantId; 502
+    if clawithTenantId is malformed."""
+    bff_data = await _bff_get(f"/api/internal/cross-store/tenants/{tenant_id}")
+    if bff_data.get("_status") == 404:
+        raise HTTPException(status_code=404, detail="Tenant not found in tenant_registry")
+    bff_row = bff_data.get("tenant", {})
+    if not bff_row:
+        raise HTTPException(status_code=502, detail="BFF returned malformed response")
+    cid = bff_row.get("clawithTenantId")
+    if not cid:
+        raise HTTPException(
+            status_code=409,
+            detail="Tenant has no clawithTenantId; agent CRUD requires a linked Clawith tenant",
+        )
+    try:
+        return bff_row, UUID(cid)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=502, detail="Malformed clawithTenantId in tenant_registry")
 
 
 # ─── List endpoint ──────────────────────────────────────────────────
@@ -258,3 +287,184 @@ async def resolve_action(
         # Surface BFF's error verbatim (400/404/409 are all caller-actionable)
         raise HTTPException(status_code=status, detail=data.get("error", "BFF resolve-action failed"))
     return data
+
+
+# ─── Agent CRUD (S4) ─────────────────────────────────────────────────
+# Direct ORM access to local Clawith agents table. Per ratification 16,
+# agent data is Clawith-owned (BFF has no agents model); no BFF hop.
+# Tenant validation goes through BFF (_bff_get -> clawithTenantId), then
+# all CRUD is local SQLAlchemy on the Tenant + Agent tables.
+
+import uuid as _uuidlib
+from datetime import datetime as _datetime, timezone as _timezone
+
+
+class AgentCreateBody(BaseModel):
+    name: str
+    role_description: str | None = None
+    welcome_message: str | None = None
+    tone: int | None = None
+
+
+class AgentUpdateBody(BaseModel):
+    name: str | None = None
+    role_description: str | None = None
+    welcome_message: str | None = None
+    tone: int | None = None
+
+
+def _validate_agent_id(agent_id: str) -> _uuidlib.UUID:
+    if not agent_id or len(agent_id) > 100:
+        raise HTTPException(status_code=400, detail="agent_id must be 1-100 chars")
+    try:
+        return _uuidlib.UUID(agent_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="agent_id must be a UUID")
+
+
+@router.get("/tenants/{tenant_id}/agents")
+async def list_agents(
+    tenant_id: str,
+    include_retired: bool = Query(False, alias="includeRetired"),
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    _, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+
+    q = select(Agent).where(Agent.tenant_id == clawith_uuid)
+    if not include_retired:
+        q = q.where(Agent.retired_at.is_(None))
+    q = q.order_by(Agent.created_at.desc())
+
+    result = await db.execute(q)
+    agents = result.scalars().all()
+    return {"total": len(agents), "agents": [_agent_view(a) for a in agents]}
+
+
+@router.post("/tenants/{tenant_id}/agents", status_code=201)
+async def create_agent(
+    tenant_id: str,
+    body: AgentCreateBody,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    _, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+
+    if body.tone is not None and (body.tone < 0 or body.tone > 2):
+        raise HTTPException(status_code=400, detail="tone must be 0..2 inclusive")
+
+    new_id = _uuidlib.uuid4()
+    new_agent = Agent(
+        id=new_id,
+        name=body.name,
+        role_description=body.role_description or "",
+        welcome_message=body.welcome_message,
+        tone=body.tone,
+        creator_id=current_user.id,
+        tenant_id=clawith_uuid,
+        agent_type="native",
+        external_id=str(new_id),
+    )
+    db.add(new_agent)
+    await db.commit()
+    await db.refresh(new_agent)
+    return _agent_view(new_agent)
+
+
+@router.get("/tenants/{tenant_id}/agents/{agent_id}")
+async def get_agent(
+    tenant_id: str,
+    agent_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    aid = _validate_agent_id(agent_id)
+    _, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+
+    result = await db.execute(
+        select(Agent).where(Agent.id == aid, Agent.tenant_id == clawith_uuid)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found under this tenant")
+    return _agent_view(agent)
+
+
+@router.patch("/tenants/{tenant_id}/agents/{agent_id}")
+async def update_agent(
+    tenant_id: str,
+    agent_id: str,
+    body: AgentUpdateBody,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    aid = _validate_agent_id(agent_id)
+    _, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+
+    if body.tone is not None and (body.tone < 0 or body.tone > 2):
+        raise HTTPException(status_code=400, detail="tone must be 0..2 inclusive")
+
+    result = await db.execute(
+        select(Agent).where(Agent.id == aid, Agent.tenant_id == clawith_uuid)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found under this tenant")
+    if agent.retired_at is not None:
+        raise HTTPException(status_code=409, detail="Agent is retired; cannot edit")
+
+    if body.name is not None:
+        agent.name = body.name
+    if body.role_description is not None:
+        agent.role_description = body.role_description
+    if body.welcome_message is not None:
+        agent.welcome_message = body.welcome_message
+    if body.tone is not None:
+        agent.tone = body.tone
+
+    await db.commit()
+    await db.refresh(agent)
+    return _agent_view(agent)
+
+
+@router.post("/tenants/{tenant_id}/agents/{agent_id}/retire")
+async def retire_agent(
+    tenant_id: str,
+    agent_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    aid = _validate_agent_id(agent_id)
+    _, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+
+    result = await db.execute(
+        select(Agent).where(Agent.id == aid, Agent.tenant_id == clawith_uuid)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found under this tenant")
+    if agent.retired_at is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent already retired at {agent.retired_at.isoformat()}",
+        )
+
+    agent.retired_at = _datetime.now(_timezone.utc)
+    agent.retired_by = current_user.id
+    await db.commit()
+    await db.refresh(agent)
+    return {
+        "id": str(agent.id),
+        "retired_at": agent.retired_at.isoformat(),
+        "retired_by": str(agent.retired_by),
+    }

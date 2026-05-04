@@ -131,6 +131,12 @@ class Agent(Base):
     )
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # L4 S4 ratification 15: lifecycle soft-delete. NULL retired_at = active;
+    # non-NULL = retired (audit trail preserved). Distinct from runtime
+    # status enum which carries operational state.
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
     # Relationships
     creator: Mapped["User"] = relationship("User", back_populates="created_agents", foreign_keys=[creator_id])
 
