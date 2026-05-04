@@ -468,3 +468,273 @@ async def retire_agent(
         "retired_at": agent.retired_at.isoformat(),
         "retired_by": str(agent.retired_by),
     }
+
+
+# ── S5 R25 (2026-05-04): Paperclip ID resolution helper ──────────────────────
+
+
+async def _resolve_paperclip_ids(
+    tenant_id: str,
+    agent_id: str,
+    db: AsyncSession,
+) -> tuple[str, str]:
+    """Verify tenant + agent exist, return (paperclip_company_id, paperclip_agent_id).
+
+    S5 R25 (2026-05-04): returns 409 with detail {error: 'agent_not_paperclip_managed',
+    agent_id} if EITHER paperclip_company_id or paperclip_agent_id is NULL on the
+    Clawith Agent row (legacy/orphan/smoke-residue). Mirrors S4 clawithTenantId-NULL
+    409 precedent.
+
+    Raises 400 on malformed agent_id; 404 on tenant or agent missing; 409 per R25.
+    """
+    bff_data = await _bff_get(f"/api/internal/cross-store/tenants/{tenant_id}")
+    if bff_data.get("_status") == 404:
+        raise HTTPException(status_code=404, detail="Tenant not found in tenant_registry")
+
+    try:
+        agent_uuid = UUID(agent_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="agent_id must be a valid UUID")
+
+    result = await db.execute(select(Agent).where(Agent.id == agent_uuid))
+    agent = result.scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if not agent.paperclip_company_id or not agent.paperclip_agent_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "agent_not_paperclip_managed", "agent_id": agent_id},
+        )
+
+    return agent.paperclip_company_id, agent.paperclip_agent_id
+
+
+# ── S5 R18-R25 (2026-05-04): SOUL editor + skill attachment ambassador ────────
+# 4 endpoints under /api/admin/cross-store/tenants/{tid}/agents/{aid}:
+#   GET  /soul    — fetch SOUL.md from Paperclip (source of truth)
+#   PUT  /soul    — write Paperclip + R20a write-through Clawith Agent.soul
+#   GET  /skills  — fetch catalog + agent's attached desiredSkills
+#   PUT  /skills  — POST Paperclip skills/sync; no Clawith cache (ADR-0070)
+
+
+import hashlib as _hashlib
+import time as _time
+
+from app.models.audit import AuditLog
+from app.services.paperclip_client import (
+    PaperclipUnreachable,
+    _get_json as _pcp_get_json,
+    fetch_paperclip_soul,
+    update_paperclip_desired_skills,
+    update_paperclip_soul,
+)
+
+
+# In-memory idempotency cache for SOUL writes (S5 R23 last-write-wins; 60s window).
+# Module-level dict; lost on container restart (Wave-1 single-operator acceptable).
+_SOUL_IDEMPOTENCY: dict[tuple[str, str], tuple[dict, float]] = {}
+_SOUL_IDEMPOTENCY_TTL = 60.0
+
+
+def _soul_idemp_get(agent_id: str, content_sha: str) -> dict | None:
+    entry = _SOUL_IDEMPOTENCY.get((agent_id, content_sha))
+    if entry is None:
+        return None
+    response, ts = entry
+    if _time.time() - ts > _SOUL_IDEMPOTENCY_TTL:
+        _SOUL_IDEMPOTENCY.pop((agent_id, content_sha), None)
+        return None
+    return response
+
+
+def _soul_idemp_put(agent_id: str, content_sha: str, response: dict) -> None:
+    _SOUL_IDEMPOTENCY[(agent_id, content_sha)] = (response, _time.time())
+    now = _time.time()
+    stale = [k for k, (_, t) in _SOUL_IDEMPOTENCY.items() if now - t > _SOUL_IDEMPOTENCY_TTL]
+    for k in stale:
+        _SOUL_IDEMPOTENCY.pop(k, None)
+
+
+class SoulPutBody(BaseModel):
+    content: str
+
+
+@router.get("/tenants/{tenant_id}/agents/{agent_id}/soul")
+async def get_agent_soul(
+    tenant_id: str,
+    agent_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    pcp_co, pcp_ag = await _resolve_paperclip_ids(tenant_id, agent_id, db)
+    try:
+        # runtimeConfig.soul is the dispatch-time hydrated view; null on agents
+        # that haven't been dispatched yet. Fall back to bundle-file source of truth.
+        content = await fetch_paperclip_soul(pcp_ag)
+        if content is None:
+            body = await _pcp_get_json(
+                f"/api/agents/{pcp_ag}/instructions-bundle/file?path=SOUL.md"
+            )
+            content = body.get("content") or ""
+    except PaperclipUnreachable as e:
+        raise HTTPException(status_code=502, detail=f"Paperclip unreachable: {e}")
+    return {
+        "content": content,
+        "source": "paperclip",
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+    }
+
+
+@router.put("/tenants/{tenant_id}/agents/{agent_id}/soul")
+async def put_agent_soul(
+    tenant_id: str,
+    agent_id: str,
+    body: SoulPutBody,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not body.content or not body.content.strip():
+        raise HTTPException(status_code=422, detail="content must not be empty")
+    if len(body.content) > 50000:
+        raise HTTPException(status_code=422, detail="content exceeds 50000 char limit")
+
+    pcp_co, pcp_ag = await _resolve_paperclip_ids(tenant_id, agent_id, db)
+
+    new_sha = _hashlib.sha256(body.content.encode("utf-8")).hexdigest()
+    cached = _soul_idemp_get(agent_id, new_sha)
+    if cached is not None:
+        return cached
+
+    agent_uuid = _uuidlib.UUID(agent_id)
+    agent_r = await db.execute(select(Agent).where(Agent.id == agent_uuid))
+    agent_row = agent_r.scalar_one_or_none()
+    if agent_row is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    prev_sha = (
+        _hashlib.sha256(agent_row.soul.encode("utf-8")).hexdigest()
+        if agent_row.soul else None
+    )
+
+    try:
+        await update_paperclip_soul(pcp_ag, body.content)
+    except PaperclipUnreachable as e:
+        raise HTTPException(status_code=502, detail=f"Paperclip write failed: {e}")
+
+    # R20a write-through: update Clawith cache from request body, NOT from a fetch.
+    # fetch_paperclip_soul reads runtimeConfig.soul (dispatch-time cache); the
+    # bundle-file write doesn't repopulate that until next dispatch.
+    agent_row.soul = body.content
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        agent_id=agent_uuid,
+        action="platform_admin.soul_edit",
+        details={
+            "tenant_id": tenant_id,
+            "paperclip_agent_id": pcp_ag,
+            "paperclip_company_id": pcp_co,
+            "content_sha256_before": prev_sha,
+            "content_sha256_after": new_sha,
+            "content_length": len(body.content),
+        },
+    ))
+    await db.commit()
+
+    response = {
+        "content": body.content,
+        "content_sha256": new_sha,
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+        "cache_refreshed": True,
+        "source": "paperclip",
+    }
+    _soul_idemp_put(agent_id, new_sha, response)
+    return response
+
+
+@router.get("/tenants/{tenant_id}/agents/{agent_id}/skills")
+async def get_agent_skills(
+    tenant_id: str,
+    agent_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    pcp_co, pcp_ag = await _resolve_paperclip_ids(tenant_id, agent_id, db)
+    try:
+        catalog = await _pcp_get_json(f"/api/companies/{pcp_co}/skills")
+        agent_skills = await _pcp_get_json(f"/api/agents/{pcp_ag}/skills")
+    except PaperclipUnreachable as e:
+        raise HTTPException(status_code=502, detail=f"Paperclip unreachable: {e}")
+    attached = agent_skills.get("desiredSkills") or []
+    available = [
+        {
+            "key": s.get("key"),
+            "slug": s.get("slug"),
+            "description": s.get("description") or "",
+            "id": s.get("id"),
+        }
+        for s in catalog
+        if not (s.get("key") or "").startswith("paperclipai/")
+    ]
+    return {
+        "available": available,
+        "attached": attached,
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+    }
+
+
+class SkillsPutBody(BaseModel):
+    desired: list[str]
+
+
+@router.put("/tenants/{tenant_id}/agents/{agent_id}/skills")
+async def put_agent_skills(
+    tenant_id: str,
+    agent_id: str,
+    body: SkillsPutBody,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    pcp_co, pcp_ag = await _resolve_paperclip_ids(tenant_id, agent_id, db)
+    agent_uuid = _uuidlib.UUID(agent_id)
+
+    try:
+        before_resp = await _pcp_get_json(f"/api/agents/{pcp_ag}/skills")
+        before = before_resp.get("desiredSkills") or []
+    except PaperclipUnreachable:
+        before = []  # read failure shouldn't block write attempt
+
+    try:
+        pcp_response = await update_paperclip_desired_skills(pcp_ag, body.desired)
+    except PaperclipUnreachable as e:
+        msg = str(e)
+        # Surface Paperclip's 422 (catalog-validation reject) verbatim
+        if "HTTP 422" in msg:
+            raise HTTPException(status_code=422, detail=msg[:300])
+        raise HTTPException(status_code=502, detail=f"Paperclip skills/sync failed: {e}")
+
+    after = pcp_response.get("desiredSkills") or body.desired
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        agent_id=agent_uuid,
+        action="platform_admin.skills_edit",
+        details={
+            "tenant_id": tenant_id,
+            "paperclip_agent_id": pcp_ag,
+            "paperclip_company_id": pcp_co,
+            "before": before,
+            "after": after,
+        },
+    ))
+    await db.commit()
+
+    return {
+        "desired": after,
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+        "source": "paperclip",
+    }

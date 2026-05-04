@@ -6,6 +6,8 @@ import { useAuthStore } from '../../stores';
 import LinearCopyButton from '../../components/LinearCopyButton';
 import OperatorActionItem from '../../components/OperatorActionItem';
 import AgentFormModal from '../../components/AgentFormModal';
+import SOULEditorModal from '../../components/SOULEditorModal';
+import SkillsAttachmentPanel from '../../components/SkillsAttachmentPanel';
 
 // L4 S2: per-tenant detail. Bearer + platform_admin. Calls
 // /api/admin/cross-store/tenants/{tenantId}. Read-only in S2; CRUD/actions
@@ -68,6 +70,10 @@ export default function CrossStoreTenantDetail() {
     const [retiringId, setRetiringId] = useState<string | null>(null);
     const [confirmRetireId, setConfirmRetireId] = useState<string | null>(null);
     const [retireErr, setRetireErr] = useState<string | null>(null);
+
+    // S5: SOUL editor + Skills attachment modal targets
+    const [soulTarget, setSoulTarget] = useState<{ agentId: string; agentName: string } | null>(null);
+    const [skillsTarget, setSkillsTarget] = useState<{ agentId: string; agentName: string } | null>(null);
 
     const refetch = () => {
         if (!tenantId) return;
@@ -232,6 +238,7 @@ export default function CrossStoreTenantDetail() {
                                 <tbody>
                                     {agentsList.map((a) => {
                                         const isRetired = a.retired_at !== null;
+                                        const isPaperclipManaged = !!a.paperclip_agent_id;
                                         return (
                                             <tr key={a.id} style={{ borderBottom: '1px solid var(--border)', opacity: isRetired ? 0.6 : 1 }}>
                                                 <td style={{ padding: '10px 8px', fontWeight: 500 }}>{a.name}</td>
@@ -268,6 +275,22 @@ export default function CrossStoreTenantDetail() {
                                                         </span>
                                                     ) : (
                                                         <>
+                                                            <button
+                                                                onClick={() => setSoulTarget({ agentId: a.id, agentName: a.name })}
+                                                                disabled={!isPaperclipManaged}
+                                                                title={isPaperclipManaged ? '' : 'Agent is not Paperclip-managed'}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: isPaperclipManaged ? 'pointer' : 'not-allowed', color: 'var(--text-primary)', fontSize: 12, marginRight: 6, opacity: isPaperclipManaged ? 1 : 0.5 }}
+                                                            >
+                                                                {t('admin.agents.editSoulBtn', 'Edit SOUL')}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => setSkillsTarget({ agentId: a.id, agentName: a.name })}
+                                                                disabled={!isPaperclipManaged}
+                                                                title={isPaperclipManaged ? '' : 'Agent is not Paperclip-managed'}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: isPaperclipManaged ? 'pointer' : 'not-allowed', color: 'var(--text-primary)', fontSize: 12, marginRight: 6, opacity: isPaperclipManaged ? 1 : 0.5 }}
+                                                            >
+                                                                {t('admin.agents.manageSkillsBtn', 'Manage Skills')}
+                                                            </button>
                                                             <button
                                                                 onClick={() => setModalMode({ mode: 'edit', agent: a })}
                                                                 style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', color: 'var(--text-primary)', fontSize: 12, marginRight: 6 }}
@@ -361,6 +384,26 @@ export default function CrossStoreTenantDetail() {
                     </div>
                 )}
             </div>
+
+            {soulTarget && tenantId && (
+                <SOULEditorModal
+                    open={!!soulTarget}
+                    tenantId={tenantId}
+                    agentId={soulTarget.agentId}
+                    agentName={soulTarget.agentName}
+                    onClose={() => setSoulTarget(null)}
+                />
+            )}
+
+            {skillsTarget && tenantId && (
+                <SkillsAttachmentPanel
+                    open={!!skillsTarget}
+                    tenantId={tenantId}
+                    agentId={skillsTarget.agentId}
+                    agentName={skillsTarget.agentName}
+                    onClose={() => setSkillsTarget(null)}
+                />
+            )}
         </div>
     );
 }

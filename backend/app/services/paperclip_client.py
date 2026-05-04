@@ -120,3 +120,62 @@ async def fetch_paperclip_skill_body(
             f"skill {skill_id} files response missing 'content' string field"
         )
     return content
+
+
+# ── S5 R22-R25 (2026-05-04): Paperclip writer methods ─────────────────────────
+# Added for L4 S5 SOUL editor + skill attachment surface.
+# - update_paperclip_soul: PUT /api/agents/{id}/instructions-bundle/file
+# - update_paperclip_desired_skills: POST /api/agents/{id}/skills/sync
+# Both reuse _headers() (PCP_BOARD_TOKEN auth per R24) + 5s fail-fast timeout.
+# R23: Wave-1 last-write-wins; no etag/revision guard.
+
+
+async def _request_json(method: str, path: str, body: dict | None = None) -> dict:
+    """Generic Paperclip HTTP helper for non-GET methods.
+
+    Mirrors _get_json semantics. _get_json kept unchanged for diff minimization;
+    future refactor can collapse both into _request_json('GET', ...).
+    """
+    if not PAPERCLIP_API_URL:
+        raise PaperclipUnreachable("PAPERCLIP_API_URL not set in container env")
+    url = f"{PAPERCLIP_API_URL}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+            r = await client.request(method, url, headers=_headers(), json=body)
+    except httpx.HTTPError as e:
+        raise PaperclipUnreachable(f"{method} {path}: {type(e).__name__}: {e}") from e
+    if r.status_code >= 400:
+        raise PaperclipUnreachable(f"{method} {path}: HTTP {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
+async def update_paperclip_soul(paperclip_agent_id: str, soul_md: str) -> dict:
+    """PUT /api/agents/{id}/instructions-bundle/file body {path: SOUL.md, content}.
+
+    S5 R22 (2026-05-04): no companyId in path; server derives from agent record.
+    S5 R23: Wave-1 last-write-wins; no etag/revision guard.
+    """
+    body = {"path": "SOUL.md", "content": soul_md}
+    return await _request_json(
+        "PUT",
+        f"/api/agents/{paperclip_agent_id}/instructions-bundle/file",
+        body,
+    )
+
+
+async def update_paperclip_desired_skills(
+    paperclip_agent_id: str,
+    desired_skill_keys: list[str],
+) -> dict:
+    """POST /api/agents/{id}/skills/sync body {desiredSkills: [...]}.
+
+    S5 R22 (2026-05-04): dedicated sync endpoint; server resolves + validates;
+    Paperclip returns 422 on empty desiredSkills (we surface as PaperclipUnreachable).
+    S5 R25: caller should resolve _resolve_paperclip_ids first for clean 409s.
+    """
+    body = {"desiredSkills": desired_skill_keys}
+    return await _request_json(
+        "POST",
+        f"/api/agents/{paperclip_agent_id}/skills/sync",
+        body,
+    )

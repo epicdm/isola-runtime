@@ -248,6 +248,36 @@ export const crossStoreApi = {
                 body: JSON.stringify({ actionKind, ...(resolutionPayload !== undefined ? { resolutionPayload } : {}) }),
             },
         ),
+
+    // ── S5 (2026-05-04): SOUL editor + skill attachment ambassador ──
+    getAgentSoul: (tenantId: string, agentId: string) =>
+        request<{ content: string; source: string; agent_id: string; tenant_id: string }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/soul`,
+        ),
+
+    putAgentSoul: (tenantId: string, agentId: string, content: string) =>
+        request<{ content: string; content_sha256: string; agent_id: string; tenant_id: string; cache_refreshed: boolean; source: string }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/soul`,
+            { method: 'PUT', body: JSON.stringify({ content }) },
+        ),
+
+    getAgentSkills: (tenantId: string, agentId: string) =>
+        request<{ available: SkillCatalogEntry[]; attached: string[]; agent_id: string; tenant_id: string }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/skills`,
+        ),
+
+    putAgentSkills: (tenantId: string, agentId: string, desired: string[]) =>
+        request<{ desired: string[]; agent_id: string; tenant_id: string; source: string }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/skills`,
+            { method: 'PUT', body: JSON.stringify({ desired }) },
+        ),
+};
+
+export type SkillCatalogEntry = {
+    key: string;
+    slug: string;
+    description: string;
+    id: string;
 };
 
 export type QueueItem = {
