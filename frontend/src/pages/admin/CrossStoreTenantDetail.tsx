@@ -66,6 +66,7 @@ export default function CrossStoreTenantDetail() {
     const [includeRetired, setIncludeRetired] = useState(false);
     const [modalMode, setModalMode] = useState<null | { mode: 'create' } | { mode: 'edit'; agent: AgentRow }>(null);
     const [retiringId, setRetiringId] = useState<string | null>(null);
+    const [confirmRetireId, setConfirmRetireId] = useState<string | null>(null);
     const [retireErr, setRetireErr] = useState<string | null>(null);
 
     const refetch = () => {
@@ -95,11 +96,11 @@ export default function CrossStoreTenantDetail() {
 
     const onRetire = async (agent: AgentRow) => {
         if (!tenantId) return;
-        if (!window.confirm(`Retire agent "${agent.name}"? This sets a retired_at timestamp; the row + audit trail are preserved.`)) return;
         setRetiringId(agent.id);
         setRetireErr(null);
         try {
             await crossStoreAgentsApi.retire(tenantId, agent.id);
+            setConfirmRetireId(null);
             refetchAgents();
         } catch (e) {
             setRetireErr(e instanceof Error ? e.message : String(e));
@@ -244,8 +245,28 @@ export default function CrossStoreTenantDetail() {
                                                     )}
                                                 </td>
                                                 <td style={{ padding: '10px 8px', fontFamily: 'monospace', fontSize: 11, color: 'var(--text-tertiary)' }}>{a.status}</td>
-                                                <td style={{ padding: '10px 8px', textAlign: 'right' }}>
-                                                    {!isRetired && (
+                                                <td style={{ padding: '10px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                                    {isRetired ? null : confirmRetireId === a.id ? (
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                                            <span style={{ fontSize: 12, color: 'var(--text-tertiary)', marginRight: 4 }}>
+                                                                {t('admin.agents.retireConfirm', 'Retire?')}
+                                                            </span>
+                                                            <button
+                                                                onClick={() => setConfirmRetireId(null)}
+                                                                disabled={retiringId === a.id}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', color: 'var(--text-primary)', fontSize: 12 }}
+                                                            >
+                                                                {t('common.cancel', 'Cancel')}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => onRetire(a)}
+                                                                disabled={retiringId === a.id}
+                                                                style={{ padding: '4px 10px', background: '#ef4444', border: 'none', borderRadius: 6, cursor: retiringId === a.id ? 'wait' : 'pointer', color: '#fff', fontSize: 12, fontWeight: 600 }}
+                                                            >
+                                                                {retiringId === a.id ? t('common.retiring', 'Retiring…') : t('admin.agents.retireConfirmYes', 'Yes, retire')}
+                                                            </button>
+                                                        </span>
+                                                    ) : (
                                                         <>
                                                             <button
                                                                 onClick={() => setModalMode({ mode: 'edit', agent: a })}
@@ -254,11 +275,10 @@ export default function CrossStoreTenantDetail() {
                                                                 {t('admin.agents.editBtn', 'Edit')}
                                                             </button>
                                                             <button
-                                                                onClick={() => onRetire(a)}
-                                                                disabled={retiringId === a.id}
-                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid #ef4444', borderRadius: 6, cursor: retiringId === a.id ? 'wait' : 'pointer', color: '#ef4444', fontSize: 12 }}
+                                                                onClick={() => setConfirmRetireId(a.id)}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid #ef4444', borderRadius: 6, cursor: 'pointer', color: '#ef4444', fontSize: 12 }}
                                                             >
-                                                                {retiringId === a.id ? t('common.retiring', 'Retiring…') : t('admin.agents.retireBtn', 'Retire')}
+                                                                {t('admin.agents.retireBtn', 'Retire')}
                                                             </button>
                                                         </>
                                                     )}
