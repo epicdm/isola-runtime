@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     # /api/internal/* calls (cross-store reads of tenant_registry, etc.).
     # Same value as bff-v2's INTERNAL_SECRET. Blank disables outbound BFF calls.
     BFF_INTERNAL_SECRET: str = ""
+    BFF_API_BASE_URL: str = "https://bff.epic.dm"
     JWT_SECRET_KEY: str = "change-me-jwt-secret"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours

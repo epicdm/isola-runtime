@@ -61,6 +61,7 @@ services:
       # outbound calls (cross-store reads of tenant_registry, etc.). Same value
       # as bff-v2's INTERNAL_SECRET; consumer-side renamed to disambiguate.
       BFF_INTERNAL_SECRET: ${BFF_INTERNAL_SECRET:-}
+      BFF_API_BASE_URL: ${BFF_API_BASE_URL:-https://bff.epic.dm}
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents
