@@ -258,6 +258,67 @@ export type QueueItem = {
     payload: unknown;
 };
 
+// L4 S4: agent CRUD scoped to a cross-store tenant. Path is
+// /admin/cross-store/tenants/{tenantId}/agents/...; auth is Bearer +
+// platform_admin (matches list/detail/queue family).
+
+export type AgentRow = {
+    id: string;
+    name: string;
+    agent_type: string;
+    role_description: string;
+    welcome_message: string | null;
+    tone: number | null;
+    status: string;
+    owner_phone: string | null;
+    paperclip_agent_id: string | null;
+    paperclip_company_id: string | null;
+    container_port: number | null;
+    retired_at: string | null;
+    retired_by: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+};
+
+export type AgentCreatePayload = {
+    name: string;
+    role_description?: string;
+    welcome_message?: string;
+    tone?: number;
+};
+
+export type AgentUpdatePayload = Partial<AgentCreatePayload>;
+
+export const crossStoreAgentsApi = {
+    list: (tenantId: string, includeRetired = false) =>
+        request<{ total: number; agents: AgentRow[] }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents${includeRetired ? '?includeRetired=true' : ''}`,
+        ),
+
+    create: (tenantId: string, payload: AgentCreatePayload) =>
+        request<AgentRow>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents`,
+            { method: 'POST', body: JSON.stringify(payload) },
+        ),
+
+    get: (tenantId: string, agentId: string) =>
+        request<AgentRow>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}`,
+        ),
+
+    update: (tenantId: string, agentId: string, payload: AgentUpdatePayload) =>
+        request<AgentRow>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}`,
+            { method: 'PATCH', body: JSON.stringify(payload) },
+        ),
+
+    retire: (tenantId: string, agentId: string) =>
+        request<{ id: string; retired_at: string; retired_by: string }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/retire`,
+            { method: 'POST' },
+        ),
+};
+
 // ─── Agents ───────────────────────────────────────────
 export const agentApi = {
     list: (tenantId?: string) => request<Agent[]>(`/agents/${tenantId ? `?tenant_id=${tenantId}` : ''}`),

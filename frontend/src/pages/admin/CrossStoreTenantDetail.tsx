@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
-import { crossStoreApi, type QueueItem } from '../../services/api';
+import { crossStoreApi, crossStoreAgentsApi, type AgentRow, type QueueItem } from '../../services/api';
 import { useAuthStore } from '../../stores';
 import LinearCopyButton from '../../components/LinearCopyButton';
 import OperatorActionItem from '../../components/OperatorActionItem';
+import AgentFormModal from '../../components/AgentFormModal';
 
 // L4 S2: per-tenant detail. Bearer + platform_admin. Calls
 // /api/admin/cross-store/tenants/{tenantId}. Read-only in S2; CRUD/actions
@@ -57,6 +58,16 @@ export default function CrossStoreTenantDetail() {
     const [err, setErr] = useState<string | null>(null);
     const [tab, setTab] = useState<Tab>('overview');
 
+    // S4 agent CRUD state — fetched independently of detail so list refetches
+    // after create/edit/retire don't reload the entire detail payload.
+    const [agentsList, setAgentsList] = useState<AgentRow[] | null>(null);
+    const [agentsLoading, setAgentsLoading] = useState(false);
+    const [agentsErr, setAgentsErr] = useState<string | null>(null);
+    const [includeRetired, setIncludeRetired] = useState(false);
+    const [modalMode, setModalMode] = useState<null | { mode: 'create' } | { mode: 'edit'; agent: AgentRow }>(null);
+    const [retiringId, setRetiringId] = useState<string | null>(null);
+    const [retireErr, setRetireErr] = useState<string | null>(null);
+
     const refetch = () => {
         if (!tenantId) return;
         setLoading(true);
@@ -66,7 +77,36 @@ export default function CrossStoreTenantDetail() {
             .finally(() => setLoading(false));
     };
 
+    const refetchAgents = () => {
+        if (!tenantId) return;
+        setAgentsLoading(true);
+        setAgentsErr(null);
+        crossStoreAgentsApi.list(tenantId, includeRetired)
+            .then((d) => setAgentsList(d.agents || []))
+            .catch((e: Error) => setAgentsErr(e.message))
+            .finally(() => setAgentsLoading(false));
+    };
+
     useEffect(refetch, [tenantId]);
+    useEffect(() => {
+        // Fetch agents on tab open or when includeRetired toggles
+        if (tab === 'agents') refetchAgents();
+    }, [tab, tenantId, includeRetired]);
+
+    const onRetire = async (agent: AgentRow) => {
+        if (!tenantId) return;
+        if (!window.confirm(`Retire agent "${agent.name}"? This sets a retired_at timestamp; the row + audit trail are preserved.`)) return;
+        setRetiringId(agent.id);
+        setRetireErr(null);
+        try {
+            await crossStoreAgentsApi.retire(tenantId, agent.id);
+            refetchAgents();
+        } catch (e) {
+            setRetireErr(e instanceof Error ? e.message : String(e));
+        } finally {
+            setRetiringId(null);
+        }
+    };
 
     if (user?.role !== 'platform_admin') {
         return (
@@ -151,33 +191,92 @@ export default function CrossStoreTenantDetail() {
 
                 {tab === 'agents' && (
                     <div>
-                        {agents.length === 0 ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+                            <button
+                                onClick={() => setModalMode({ mode: 'create' })}
+                                style={{ padding: '6px 14px', background: 'var(--accent, #3b82f6)', border: 'none', borderRadius: 6, cursor: 'pointer', color: '#fff', fontWeight: 600, fontSize: 13 }}
+                            >
+                                + {t('admin.agents.addBtn', 'Add agent')}
+                            </button>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-tertiary)', cursor: 'pointer' }}>
+                                <input type="checkbox" checked={includeRetired} onChange={(e) => setIncludeRetired(e.target.checked)} />
+                                {t('admin.agents.showRetired', 'Show retired')}
+                            </label>
+                            <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-tertiary)' }}>
+                                {agentsList ? `${agentsList.length} agent${agentsList.length === 1 ? '' : 's'}` : ''}
+                            </span>
+                        </div>
+                        {retireErr && <div style={{ color: '#ef4444', fontSize: 12, marginBottom: 8 }}>{retireErr}</div>}
+                        {agentsErr && <div style={{ color: '#ef4444', padding: 20 }}>{agentsErr}</div>}
+                        {agentsLoading && !agentsList && (
+                            <div style={{ padding: 40, color: 'var(--text-tertiary)' }}>{t('common.loading', 'Loading…')}</div>
+                        )}
+                        {!agentsErr && agentsList && agentsList.length === 0 && (
                             <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>
-                                {t('admin.crossStore.detail.agents.empty', 'No agents in Clawith local DB.')}
+                                {t('admin.agents.empty', 'No agents yet. Click Add agent to create one.')}
                             </div>
-                        ) : (
+                        )}
+                        {!agentsErr && agentsList && agentsList.length > 0 && (
                             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                                 <thead>
                                     <tr style={{ borderBottom: '1px solid var(--border)' }}>
-                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.crossStore.detail.agents.col.name', 'Name')}</th>
-                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.crossStore.detail.agents.col.type', 'Type')}</th>
-                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.crossStore.detail.agents.col.role', 'Role')}</th>
-                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.crossStore.detail.agents.col.owner', 'Owner phone')}</th>
-                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.crossStore.detail.agents.col.paperclip', 'Paperclip agent id')}</th>
+                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.agents.col.name', 'Name')}</th>
+                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.agents.col.role', 'Role')}</th>
+                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.agents.col.welcome', 'Welcome')}</th>
+                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.agents.col.status', 'Lifecycle')}</th>
+                                        <th style={{ textAlign: 'left', padding: '10px 8px', color: 'var(--text-tertiary)' }}>{t('admin.agents.col.runtime', 'Runtime')}</th>
+                                        <th style={{ textAlign: 'right', padding: '10px 8px', color: 'var(--text-tertiary)' }}></th>
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {agents.map((a) => (
-                                        <tr key={a.id} style={{ borderBottom: '1px solid var(--border)' }}>
-                                            <td style={{ padding: '10px 8px', fontWeight: 500 }}>{a.name}</td>
-                                            <td style={{ padding: '10px 8px' }}>{a.agent_type}</td>
-                                            <td style={{ padding: '10px 8px', color: 'var(--text-tertiary)' }}>{a.role_description || '—'}</td>
-                                            <td style={{ padding: '10px 8px', fontFamily: 'monospace', fontSize: 11 }}>{a.owner_phone || '—'}</td>
-                                            <td style={{ padding: '10px 8px', fontFamily: 'monospace', fontSize: 11 }}>{a.paperclip_agent_id || '—'}</td>
-                                        </tr>
-                                    ))}
+                                    {agentsList.map((a) => {
+                                        const isRetired = a.retired_at !== null;
+                                        return (
+                                            <tr key={a.id} style={{ borderBottom: '1px solid var(--border)', opacity: isRetired ? 0.6 : 1 }}>
+                                                <td style={{ padding: '10px 8px', fontWeight: 500 }}>{a.name}</td>
+                                                <td style={{ padding: '10px 8px', color: 'var(--text-tertiary)' }}>{a.role_description || '—'}</td>
+                                                <td style={{ padding: '10px 8px', color: 'var(--text-tertiary)', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.welcome_message || '—'}</td>
+                                                <td style={{ padding: '10px 8px' }}>
+                                                    {isRetired ? (
+                                                        <span style={{ display: 'inline-block', padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, color: '#94a3b8', background: '#94a3b81a', border: '1px solid #94a3b833' }}>retired</span>
+                                                    ) : (
+                                                        <span style={{ display: 'inline-block', padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, color: '#22c55e', background: '#22c55e1a', border: '1px solid #22c55e33' }}>active</span>
+                                                    )}
+                                                </td>
+                                                <td style={{ padding: '10px 8px', fontFamily: 'monospace', fontSize: 11, color: 'var(--text-tertiary)' }}>{a.status}</td>
+                                                <td style={{ padding: '10px 8px', textAlign: 'right' }}>
+                                                    {!isRetired && (
+                                                        <>
+                                                            <button
+                                                                onClick={() => setModalMode({ mode: 'edit', agent: a })}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', color: 'var(--text-primary)', fontSize: 12, marginRight: 6 }}
+                                                            >
+                                                                {t('admin.agents.editBtn', 'Edit')}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => onRetire(a)}
+                                                                disabled={retiringId === a.id}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid #ef4444', borderRadius: 6, cursor: retiringId === a.id ? 'wait' : 'pointer', color: '#ef4444', fontSize: 12 }}
+                                                            >
+                                                                {retiringId === a.id ? t('common.retiring', 'Retiring…') : t('admin.agents.retireBtn', 'Retire')}
+                                                            </button>
+                                                        </>
+                                                    )}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
                                 </tbody>
                             </table>
+                        )}
+                        {modalMode && tenantId && (
+                            <AgentFormModal
+                                tenantId={tenantId}
+                                mode={modalMode.mode}
+                                agent={modalMode.mode === 'edit' ? modalMode.agent : undefined}
+                                onClose={() => setModalMode(null)}
+                                onSaved={() => { setModalMode(null); refetchAgents(); }}
+                            />
                         )}
                     </div>
                 )}
