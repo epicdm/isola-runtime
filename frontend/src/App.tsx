@@ -18,6 +18,7 @@ import InvitationCodes from './pages/InvitationCodes';
 import AdminCompanies from './pages/AdminCompanies';
 import CrossStoreTenants from './pages/admin/CrossStoreTenants';
 import CrossStoreTenantDetail from './pages/admin/CrossStoreTenantDetail';
+import OperatorQueue from './pages/admin/OperatorQueue';
 import SSOEntry from './pages/SSOEntry';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -197,6 +198,7 @@ export default function App() {
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
                     <Route path="admin/companies" element={<CrossStoreTenants />} />
                     <Route path="admin/companies/:tenantId" element={<CrossStoreTenantDetail />} />
+                    <Route path="admin/operator-queue" element={<OperatorQueue />} />
                 </Route>
             </Routes>
         </>

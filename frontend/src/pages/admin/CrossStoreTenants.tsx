@@ -54,6 +54,7 @@ export default function CrossStoreTenants() {
     const [err, setErr] = useState<string | null>(null);
     const [statusFilter, setStatusFilter] = useState<string>('all');
     const [search, setSearch] = useState<string>('');
+    const [showTest, setShowTest] = useState<boolean>(false);
 
     useEffect(() => {
         crossStoreApi.listTenants()
@@ -65,11 +66,15 @@ export default function CrossStoreTenants() {
     const filtered = useMemo(() => {
         const s = search.trim().toLowerCase();
         return rows.filter((r) => {
+            // Default: hide test rows. Toggle "Show test tenants" to include them.
+            // Status filter (when != 'all') overrides the default test-hide because
+            // an explicit pick of 'test' in the dropdown means the user wants to see them.
+            if (!showTest && statusFilter === 'all' && r.bff.status === 'test') return false;
             if (statusFilter !== 'all' && r.bff.status !== statusFilter) return false;
             if (s && !(r.bff.businessName || '').toLowerCase().includes(s)) return false;
             return true;
         });
-    }, [rows, statusFilter, search]);
+    }, [rows, statusFilter, search, showTest]);
 
     if (user?.role !== 'platform_admin') {
         return (
@@ -112,6 +117,14 @@ export default function CrossStoreTenants() {
                     <option value="archived">archived</option>
                     <option value="failed">failed</option>
                 </select>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-tertiary)', cursor: 'pointer' }}>
+                    <input
+                        type="checkbox"
+                        checked={showTest}
+                        onChange={(e) => setShowTest(e.target.checked)}
+                    />
+                    {t('admin.crossStore.showTest', 'Show test tenants')}
+                </label>
                 <span style={{ color: 'var(--text-tertiary)', fontSize: 12, marginLeft: 'auto' }}>
                     {filtered.length} / {rows.length}
                 </span>

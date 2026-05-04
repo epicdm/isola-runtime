@@ -232,6 +232,28 @@ export const crossStoreApi = {
         request<{ bff: any; local: any | null; agents: any[] }>(
             `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}`,
         ),
+
+    listQueue: () =>
+        request<{ total: number; byKind: Record<string, number>; items: QueueItem[] }>(
+            '/admin/cross-store/operator-queue',
+        ),
+
+    resolveAction: (tenantId: string, actionKind: string, resolutionPayload?: unknown) =>
+        request<{ tenantId: string; resolved: string; remaining: string[] }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/resolve-action`,
+            {
+                method: 'POST',
+                body: JSON.stringify({ actionKind, ...(resolutionPayload !== undefined ? { resolutionPayload } : {}) }),
+            },
+        ),
+};
+
+export type QueueItem = {
+    tenantId: string;
+    businessName: string | null;
+    status: string;
+    kind: string;
+    payload: unknown;
 };
 
 // ─── Agents ───────────────────────────────────────────

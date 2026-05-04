@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
-import { crossStoreApi } from '../../services/api';
+import { crossStoreApi, type QueueItem } from '../../services/api';
 import { useAuthStore } from '../../stores';
 import LinearCopyButton from '../../components/LinearCopyButton';
+import OperatorActionItem from '../../components/OperatorActionItem';
 
 // L4 S2: per-tenant detail. Bearer + platform_admin. Calls
 // /api/admin/cross-store/tenants/{tenantId}. Read-only in S2; CRUD/actions
@@ -56,13 +57,16 @@ export default function CrossStoreTenantDetail() {
     const [err, setErr] = useState<string | null>(null);
     const [tab, setTab] = useState<Tab>('overview');
 
-    useEffect(() => {
+    const refetch = () => {
         if (!tenantId) return;
+        setLoading(true);
         crossStoreApi.getTenant(tenantId)
             .then(setData)
             .catch((e: Error) => setErr(e.message))
             .finally(() => setLoading(false));
-    }, [tenantId]);
+    };
+
+    useEffect(refetch, [tenantId]);
 
     if (user?.role !== 'platform_admin') {
         return (
@@ -196,17 +200,39 @@ export default function CrossStoreTenantDetail() {
                 )}
 
                 {tab === 'deferred' && (
-                    <div style={{ maxWidth: 720 }}>
-                        {bff.deferredOperatorActions ? (
-                            <pre style={{
-                                background: 'var(--bg-secondary)', border: '1px solid var(--border)',
-                                borderRadius: 6, padding: 16, fontSize: 12, lineHeight: 1.5, overflow: 'auto',
-                            }}>{JSON.stringify(bff.deferredOperatorActions, null, 2)}</pre>
-                        ) : (
-                            <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>
-                                {t('admin.crossStore.detail.deferred.empty', 'No deferred operator actions.')}
-                            </div>
-                        )}
+                    <div style={{ maxWidth: 720, display: 'flex', flexDirection: 'column', gap: 12 }}>
+                        {(() => {
+                            const actions = bff.deferredOperatorActions as Record<string, unknown> | null;
+                            const tenantId: string = bff.tenantId;
+                            const items: QueueItem[] = [];
+                            if (actions && typeof actions === 'object') {
+                                for (const [kind, payload] of Object.entries(actions)) {
+                                    if (payload === null || payload === undefined || payload === false) continue;
+                                    items.push({
+                                        tenantId,
+                                        businessName: bff.businessName ?? null,
+                                        status: bff.status,
+                                        kind,
+                                        payload,
+                                    });
+                                }
+                            }
+                            if (items.length === 0) {
+                                return (
+                                    <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                                        {t('admin.crossStore.detail.deferred.empty', 'No deferred operator actions.')}
+                                    </div>
+                                );
+                            }
+                            return items.map((it, i) => (
+                                <OperatorActionItem
+                                    key={`${it.kind}-${i}`}
+                                    item={it}
+                                    showTenantLink={false}
+                                    onResolved={refetch}
+                                />
+                            ));
+                        })()}
                     </div>
                 )}
 

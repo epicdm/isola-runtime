@@ -723,6 +723,14 @@ export default function Layout() {
                                 <span className="sidebar-item-text">{t('nav.crossStoreTenants', 'Cross-store tenants')}</span>
                             </NavLink>
                         )}
+                        {user && user.role === 'platform_admin' && (
+                            <NavLink to="/admin/operator-queue" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`} title={t('nav.operatorQueue', 'Operator queue')}>
+                                <span className="sidebar-item-icon" style={{ display: 'flex' }}>
+                                    <IconBell size={16} stroke={1.5} />
+                                </span>
+                                <span className="sidebar-item-text">{t('nav.operatorQueue', 'Operator queue')}</span>
+                            </NavLink>
+                        )}
                     </div>
 
                     <div className="sidebar-footer">
