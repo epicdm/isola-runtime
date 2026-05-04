@@ -57,24 +57,24 @@ export default function CrossStoreTenants() {
     const [showTest, setShowTest] = useState<boolean>(false);
 
     useEffect(() => {
-        crossStoreApi.listTenants()
+        setLoading(true);
+        crossStoreApi.listTenants(showTest)
             .then((d) => setRows(d.tenants || []))
             .catch((e: Error) => setErr(e.message))
             .finally(() => setLoading(false));
-    }, []);
+    }, [showTest]);
 
     const filtered = useMemo(() => {
         const s = search.trim().toLowerCase();
+        // Server-side already filters status in {test, archived} when showTest=false
+        // (see /api/admin/cross-store/tenants ?includeTest). Client-side just
+        // narrows the returned set by status dropdown + name search.
         return rows.filter((r) => {
-            // Default: hide test rows. Toggle "Show test tenants" to include them.
-            // Status filter (when != 'all') overrides the default test-hide because
-            // an explicit pick of 'test' in the dropdown means the user wants to see them.
-            if (!showTest && statusFilter === 'all' && r.bff.status === 'test') return false;
             if (statusFilter !== 'all' && r.bff.status !== statusFilter) return false;
             if (s && !(r.bff.businessName || '').toLowerCase().includes(s)) return false;
             return true;
         });
-    }, [rows, statusFilter, search, showTest]);
+    }, [rows, statusFilter, search]);
 
     if (user?.role !== 'platform_admin') {
         return (
@@ -123,7 +123,7 @@ export default function CrossStoreTenants() {
                         checked={showTest}
                         onChange={(e) => setShowTest(e.target.checked)}
                     />
-                    {t('admin.crossStore.showTest', 'Show test tenants')}
+                    {t('admin.crossStore.showTest', 'Show test/archived tenants')}
                 </label>
                 <span style={{ color: 'var(--text-tertiary)', fontSize: 12, marginLeft: 'auto' }}>
                     {filtered.length} / {rows.length}

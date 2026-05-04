@@ -225,8 +225,10 @@ export const adminApi = {
 // console. Auth: Bearer JWT + platform_admin. The runtime backend acts as
 // ambassador to BFF /api/internal/cross-store/* (X-Internal-Secret).
 export const crossStoreApi = {
-    listTenants: () =>
-        request<{ total: number; tenants: any[] }>('/admin/cross-store/tenants'),
+    listTenants: (includeTest = false) =>
+        request<{ total: number; tenants: any[]; hiddenCount?: number }>(
+            `/admin/cross-store/tenants${includeTest ? '?includeTest=true' : ''}`,
+        ),
 
     getTenant: (tenantId: string) =>
         request<{ bff: any; local: any | null; agents: any[] }>(
