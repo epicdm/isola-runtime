@@ -57,6 +57,10 @@ services:
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
       # Phase E.6c: shared service secret for apps/isola <-> isola-runtime
       ISOLA_INTERNAL_SECRET: ${ISOLA_INTERNAL_SECRET:-}
+      # L4 S1: shared service secret for isola-runtime -> BFF /api/internal/*
+      # outbound calls (cross-store reads of tenant_registry, etc.). Same value
+      # as bff-v2's INTERNAL_SECRET; consumer-side renamed to disambiguate.
+      BFF_INTERNAL_SECRET: ${BFF_INTERNAL_SECRET:-}
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents

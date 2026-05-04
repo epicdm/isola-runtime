@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # internal API calls (e.g. tenant-runtime-mode proxy). Blank in dev
     # disables the /api/internal/* routes so they cannot be called.
     ISOLA_INTERNAL_SECRET: str = ""
+    # L4 S1: shared service secret for outbound isola-runtime -> BFF
+    # /api/internal/* calls (cross-store reads of tenant_registry, etc.).
+    # Same value as bff-v2's INTERNAL_SECRET. Blank disables outbound BFF calls.
+    BFF_INTERNAL_SECRET: str = ""
     JWT_SECRET_KEY: str = "change-me-jwt-secret"
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
