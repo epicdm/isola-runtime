@@ -16,6 +16,8 @@ import Messages from './pages/Messages';
 import EnterpriseSettings from './pages/EnterpriseSettings';
 import InvitationCodes from './pages/InvitationCodes';
 import AdminCompanies from './pages/AdminCompanies';
+import CrossStoreTenants from './pages/admin/CrossStoreTenants';
+import CrossStoreTenantDetail from './pages/admin/CrossStoreTenantDetail';
 import SSOEntry from './pages/SSOEntry';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -193,6 +195,8 @@ export default function App() {
                     <Route path="enterprise" element={<EnterpriseSettings />} />
                     <Route path="invitations" element={<InvitationCodes />} />
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
+                    <Route path="admin/companies" element={<CrossStoreTenants />} />
+                    <Route path="admin/companies/:tenantId" element={<CrossStoreTenantDetail />} />
                 </Route>
             </Routes>
         </>

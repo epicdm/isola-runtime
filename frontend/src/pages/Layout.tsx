@@ -715,6 +715,14 @@ export default function Layout() {
                                 <span className="sidebar-item-text">{t('nav.platformSettings', 'Platform Settings')}</span>
                             </NavLink>
                         )}
+                        {user && user.role === 'platform_admin' && (
+                            <NavLink to="/admin/companies" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`} title={t('nav.crossStoreTenants', 'Cross-store tenants')}>
+                                <span className="sidebar-item-icon" style={{ display: 'flex' }}>
+                                    <IconBuilding size={16} stroke={1.5} />
+                                </span>
+                                <span className="sidebar-item-text">{t('nav.crossStoreTenants', 'Cross-store tenants')}</span>
+                            </NavLink>
+                        )}
                     </div>
 
                     <div className="sidebar-footer">

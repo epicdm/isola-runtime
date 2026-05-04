@@ -220,6 +220,20 @@ export const adminApi = {
         request<any>('/admin/platform-settings', { method: 'PUT', body: JSON.stringify(data) }),
 };
 
+// ─── Cross-store admin (L4) ───────────────────────────
+// Aggregates BFF tenant_registry + local Clawith tenants for the operator
+// console. Auth: Bearer JWT + platform_admin. The runtime backend acts as
+// ambassador to BFF /api/internal/cross-store/* (X-Internal-Secret).
+export const crossStoreApi = {
+    listTenants: () =>
+        request<{ total: number; tenants: any[] }>('/admin/cross-store/tenants'),
+
+    getTenant: (tenantId: string) =>
+        request<{ bff: any; local: any | null; agents: any[] }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}`,
+        ),
+};
+
 // ─── Agents ───────────────────────────────────────────
 export const agentApi = {
     list: (tenantId?: string) => request<Agent[]>(`/agents/${tenantId ? `?tenant_id=${tenantId}` : ''}`),
