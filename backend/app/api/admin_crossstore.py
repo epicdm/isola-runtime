@@ -18,6 +18,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,7 +44,7 @@ def _bff_slug(tenant_id: str) -> str:
     return f"iso-{_slugify_external(tenant_id)}"
 
 
-async def _bff_get(path: str) -> dict:
+def _bff_config() -> tuple[str, dict[str, str]]:
     settings = get_settings()
     base = (settings.BFF_API_BASE_URL or "").rstrip("/")
     secret = settings.BFF_INTERNAL_SECRET
@@ -52,7 +53,11 @@ async def _bff_get(path: str) -> dict:
             status_code=503,
             detail="BFF outbound not configured (BFF_API_BASE_URL / BFF_INTERNAL_SECRET)",
         )
-    headers = {"x-internal-secret": secret}
+    return base, {"x-internal-secret": secret}
+
+
+async def _bff_get(path: str) -> dict:
+    base, headers = _bff_config()
     try:
         async with httpx.AsyncClient(timeout=_BFF_TIMEOUT_SECONDS) as client:
             r = await client.get(f"{base}{path}", headers=headers)
@@ -63,6 +68,21 @@ async def _bff_get(path: str) -> dict:
     if r.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"BFF GET {path}: HTTP {r.status_code}")
     return r.json()
+
+
+async def _bff_post(path: str, body: dict) -> tuple[int, dict]:
+    base, headers = _bff_config()
+    headers = {**headers, "content-type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=_BFF_TIMEOUT_SECONDS) as client:
+            r = await client.post(f"{base}{path}", headers=headers, json=body)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"BFF unreachable: {type(e).__name__}: {e}")
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text[:200]}
+    return r.status_code, data
 
 
 def _local_tenant_view(t: Tenant) -> dict[str, Any]:
@@ -162,3 +182,41 @@ async def get_cross_store_tenant(
         agents = [_agent_view(a) for a in agents_q.scalars().all()]
 
     return {"bff": bff_row, "local": local_view, "agents": agents}
+
+
+# ─── Operator queue ─────────────────────────────────────────────────
+
+@router.get("/operator-queue")
+async def list_operator_queue(
+    current_user: User = Depends(require_role("platform_admin")),
+) -> dict[str, Any]:
+    """Flattened deferredOperatorActions across all tenants. No status
+    filter — the queue is the operator's daily-work surface and shouldn't
+    hide actionable items even on test rows."""
+    return await _bff_get("/api/internal/cross-store/operator-queue")
+
+
+# ─── Resolve action ─────────────────────────────────────────────────
+
+class ResolveActionBody(BaseModel):
+    actionKind: str
+    resolutionPayload: Any | None = None
+
+
+@router.post("/tenants/{tenant_id}/resolve-action")
+async def resolve_action(
+    tenant_id: UUID,
+    body: ResolveActionBody,
+    current_user: User = Depends(require_role("platform_admin")),
+) -> dict[str, Any]:
+    bff_body: dict[str, Any] = {"actionKind": body.actionKind}
+    if body.resolutionPayload is not None:
+        bff_body["resolutionPayload"] = body.resolutionPayload
+    status, data = await _bff_post(
+        f"/api/internal/cross-store/tenants/{tenant_id}/resolve-action",
+        bff_body,
+    )
+    if status >= 400:
+        # Surface BFF's error verbatim (400/404/409 are all caller-actionable)
+        raise HTTPException(status_code=status, detail=data.get("error", "BFF resolve-action failed"))
+    return data
