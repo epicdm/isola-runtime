@@ -80,6 +80,10 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     registration_source: Mapped[str | None] = mapped_column(String(50), default="web")
+    
+    # L4 S7 R39 (2026-05-05): soft-delete lifecycle (mirrors agents pattern)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

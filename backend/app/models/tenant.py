@@ -26,6 +26,9 @@ class Tenant(Base):
     im_config: Mapped[dict | None] = mapped_column(JSON, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # L4 S7 R39 (2026-05-05): soft-delete lifecycle (mirrors agents pattern)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     # Default quotas for new users
     default_message_limit: Mapped[int] = mapped_column(Integer, default=50)

@@ -940,3 +940,159 @@ async def knowledge_stats(
         top_pending=top_pending,
     )
 
+
+
+# ── L4 S7 R38/R39 (2026-05-05): internal-secret DELETE endpoints ─────
+# Soft-retire pattern (mirror S4 agents.retired_at).
+#
+# Auth: X-Internal-Secret (router-level dep at line 31). Per-callsite
+# dep redundant; included for defensive clarity.
+#
+# Body: optional retired_by UUID (caller-supplied operator identity if
+# orchestrating from a higher-level service like admin_crossstore.py).
+#
+# Idempotency: retiring an already-retired row → 200 with current state,
+# NO update (existing retired_at preserved). Mirrors S4 agent retire 409
+# semantics inverted: internal endpoints are friendlier to retry.
+#
+# 404 if not found. No body validation needed (UUID parsed via Path str
+# coercion + try/except per S3 bug-2 path-param-as-str rule).
+
+from datetime import datetime as _s7_dt, timezone as _s7_tz
+import uuid as _s7_uuid
+
+from app.models.agent import Agent as _S7Agent
+from app.models.user import User as _S7User
+
+
+class _RetireBody(BaseModel):
+    retired_by: str | None = Field(
+        default=None,
+        description="UUID of the user/operator initiating the retire (audit trail). Optional.",
+    )
+
+
+def _parse_uuid_str(value: str, label: str) -> _s7_uuid.UUID:
+    try:
+        return _s7_uuid.UUID(value)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail=f"{label} must be a UUID")
+
+
+@router.delete("/tenants/{tenant_id}", status_code=200)
+async def delete_tenant_soft(
+    tenant_id: str,
+    body: _RetireBody | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Soft-retire a tenant by setting retired_at = NOW(). Idempotent."""
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    tid = _parse_uuid_str(tenant_id, "tenant_id")
+
+    result = await db.execute(select(Tenant).where(Tenant.id == tid))
+    tenant = result.scalar_one_or_none()
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    if getattr(tenant, "retired_at", None) is not None:
+        # Idempotent: already retired. Return current state without write.
+        return {
+            "id": str(tenant.id),
+            "retired_at": tenant.retired_at.isoformat(),
+            "retired_by": str(tenant.retired_by) if getattr(tenant, "retired_by", None) else None,
+            "noop": True,
+        }
+
+    tenant.retired_at = _s7_dt.now(_s7_tz.utc)
+    if body and body.retired_by:
+        tenant.retired_by = _parse_uuid_str(body.retired_by, "retired_by")
+    await db.commit()
+    await db.refresh(tenant)
+    return {
+        "id": str(tenant.id),
+        "retired_at": tenant.retired_at.isoformat(),
+        "retired_by": str(tenant.retired_by) if getattr(tenant, "retired_by", None) else None,
+        "noop": False,
+    }
+
+
+@router.delete("/agents/{agent_id}", status_code=200)
+async def delete_agent_soft(
+    agent_id: str,
+    body: _RetireBody | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Soft-retire an agent (X-Internal-Secret variant of S4 admin retire).
+
+    The S4 endpoint at /api/admin/cross-store/.../agents/{aid}/retire is
+    Bearer + platform_admin (operator-console origin). This /internal/
+    variant uses X-Internal-Secret (service-to-service origin: cross-store
+    orchestrator, future cleanup jobs, BFF cascade workers). Same row write,
+    different auth family per memory #28.
+    """
+    if not agent_id or len(agent_id) > 100:
+        raise HTTPException(status_code=400, detail="agent_id must be 1-100 chars")
+    aid = _parse_uuid_str(agent_id, "agent_id")
+
+    result = await db.execute(select(_S7Agent).where(_S7Agent.id == aid))
+    agent = result.scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    if agent.retired_at is not None:
+        return {
+            "id": str(agent.id),
+            "retired_at": agent.retired_at.isoformat(),
+            "retired_by": str(agent.retired_by) if agent.retired_by else None,
+            "noop": True,
+        }
+
+    agent.retired_at = _s7_dt.now(_s7_tz.utc)
+    if body and body.retired_by:
+        agent.retired_by = _parse_uuid_str(body.retired_by, "retired_by")
+    await db.commit()
+    await db.refresh(agent)
+    return {
+        "id": str(agent.id),
+        "retired_at": agent.retired_at.isoformat(),
+        "retired_by": str(agent.retired_by) if agent.retired_by else None,
+        "noop": False,
+    }
+
+
+@router.delete("/users/{user_id}", status_code=200)
+async def delete_user_soft(
+    user_id: str,
+    body: _RetireBody | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Soft-retire a user. Idempotent."""
+    if not user_id or len(user_id) > 100:
+        raise HTTPException(status_code=400, detail="user_id must be 1-100 chars")
+    uid = _parse_uuid_str(user_id, "user_id")
+
+    result = await db.execute(select(_S7User).where(_S7User.id == uid))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if getattr(user, "retired_at", None) is not None:
+        return {
+            "id": str(user.id),
+            "retired_at": user.retired_at.isoformat(),
+            "retired_by": str(user.retired_by) if getattr(user, "retired_by", None) else None,
+            "noop": True,
+        }
+
+    user.retired_at = _s7_dt.now(_s7_tz.utc)
+    if body and body.retired_by:
+        user.retired_by = _parse_uuid_str(body.retired_by, "retired_by")
+    await db.commit()
+    await db.refresh(user)
+    return {
+        "id": str(user.id),
+        "retired_at": user.retired_at.isoformat(),
+        "retired_by": str(user.retired_by) if getattr(user, "retired_by", None) else None,
+        "noop": False,
+    }

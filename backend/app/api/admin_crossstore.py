@@ -1443,3 +1443,159 @@ async def delete_agent_channel(
     ))
     await db.commit()
     return Response(status_code=204)
+
+
+# ── L4 S7 R42 (2026-05-05): cross-store tenant retire orchestrator ───
+# DELETE /api/admin/cross-store/tenants/{tenant_id}
+#
+# Operator-driven retire across 3 stores. Sequence (R42):
+#   1. Paperclip POST /api/companies/{cid}/archive  (memory: archive not DELETE
+#      for company lifecycle)
+#   2. Clawith soft-retire: tenants.retired_at = NOW(); retired_by = operator
+#   3. BFF NULL clawithTenantId via /api/internal/cross-store/tenants/{tid}/unlink-clawith
+#   4. Audit row platform_admin.tenant_retire (only on full success)
+#
+# Failure semantics: 409 with envelope
+#   { error: "partial_state", succeeded: [...], failed: <step>, details: <reason> }
+# Caller can retry — each step is idempotent so re-runs no-op the
+# already-completed work and re-attempt the failing step.
+#
+# Idempotency on full retry of already-fully-retired tenant:
+#   Paperclip archive: assumed idempotent server-side (POST /:id/archive on
+#     archived row → 200 ok or 409 already-archived; we treat 409 as success
+#     since the desired end state holds).
+#   Clawith retire: noop branch (existing retired_at preserved).
+#   BFF unlink-clawith: noop branch (already-NULL handled in route).
+#   Audit row: written on every successful run (intentional — preserves
+#     per-retry timestamp trail).
+
+from app.services.paperclip_client import _request_json as _pcp_request_json
+
+
+@router.delete("/tenants/{tenant_id}", status_code=200)
+async def retire_cross_store_tenant(
+    tenant_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Cross-store soft-retire orchestrator (R42 sequence)."""
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+
+    bff_row, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+    paperclip_company_id = bff_row.get("paperclipCompanyId")
+
+    succeeded: list[str] = []
+
+    # ── Step 1: Paperclip archive (memory: POST /:id/archive, NOT DELETE) ──
+    if paperclip_company_id:
+        try:
+            await _pcp_request_json("POST", f"/api/companies/{paperclip_company_id}/archive")
+            succeeded.append("paperclip_archive")
+        except PaperclipUnreachable as e:
+            msg = str(e)
+            # Treat "already archived" (Paperclip returns 409 in this shape) as success
+            if "HTTP 409" in msg or "already archived" in msg.lower():
+                succeeded.append("paperclip_archive_already")
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "partial_state",
+                        "succeeded": succeeded,
+                        "failed": "paperclip_archive",
+                        "details": msg[:300],
+                    },
+                )
+    else:
+        # No Paperclip linkage on this BFF row — explicit skip marker for audit.
+        succeeded.append("paperclip_skipped_no_linkage")
+
+    # ── Step 2: Clawith soft-retire (table-direct since admin_crossstore is Clawith) ──
+    try:
+        result = await db.execute(select(Tenant).where(Tenant.id == clawith_uuid))
+        tenant = result.scalar_one_or_none()
+        if tenant is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "partial_state",
+                    "succeeded": succeeded,
+                    "failed": "clawith_retire",
+                    "details": f"Clawith tenant {clawith_uuid} not found",
+                },
+            )
+        if getattr(tenant, "retired_at", None) is None:
+            tenant.retired_at = _datetime.now(_timezone.utc)
+            tenant.retired_by = current_user.id
+            await db.commit()
+            await db.refresh(tenant)
+            succeeded.append("clawith_retire")
+        else:
+            succeeded.append("clawith_retire_already")
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "partial_state",
+                "succeeded": succeeded,
+                "failed": "clawith_retire",
+                "details": f"{type(e).__name__}: {str(e)[:300]}",
+            },
+        )
+
+    # ── Step 3: BFF NULL clawithTenantId via internal route ──────────────
+    try:
+        bff_status, bff_data = await _bff_post(
+            f"/api/internal/cross-store/tenants/{tenant_id}/unlink-clawith",
+            {},
+        )
+        if bff_status >= 400:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "partial_state",
+                    "succeeded": succeeded,
+                    "failed": "bff_unlink_clawith",
+                    "details": (bff_data.get("error") if isinstance(bff_data, dict) else str(bff_data))[:300],
+                },
+            )
+        succeeded.append(
+            "bff_unlink_clawith_already" if bff_data.get("noop") else "bff_unlink_clawith"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "partial_state",
+                "succeeded": succeeded,
+                "failed": "bff_unlink_clawith",
+                "details": f"{type(e).__name__}: {str(e)[:300]}",
+            },
+        )
+
+    # ── Step 4: Audit row (only on full success) ──────────────────────────
+    db.add(AuditLog(
+        user_id=current_user.id,
+        action="platform_admin.tenant_retire",
+        details={
+            "bff_tenant_id": tenant_id,
+            "paperclip_company_id": paperclip_company_id,
+            "clawith_tenant_id": str(clawith_uuid),
+            "succeeded_steps": succeeded,
+        },
+    ))
+    await db.commit()
+
+    return {
+        "bff_tenant_id": tenant_id,
+        "paperclip_company_id": paperclip_company_id,
+        "clawith_tenant_id": str(clawith_uuid),
+        "retired": True,
+        "succeeded_steps": succeeded,
+    }
