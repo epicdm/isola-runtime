@@ -473,8 +473,8 @@ export default function CrossStoreTenantDetail() {
                     paperclipCompanyId={bff.paperclipCompanyId ?? null}
                     clawithTenantId={bff.clawithTenantId ?? null}
                     businessName={bff.businessName || tenantId}
-                    onClose={() => setRetireOpen(false)}
-                    onRetired={() => { setRetireOpen(false); refetch(); }}
+                    onClose={() => { setRetireOpen(false); refetch(); }}
+                    onRetired={undefined /* refetch happens on close so success state is fully visible */}
                 />
             )}
         </div>
