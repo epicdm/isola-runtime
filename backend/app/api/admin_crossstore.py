@@ -738,3 +738,708 @@ async def put_agent_skills(
         "tenant_id": tenant_id,
         "source": "paperclip",
     }
+
+
+# ── S6 R28-revised + R34 + R35 + R36 (2026-05-04 night): policy + channels ──
+# 6 endpoints under /api/admin/cross-store/tenants/{tid}/agents/{aid}:
+#   GET    /policy             — assembled state with 9-key autonomy + badges
+#   PATCH  /policy             — autonomy + escalation_keywords (table-direct DB write)
+#   GET    /channels           — list ChannelConfig rows (table-direct, R34)
+#   POST   /channels           — dispatch to per-channel handler (R34, R36 plaintext)
+#   PATCH  /channels/{cid}     — conditional dispatch (R34, R36 plaintext)
+#   DELETE /channels/{cid}     — table-direct (R34)
+#
+# R36: encryption deferred to W2-HW pre-launch gate. Phase 1 stores plaintext
+# at rest. Per-channel handlers (slack.py / discord_bot.py / teams.py /
+# whatsapp.py) UNTOUCHED — read paths unchanged.
+#
+# R35: 9-key autonomy whitelist with per-key enforcement_status badge.
+# Map-only orphans (web_search, execute_code, send_feishu_message) NEVER exposed.
+
+import json as _json
+import re as _re
+
+from fastapi import Request, Response
+from app.models.channel_config import ChannelConfig
+
+
+# 9-key autonomy whitelist (R35). Source: agents.autonomy_policy schema default
+# in app/models/agent.py line 76. access_business_system splits into _read + _write
+# (NOT 8 keys as v1.0 plan body claimed; corrected to 9 per probe surface).
+_AUTONOMY_KEY_WHITELIST = (
+    "write_workspace_files",
+    "delete_files",
+    "read_files",
+    "send_external_message",
+    "modify_soul",
+    "access_business_system_read",
+    "access_business_system_write",
+    "create_calendar_event",
+    "financial_operations",
+)
+
+# Wave-1 enforcement reality (R35): only these 2 keys actually gate via
+# _TOOL_AUTONOMY_MAP in agent_tools.py:1309. The other 7 are scaffolded —
+# saved + persisted but no tool currently checks them.
+_AUTONOMY_ENFORCED_WAVE1 = frozenset(("write_workspace_files", "delete_files"))
+
+_AUTONOMY_VALUES = ("L1", "L2", "L3")
+
+# Hard limits per R31
+_ESCAL_MAX_KEYWORDS = 50
+_ESCAL_MAX_CHAR = 100
+
+
+# In-memory idempotency cache for PATCH /policy (60s TTL, S5 R23 pattern).
+# Module-level dict; lost on container restart (Wave-1 single-operator acceptable).
+_POLICY_IDEMPOTENCY: dict[tuple[str, str], tuple[dict, float]] = {}
+_POLICY_IDEMPOTENCY_TTL = 60.0
+
+
+def _policy_idemp_get(agent_id: str, body_sha: str) -> dict | None:
+    entry = _POLICY_IDEMPOTENCY.get((agent_id, body_sha))
+    if entry is None:
+        return None
+    response, ts = entry
+    if _time.time() - ts > _POLICY_IDEMPOTENCY_TTL:
+        _POLICY_IDEMPOTENCY.pop((agent_id, body_sha), None)
+        return None
+    return response
+
+
+def _policy_idemp_put(agent_id: str, body_sha: str, response: dict) -> None:
+    _POLICY_IDEMPOTENCY[(agent_id, body_sha)] = (response, _time.time())
+    now = _time.time()
+    stale = [k for k, (_, t) in _POLICY_IDEMPOTENCY.items() if now - t > _POLICY_IDEMPOTENCY_TTL]
+    for k in stale:
+        _POLICY_IDEMPOTENCY.pop(k, None)
+
+
+# ── Channel dispatch table (R34) ─────────────────────────────────────────
+# Maps channel_type → (per-channel POST URL suffix, body adapter).
+# Per-channel handlers live at /api/agents/{aid}/<type>-channel.
+# is_agent_creator (line 57 of permissions.py) treats platform_admin as creator,
+# so admin's Bearer pass-through is accepted by per-channel handlers without
+# touching their auth. R36 forbids touching slack.py / discord_bot.py /
+# teams.py / whatsapp.py read paths — dispatch via HTTP self-call is the
+# zero-touch pattern.
+
+_HANDLER_HOST = "http://127.0.0.1:8000"  # uvicorn binds 8000 inside container
+                                          # (host port 8800 maps to 8000)
+
+
+def _shape_slack_body(body: "ChannelMutateBody") -> dict:
+    """Slack handler expects {bot_token, signing_secret}.
+    Admin generic body uses app_secret + extra_config.signing_secret."""
+    return {
+        "bot_token": (body.app_secret or "").strip(),
+        "signing_secret": ((body.extra_config or {}).get("signing_secret") or "").strip(),
+    }
+
+
+def _shape_discord_body(body: "ChannelMutateBody") -> dict:
+    """Discord handler expects {connection_mode, bot_token, application_id, public_key}.
+    Admin app_id → application_id; extra_config carries connection_mode + public_key."""
+    extra = body.extra_config or {}
+    return {
+        "connection_mode": (extra.get("connection_mode") or "webhook").strip(),
+        "bot_token": (body.app_secret or "").strip(),
+        "application_id": (body.app_id or "").strip(),
+        "public_key": (extra.get("public_key") or "").strip(),
+    }
+
+
+def _shape_teams_body(body: "ChannelMutateBody") -> dict:
+    """Teams handler expects {app_id, app_secret, tenant_id?, use_managed_identity?}."""
+    extra = body.extra_config or {}
+    return {
+        "app_id": (body.app_id or "").strip(),
+        "app_secret": (body.app_secret or "").strip(),
+        "tenant_id": (extra.get("tenant_id") or "").strip(),
+        "use_managed_identity": bool(extra.get("use_managed_identity") or False),
+    }
+
+
+def _shape_whatsapp_body(body: "ChannelMutateBody") -> dict:
+    """WA handler expects {phone_number_id, waba_id, access_token, verify_token, app_secret}.
+    All live in extra_config; admin-layer body.app_secret seeds extra_config.app_secret too."""
+    extra = body.extra_config or {}
+    return {
+        "phone_number_id": (extra.get("phone_number_id") or "").strip(),
+        "waba_id": (extra.get("waba_id") or "").strip(),
+        "access_token": (extra.get("access_token") or "").strip(),
+        "verify_token": (extra.get("verify_token") or "").strip(),
+        "app_secret": (extra.get("app_secret") or body.app_secret or "").strip(),
+    }
+
+
+# Order of registration matches the 4 channel_type enum values.
+# Adding a new channel_type requires: (a) new per-channel handler in
+# app/api/<type>.py, (b) new entry here. Until both exist, POST 422s.
+_DISPATCH_TABLE: dict[str, tuple[str, callable]] = {
+    "slack":           ("slack-channel",     _shape_slack_body),
+    "discord":         ("discord-channel",   _shape_discord_body),
+    "microsoft_teams": ("teams-channel",     _shape_teams_body),
+    "whatsapp":        ("whatsapp-channel",  _shape_whatsapp_body),
+}
+
+
+async def _dispatch_to_channel_handler(
+    channel_type: str,
+    agent_id: str,
+    handler_body: dict,
+    auth_header: str,
+) -> tuple[int, dict]:
+    """HTTP self-call to per-channel POST handler. Forwards Bearer; returns
+    (status, body). Caller has already validated channel_type ∈ dispatch table."""
+    suffix, _ = _DISPATCH_TABLE[channel_type]
+    url = f"{_HANDLER_HOST}/api/agents/{agent_id}/{suffix}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, json=handler_body, headers={"authorization": auth_header})
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"detail": (r.text or "")[:300]}
+
+
+def _validate_channel_id(channel_id: str) -> _uuidlib.UUID:
+    if not channel_id or len(channel_id) > 100:
+        raise HTTPException(status_code=400, detail="channel_id must be 1-100 chars")
+    try:
+        return _uuidlib.UUID(channel_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="channel_id must be a UUID")
+
+
+# ── NULL agent.tenant_id → 409 helper (R35 plan finding) ──────────────────
+async def _resolve_agent_for_policy(
+    tenant_id: str, agent_id: str, db: AsyncSession,
+) -> tuple[Agent, UUID, dict]:
+    """Verify tenant_registry → clawith UUID → agent row. Returns
+    (agent, clawith_uuid, bff_row). Raises:
+      - 400 on malformed agent_id or tenant_id
+      - 404 on tenant not found OR agent not found OR agent not under tenant
+      - 409 on agent.tenant_id IS NULL (legacy/orphan agent per pre-flight finding)
+      - 409 on tenant has no clawithTenantId (S4 carry)
+    """
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    aid = _validate_agent_id(agent_id)
+    bff_row, clawith_uuid = await _resolve_clawith_tenant_id(tenant_id)
+
+    result = await db.execute(select(Agent).where(Agent.id == aid))
+    agent = result.scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.tenant_id is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "agent_not_clawith_managed", "agent_id": agent_id},
+        )
+    if agent.tenant_id != clawith_uuid:
+        raise HTTPException(status_code=404, detail="Agent not found under this tenant")
+    return agent, clawith_uuid, bff_row
+
+
+# ── SOUL frontmatter parser (lightweight, no PyYAML dep) ──────────────────
+# Frontmatter delimiter: leading "---\n...\n---" block. Extracts hours_*
+# fields if present. Returns None when no frontmatter or no hours fields.
+_SOUL_FRONTMATTER_RE = _re.compile(r"^---\s*\n(.*?)\n---", _re.DOTALL)
+
+
+def _parse_soul_business_hours(content: str | None) -> dict | None:
+    if not content:
+        return None
+    m = _SOUL_FRONTMATTER_RE.search(content)
+    if not m:
+        return None
+    fm = m.group(1)
+    out: dict[str, str] = {}
+    for line in fm.split("\n"):
+        line = line.strip()
+        if not line or ":" not in line or line.startswith("#"):
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k in ("hours_weekday", "hours_saturday", "hours_sunday"):
+            out[k] = v
+    if not out:
+        return None
+    return {"source": "soul.md", **out}
+
+
+# ── Channel binding view from BFF tenant_registry row ────────────────────
+def _channel_binding_view(bff_row: dict) -> dict:
+    """Extract WA + voice binding fields from BFF tenant_registry row.
+    voice section omitted (None) when neither magnusDidId nor didNumber set."""
+    wa = {
+        k: bff_row.get(k)
+        for k in (
+            "whatsappStatus", "displayPhone", "waPhoneNumberId", "wabaId",
+            "ownerPhone", "didNumber", "magnusDidId",
+            "waProvisioningJobId", "waProvisioningState", "whatsappActivatedAt",
+        )
+    }
+    voice_keys = {k: bff_row.get(k) for k in ("magnusDidId", "didNumber") if bff_row.get(k)}
+    voice = voice_keys if voice_keys else None
+    return {"whatsapp": wa, "voice": voice}
+
+
+# ── Autonomy view: filter to whitelist + add per-key enforcement badge ────
+def _autonomy_view(autonomy_policy: dict | None) -> dict:
+    """R35 envelope: 9-key list filtered + per-key enforcement_status badge.
+    Map-only orphans NEVER exposed. Default value = 'L2' per autonomy_service:51."""
+    policy = autonomy_policy or {}
+    keys = []
+    for k in _AUTONOMY_KEY_WHITELIST:
+        v = policy.get(k, "L2")
+        if v not in _AUTONOMY_VALUES:
+            v = "L2"
+        keys.append({
+            "key": k,
+            "value": v,
+            "enforcement_status": "enforced" if k in _AUTONOMY_ENFORCED_WAVE1 else "scaffolded",
+        })
+    return {"keys": keys}
+
+
+# ── /policy endpoints ─────────────────────────────────────────────────────
+
+
+@router.get("/tenants/{tenant_id}/agents/{agent_id}/policy")
+async def get_agent_policy(
+    tenant_id: str,
+    agent_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent, _, bff_row = await _resolve_agent_for_policy(tenant_id, agent_id, db)
+
+    business_hours = None
+    if agent.paperclip_agent_id:
+        try:
+            content = await fetch_paperclip_soul(agent.paperclip_agent_id)
+            if content is None:
+                # runtimeConfig.soul not hydrated; fall back to bundle file (S5 pattern)
+                try:
+                    body_resp = await _pcp_get_json(
+                        f"/api/agents/{agent.paperclip_agent_id}/instructions-bundle/file?path=SOUL.md"
+                    )
+                    content = body_resp.get("content") or ""
+                except PaperclipUnreachable:
+                    content = None
+            if content:
+                business_hours = _parse_soul_business_hours(content)
+        except PaperclipUnreachable:
+            business_hours = None
+
+    return {
+        "autonomy_policy": _autonomy_view(agent.autonomy_policy),
+        "escalation_keywords": list(agent.escalation_keywords or []),
+        "channel_binding": _channel_binding_view(bff_row),
+        "business_hours_readonly": business_hours,
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+    }
+
+
+class PolicyPatchBody(BaseModel):
+    autonomy_policy: dict[str, str] | None = None
+    escalation_keywords: list[str] | None = None
+
+
+@router.patch("/tenants/{tenant_id}/agents/{agent_id}/policy")
+async def patch_agent_policy(
+    tenant_id: str,
+    agent_id: str,
+    body: PolicyPatchBody,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if body.autonomy_policy is None and body.escalation_keywords is None:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one of autonomy_policy or escalation_keywords is required",
+        )
+
+    agent, _, _ = await _resolve_agent_for_policy(tenant_id, agent_id, db)
+
+    if body.autonomy_policy is not None:
+        for k, v in body.autonomy_policy.items():
+            if k not in _AUTONOMY_KEY_WHITELIST:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unknown autonomy key '{k}'. Allowed: {list(_AUTONOMY_KEY_WHITELIST)}",
+                )
+            if v not in _AUTONOMY_VALUES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"autonomy value for '{k}' must be one of {list(_AUTONOMY_VALUES)}; got '{v}'",
+                )
+
+    normalized_keywords = None
+    if body.escalation_keywords is not None:
+        if len(body.escalation_keywords) > _ESCAL_MAX_KEYWORDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"escalation_keywords exceeds max {_ESCAL_MAX_KEYWORDS}",
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for kw in body.escalation_keywords:
+            if not isinstance(kw, str):
+                raise HTTPException(
+                    status_code=422,
+                    detail="escalation_keywords entries must be strings",
+                )
+            stripped = kw.strip()
+            if not stripped:
+                raise HTTPException(
+                    status_code=422,
+                    detail="escalation_keywords entries must be non-empty after strip",
+                )
+            if len(stripped) > _ESCAL_MAX_CHAR:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"escalation_keyword exceeds {_ESCAL_MAX_CHAR} chars (got {len(stripped)})",
+                )
+            lower = stripped.lower()
+            if lower in seen:
+                continue  # dedup case-insensitively, preserve first-seen casing
+            seen.add(lower)
+            out.append(stripped)
+        normalized_keywords = out
+
+    body_payload = {
+        "autonomy_policy": body.autonomy_policy,
+        "escalation_keywords": normalized_keywords,
+    }
+    body_sha = _hashlib.sha256(
+        _json.dumps(body_payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    cached = _policy_idemp_get(agent_id, body_sha)
+    if cached is not None:
+        return cached
+
+    before_autonomy = dict(agent.autonomy_policy or {})
+    before_keywords = list(agent.escalation_keywords or [])
+
+    if body.autonomy_policy is not None:
+        merged = dict(before_autonomy)
+        merged.update(body.autonomy_policy)
+        agent.autonomy_policy = merged
+    if normalized_keywords is not None:
+        agent.escalation_keywords = normalized_keywords
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        agent_id=agent.id,
+        action="platform_admin.policy_edit",
+        details={
+            "tenant_id": tenant_id,
+            "autonomy_policy_before": before_autonomy,
+            "autonomy_policy_after": dict(agent.autonomy_policy or {}),
+            "escalation_keywords_before": before_keywords,
+            "escalation_keywords_after": list(agent.escalation_keywords or []),
+        },
+    ))
+    await db.commit()
+    await db.refresh(agent)
+
+    response = {
+        "autonomy_policy": _autonomy_view(agent.autonomy_policy),
+        "escalation_keywords": list(agent.escalation_keywords or []),
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+        "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
+    }
+    _policy_idemp_put(agent_id, body_sha, response)
+    return response
+
+
+# ── /channels endpoints ──────────────────────────────────────────────────
+
+
+def _channel_view(c: ChannelConfig) -> dict:
+    """ChannelConfig → safe response dict. NEVER includes app_secret /
+    encrypt_key / verification_token / extra_config (R36 stores plaintext
+    but security policy still bars surfacing creds to API consumers).
+    display_name lives in extra_config['display_name'] (no schema column)."""
+    extra = c.extra_config or {}
+    return {
+        "channel_id": str(c.id),
+        "channel_type": c.channel_type,
+        "is_configured": bool(c.is_configured),
+        "is_connected": bool(c.is_connected),
+        "display_name": extra.get("display_name"),
+        "app_id": c.app_id,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+    }
+
+
+@router.get("/tenants/{tenant_id}/agents/{agent_id}/channels")
+async def list_agent_channels(
+    tenant_id: str,
+    agent_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    agent, _, _ = await _resolve_agent_for_policy(tenant_id, agent_id, db)
+    result = await db.execute(
+        select(ChannelConfig)
+        .where(ChannelConfig.agent_id == agent.id)
+        .order_by(ChannelConfig.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return {
+        "agent_id": agent_id,
+        "tenant_id": tenant_id,
+        "channels": [_channel_view(c) for c in rows],
+        "supported_channel_types": list(_DISPATCH_TABLE.keys()),
+    }
+
+
+class ChannelMutateBody(BaseModel):
+    channel_type: str | None = None         # required for POST; ignored for PATCH
+    display_name: str | None = None
+    app_id: str | None = None
+    app_secret: str | None = None
+    extra_config: dict | None = None
+    is_connected: bool | None = None
+
+
+@router.post("/tenants/{tenant_id}/agents/{agent_id}/channels", status_code=201)
+async def create_agent_channel(
+    tenant_id: str,
+    agent_id: str,
+    body: ChannelMutateBody,
+    request: Request,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    if not body.channel_type:
+        raise HTTPException(status_code=422, detail="channel_type is required")
+    if body.channel_type not in _DISPATCH_TABLE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unsupported_channel_type",
+                "channel_type": body.channel_type,
+                "supported": list(_DISPATCH_TABLE.keys()),
+                "message": (
+                    f"channel_type '{body.channel_type}' not yet supported in this Wave-1 build "
+                    f"(no per-channel handler registered)"
+                ),
+            },
+        )
+    if body.display_name is not None and len(body.display_name) > 100:
+        raise HTTPException(status_code=422, detail="display_name max 100 chars")
+
+    agent, _, _ = await _resolve_agent_for_policy(tenant_id, agent_id, db)
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    _, shaper = _DISPATCH_TABLE[body.channel_type]
+    handler_body = shaper(body)
+    status_code, handler_resp = await _dispatch_to_channel_handler(
+        body.channel_type, agent_id, handler_body, auth_header,
+    )
+    if status_code not in (200, 201):
+        raise HTTPException(
+            status_code=status_code if status_code in (400, 401, 403, 404, 422) else 502,
+            detail={
+                "error": "per_channel_handler_rejected",
+                "channel_type": body.channel_type,
+                "handler_status": status_code,
+                "handler_detail": handler_resp.get("detail") if isinstance(handler_resp, dict) else None,
+            },
+        )
+
+    # Re-fetch row to get the channel_id assigned by the per-channel handler,
+    # then patch display_name into extra_config (handlers don't accept display_name).
+    result = await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.agent_id == agent.id,
+            ChannelConfig.channel_type == body.channel_type,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "handler_succeeded_but_no_row",
+                "channel_type": body.channel_type,
+                "handler_status": status_code,
+            },
+        )
+    if body.display_name is not None:
+        merged_extra = dict(row.extra_config or {})
+        merged_extra["display_name"] = body.display_name
+        row.extra_config = merged_extra
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        agent_id=agent.id,
+        action="platform_admin.channel_create",
+        details={
+            "tenant_id": tenant_id,
+            "channel_id": str(row.id),
+            "channel_type": body.channel_type,
+            "app_id": body.app_id,                    # identifier, not credential
+            "display_name": body.display_name,        # operator label, not credential
+            # NEVER log app_secret, extra_config (creds), encrypt_key, etc.
+        },
+    ))
+    await db.commit()
+    await db.refresh(row)
+    return _channel_view(row)
+
+
+@router.patch("/tenants/{tenant_id}/agents/{agent_id}/channels/{channel_id}")
+async def patch_agent_channel(
+    tenant_id: str,
+    agent_id: str,
+    channel_id: str,
+    body: ChannelMutateBody,
+    request: Request,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    cid = _validate_channel_id(channel_id)
+    if body.display_name is not None and len(body.display_name) > 100:
+        raise HTTPException(status_code=422, detail="display_name max 100 chars")
+
+    agent, _, _ = await _resolve_agent_for_policy(tenant_id, agent_id, db)
+
+    result = await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.id == cid,
+            ChannelConfig.agent_id == agent.id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Channel config not found under this agent")
+
+    has_credential_change = body.app_secret is not None or body.extra_config is not None
+    has_metadata_change = body.display_name is not None or body.is_connected is not None
+    if not has_credential_change and not has_metadata_change:
+        raise HTTPException(
+            status_code=422,
+            detail="At least one of display_name, is_connected, app_secret, or extra_config required",
+        )
+
+    fields_changed: list[str] = []
+
+    if has_credential_change:
+        # Dispatch to per-channel handler (re-validates with channel API + writes plaintext).
+        # Use the row's existing channel_type (operator can't change channel_type via PATCH).
+        if row.channel_type not in _DISPATCH_TABLE:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "unsupported_channel_type_for_patch",
+                    "channel_type": row.channel_type,
+                },
+            )
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header:
+            raise HTTPException(status_code=401, detail="Missing Authorization header")
+        # PATCH-shaped body fills in current values for fields not provided so the
+        # per-channel handler's required-field validation passes.
+        existing_extra = dict(row.extra_config or {})
+        merged_for_dispatch = ChannelMutateBody(
+            channel_type=row.channel_type,
+            app_id=body.app_id if body.app_id is not None else row.app_id,
+            app_secret=body.app_secret if body.app_secret is not None else row.app_secret,
+            extra_config={**existing_extra, **(body.extra_config or {})},
+        )
+        _, shaper = _DISPATCH_TABLE[row.channel_type]
+        handler_body = shaper(merged_for_dispatch)
+        status_code, handler_resp = await _dispatch_to_channel_handler(
+            row.channel_type, agent_id, handler_body, auth_header,
+        )
+        if status_code not in (200, 201):
+            raise HTTPException(
+                status_code=status_code if status_code in (400, 401, 403, 404, 422) else 502,
+                detail={
+                    "error": "per_channel_handler_rejected",
+                    "channel_type": row.channel_type,
+                    "handler_status": status_code,
+                    "handler_detail": handler_resp.get("detail") if isinstance(handler_resp, dict) else None,
+                },
+            )
+        if body.app_secret is not None:
+            fields_changed.append("app_secret")
+        if body.extra_config is not None:
+            fields_changed.append("extra_config")
+        # Re-fetch the row after handler write
+        await db.refresh(row)
+
+    if has_metadata_change:
+        if body.display_name is not None:
+            merged_extra = dict(row.extra_config or {})
+            merged_extra["display_name"] = body.display_name
+            row.extra_config = merged_extra
+            fields_changed.append("display_name")
+        if body.is_connected is not None:
+            row.is_connected = body.is_connected
+            fields_changed.append("is_connected")
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        agent_id=agent.id,
+        action="platform_admin.channel_update",
+        details={
+            "tenant_id": tenant_id,
+            "channel_id": channel_id,
+            "channel_type": row.channel_type,
+            "fields_changed": fields_changed,    # KEY NAMES only, never values
+        },
+    ))
+    await db.commit()
+    await db.refresh(row)
+    return _channel_view(row)
+
+
+@router.delete("/tenants/{tenant_id}/agents/{agent_id}/channels/{channel_id}", status_code=204)
+async def delete_agent_channel(
+    tenant_id: str,
+    agent_id: str,
+    channel_id: str,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    cid = _validate_channel_id(channel_id)
+    agent, _, _ = await _resolve_agent_for_policy(tenant_id, agent_id, db)
+
+    result = await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.id == cid,
+            ChannelConfig.agent_id == agent.id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Channel config not found under this agent")
+
+    deleted_channel_type = row.channel_type
+    await db.delete(row)
+    db.add(AuditLog(
+        user_id=current_user.id,
+        agent_id=agent.id,
+        action="platform_admin.channel_delete",
+        details={
+            "tenant_id": tenant_id,
+            "channel_id": channel_id,
+            "channel_type": deleted_channel_type,
+            "wave_2_followup": "per-channel deauth hook not yet wired; webhook subscription on channel side may persist",
+        },
+    ))
+    await db.commit()
+    return Response(status_code=204)
