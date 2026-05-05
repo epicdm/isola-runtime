@@ -94,6 +94,9 @@ def _local_tenant_view(t: Tenant) -> dict[str, Any]:
         "runtime_mode": t.runtime_mode,
         "im_provider": t.im_provider,
         "created_at": t.created_at.isoformat() if t.created_at else None,
+        # L4 S7 Phase 2 (2026-05-05): expose retired_at + retired_by for operator UI gating
+        "retired_at": getattr(t, "retired_at", None).isoformat() if getattr(t, "retired_at", None) else None,
+        "retired_by": str(getattr(t, "retired_by", None)) if getattr(t, "retired_by", None) else None,
     }
 
 

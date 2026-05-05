@@ -21,7 +21,14 @@ type Row = {
         createdAt?: string;
         ownerEmail?: string | null;
     };
-    local: { id: string; name: string; agent_count?: number } | null;
+    local: {
+        id: string;
+        name: string;
+        agent_count?: number;
+        // S7 Phase 2: surfaced from backend _local_tenant_view for retire-state filter
+        retired_at?: string | null;
+        retired_by?: string | null;
+    } | null;
 };
 
 function StatusPill({ value, kind }: { value: string | undefined; kind: 'status' | 'wa' }) {
@@ -55,6 +62,10 @@ export default function CrossStoreTenants() {
     const [statusFilter, setStatusFilter] = useState<string>('all');
     const [search, setSearch] = useState<string>('');
     const [showTest, setShowTest] = useState<boolean>(false);
+    // S7 Phase 2 (R39): retire-state filter. Default 'active' matches the
+    // h1_s7_retire_lifecycle partial-index pattern (idx_tenants_active WHERE
+    // retired_at IS NULL) so operator default view matches the indexed path.
+    const [retiredFilter, setRetiredFilter] = useState<'active' | 'retired' | 'all'>('active');
 
     useEffect(() => {
         setLoading(true);
@@ -72,9 +83,12 @@ export default function CrossStoreTenants() {
         return rows.filter((r) => {
             if (statusFilter !== 'all' && r.bff.status !== statusFilter) return false;
             if (s && !(r.bff.businessName || '').toLowerCase().includes(s)) return false;
+            // S7 Phase 2: retire-state filter on Clawith local.retired_at
+            if (retiredFilter === 'active' && r.local?.retired_at) return false;
+            if (retiredFilter === 'retired' && !r.local?.retired_at) return false;
             return true;
         });
-    }, [rows, statusFilter, search]);
+    }, [rows, statusFilter, search, retiredFilter]);
 
     if (user?.role !== 'platform_admin') {
         return (
@@ -125,6 +139,27 @@ export default function CrossStoreTenants() {
                     />
                     {t('admin.crossStore.showTest', 'Show test/archived tenants')}
                 </label>
+                {/* S7 Phase 2 R39: Active/Retired/All chip filter (Clawith retired_at). */}
+                <div style={{ display: 'flex', gap: 4, padding: 2, background: 'var(--bg-tertiary, #1a1a1a)', borderRadius: 6 }}>
+                    {(['active', 'retired', 'all'] as const).map((opt) => (
+                        <button
+                            key={opt}
+                            onClick={() => setRetiredFilter(opt)}
+                            style={{
+                                padding: '4px 10px', fontSize: 11, fontWeight: 600,
+                                background: retiredFilter === opt ? 'var(--accent, #3b82f6)' : 'transparent',
+                                color: retiredFilter === opt ? '#fff' : 'var(--text-tertiary)',
+                                border: 'none', borderRadius: 4, cursor: 'pointer',
+                            }}
+                        >
+                            {opt === 'active'
+                                ? t('admin.tenants.activeFilter', 'Active')
+                                : opt === 'retired'
+                                ? t('admin.tenants.retiredFilter', 'Retired')
+                                : t('admin.tenants.allFilter', 'All')}
+                        </button>
+                    ))}
+                </div>
                 <span style={{ color: 'var(--text-tertiary)', fontSize: 12, marginLeft: 'auto' }}>
                     {filtered.length} / {rows.length}
                 </span>

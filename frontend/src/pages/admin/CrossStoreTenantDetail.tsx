@@ -8,6 +8,7 @@ import OperatorActionItem from '../../components/OperatorActionItem';
 import AgentFormModal from '../../components/AgentFormModal';
 import SOULEditorModal from '../../components/SOULEditorModal';
 import SkillsAttachmentPanel from '../../components/SkillsAttachmentPanel';
+import RetireTenantModal from '../../components/RetireTenantModal';
 
 // L4 S2: per-tenant detail. Bearer + platform_admin. Calls
 // /api/admin/cross-store/tenants/{tenantId}. Read-only in S2; CRUD/actions
@@ -73,6 +74,8 @@ export default function CrossStoreTenantDetail() {
 
     // S5: SOUL editor + Skills attachment modal targets
     const [soulTarget, setSoulTarget] = useState<{ agentId: string; agentName: string } | null>(null);
+    // S7 Phase 2 (R42): cross-store tenant retire modal target
+    const [retireOpen, setRetireOpen] = useState<boolean>(false);
     const [skillsTarget, setSkillsTarget] = useState<{ agentId: string; agentName: string } | null>(null);
 
     const refetch = () => {
@@ -138,7 +141,7 @@ export default function CrossStoreTenantDetail() {
 
     return (
         <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 64px)' }}>
-            <div className="page-header">
+            <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16 }}>
                 <div>
                     <button
                         onClick={() => navigate('/admin/companies')}
@@ -150,10 +153,60 @@ export default function CrossStoreTenantDetail() {
                         {bff.businessName || <span style={{ color: 'var(--text-tertiary)' }}>—</span>}
                         <StatusPill value={bff.status} />
                         <StatusPill value={bff.whatsappStatus} />
+                        {/* S7 Phase 2: retired pill if Clawith side is soft-retired */}
+                        {local?.retired_at && (
+                            <span style={{
+                                display: 'inline-block', padding: '2px 8px', borderRadius: 12,
+                                fontSize: 11, fontWeight: 600, color: '#94a3b8',
+                                background: '#94a3b81a', border: '1px solid #94a3b833',
+                            }} title={`retired_at: ${local.retired_at}`}>
+                                retired — {String(local.retired_at).slice(0, 10)}
+                            </span>
+                        )}
                     </h1>
                     <p className="page-subtitle">
                         {t('admin.crossStore.detail.subtitle', 'BFF tenant_registry + Clawith local view')}
                     </p>
+                </div>
+                {/* S7 Phase 2 R42: Retire Tenant button (tenant-level destructive action). */}
+                {/* Disabled if Clawith already retired OR no Clawith linkage at all. */}
+                <div style={{ flexShrink: 0 }}>
+                    {local?.retired_at ? (
+                        <button
+                            disabled
+                            title={`Already retired at ${local.retired_at}`}
+                            style={{
+                                padding: '7px 14px', background: 'transparent',
+                                border: '1px solid var(--border)', borderRadius: 6,
+                                color: 'var(--text-tertiary)', fontSize: 12, cursor: 'not-allowed', opacity: 0.6,
+                            }}
+                        >
+                            {t('admin.tenants.retire.alreadyRetiredBtn', 'Tenant retired')}
+                        </button>
+                    ) : !bff.clawithTenantId ? (
+                        <button
+                            disabled
+                            title="Tenant has no Clawith linkage; nothing to retire."
+                            style={{
+                                padding: '7px 14px', background: 'transparent',
+                                border: '1px solid var(--border)', borderRadius: 6,
+                                color: 'var(--text-tertiary)', fontSize: 12, cursor: 'not-allowed', opacity: 0.6,
+                            }}
+                        >
+                            {t('admin.tenants.retire.noClawithBtn', 'Retire — no linkage')}
+                        </button>
+                    ) : (
+                        <button
+                            onClick={() => setRetireOpen(true)}
+                            style={{
+                                padding: '7px 14px', background: 'transparent',
+                                border: '1px solid #ef4444', borderRadius: 6,
+                                color: '#ef4444', fontSize: 12, cursor: 'pointer', fontWeight: 600,
+                            }}
+                        >
+                            {t('admin.tenants.retire.btn', 'Retire tenant')}
+                        </button>
+                    )}
                 </div>
             </div>
 
@@ -409,6 +462,19 @@ export default function CrossStoreTenantDetail() {
                     agentId={skillsTarget.agentId}
                     agentName={skillsTarget.agentName}
                     onClose={() => setSkillsTarget(null)}
+                />
+            )}
+
+            {retireOpen && tenantId && (
+                <RetireTenantModal
+                    open={retireOpen}
+                    tenantId={tenantId}
+                    bffTenantId={bff.tenantId}
+                    paperclipCompanyId={bff.paperclipCompanyId ?? null}
+                    clawithTenantId={bff.clawithTenantId ?? null}
+                    businessName={bff.businessName || tenantId}
+                    onClose={() => setRetireOpen(false)}
+                    onRetired={() => { setRetireOpen(false); refetch(); }}
                 />
             )}
         </div>

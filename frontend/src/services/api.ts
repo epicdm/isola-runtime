@@ -326,6 +326,33 @@ export const crossStoreApi = {
             `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/channels/${encodeURIComponent(channelId)}`,
             { method: 'DELETE' },
         ),
+
+    // ── L4 S7 R42 (2026-05-05): cross-store tenant retire orchestrator ──
+    // DELETE /api/admin/cross-store/tenants/{tid} runs Paperclip archive →
+    // Clawith soft-retire → BFF NULL FK → audit. Returns 200 + step trail
+    // on full success, 409 partial_state on mid-sequence failure (idempotent
+    // retry recovery — caller can re-call DELETE; succeeded steps no-op).
+    retireCrossStoreTenant: (tenantId: string) =>
+        request<RetireSuccess>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}`,
+            { method: 'DELETE' },
+        ),
+};
+
+// S7 R42: cross-store retire envelope (success + partial-state failure shapes).
+export type RetireSuccess = {
+    bff_tenant_id: string;
+    paperclip_company_id: string | null;
+    clawith_tenant_id: string;
+    retired: true;
+    succeeded_steps: string[];
+};
+
+export type RetireError = {
+    error: 'partial_state';
+    succeeded: string[];
+    failed: string;
+    details: string;
 };
 
 // S6 R35: 9-key autonomy view with per-key enforcement-status badge.
