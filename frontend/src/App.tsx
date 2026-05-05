@@ -18,6 +18,7 @@ import InvitationCodes from './pages/InvitationCodes';
 import AdminCompanies from './pages/AdminCompanies';
 import CrossStoreTenants from './pages/admin/CrossStoreTenants';
 import CrossStoreTenantDetail from './pages/admin/CrossStoreTenantDetail';
+import PolicyEditor from './pages/admin/PolicyEditor';
 import OperatorQueue from './pages/admin/OperatorQueue';
 import SSOEntry from './pages/SSOEntry';
 
@@ -198,6 +199,7 @@ export default function App() {
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
                     <Route path="admin/companies" element={<CrossStoreTenants />} />
                     <Route path="admin/companies/:tenantId" element={<CrossStoreTenantDetail />} />
+                    <Route path="admin/companies/:tenantId/agents/:agentId/policy" element={<PolicyEditor />} />
                     <Route path="admin/operator-queue" element={<OperatorQueue />} />
                 </Route>
             </Routes>

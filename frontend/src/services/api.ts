@@ -271,6 +271,122 @@ export const crossStoreApi = {
             `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/skills`,
             { method: 'PUT', body: JSON.stringify({ desired }) },
         ),
+
+    // ── S6 R28-revised + R34 + R35 (2026-05-04 night): policy + channels ──
+    // /policy: 9-key autonomy whitelist + escalation_keywords + channel_binding RO
+    //          + business_hours_readonly (from SOUL frontmatter)
+    // /channels: ChannelConfig CRUD; LIST + DELETE table-direct; POST + PATCH
+    //            dispatch to per-channel handlers via internal HTTP (R34 hybrid).
+    // 9-key autonomy whitelist; map-only orphans NEVER returned.
+    getAgentPolicy: (tenantId: string, agentId: string) =>
+        request<AgentPolicy>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/policy`,
+        ),
+
+    patchAgentPolicy: (
+        tenantId: string,
+        agentId: string,
+        body: { autonomy_policy?: Record<string, 'L1' | 'L2' | 'L3'>; escalation_keywords?: string[] },
+    ) =>
+        request<{
+            autonomy_policy: AgentAutonomyView;
+            escalation_keywords: string[];
+            agent_id: string;
+            tenant_id: string;
+            updated_at: string | null;
+        }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/policy`,
+            { method: 'PATCH', body: JSON.stringify(body) },
+        ),
+
+    listAgentChannels: (tenantId: string, agentId: string) =>
+        request<{
+            agent_id: string;
+            tenant_id: string;
+            channels: AgentChannelRow[];
+            supported_channel_types: string[];
+        }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/channels`,
+        ),
+
+    createAgentChannel: (tenantId: string, agentId: string, body: Record<string, unknown>) =>
+        request<AgentChannelRow>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/channels`,
+            { method: 'POST', body: JSON.stringify(body) },
+        ),
+
+    patchAgentChannel: (tenantId: string, agentId: string, channelId: string, body: Record<string, unknown>) =>
+        request<AgentChannelRow>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/channels/${encodeURIComponent(channelId)}`,
+            { method: 'PATCH', body: JSON.stringify(body) },
+        ),
+
+    deleteAgentChannel: (tenantId: string, agentId: string, channelId: string) =>
+        request<void>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/channels/${encodeURIComponent(channelId)}`,
+            { method: 'DELETE' },
+        ),
+};
+
+// S6 R35: 9-key autonomy view with per-key enforcement-status badge.
+// Map-only orphans (web_search/execute_code/send_feishu_message) NEVER returned.
+export type AgentAutonomyKey = {
+    key: string;
+    value: 'L1' | 'L2' | 'L3';
+    enforcement_status: 'enforced' | 'scaffolded';
+};
+
+export type AgentAutonomyView = {
+    keys: AgentAutonomyKey[];
+};
+
+export type AgentChannelBinding = {
+    whatsapp: {
+        whatsappStatus: string | null;
+        displayPhone: string | null;
+        waPhoneNumberId: string | null;
+        wabaId: string | null;
+        ownerPhone: string | null;
+        didNumber: string | null;
+        magnusDidId: string | null;
+        waProvisioningJobId: string | null;
+        waProvisioningState: string | null;
+        whatsappActivatedAt: string | null;
+    } | null;
+    voice: {
+        magnusDidId?: string | null;
+        didNumber?: string | null;
+    } | null;
+};
+
+export type AgentBusinessHours = {
+    source: string;
+    hours_weekday?: string;
+    hours_saturday?: string;
+    hours_sunday?: string;
+} | null;
+
+export type AgentPolicy = {
+    autonomy_policy: AgentAutonomyView;
+    escalation_keywords: string[];
+    channel_binding: AgentChannelBinding;
+    business_hours_readonly: AgentBusinessHours;
+    agent_id: string;
+    tenant_id: string;
+};
+
+// S6 R28-revised: ChannelConfig row metadata. NEVER includes credentials.
+// display_name is operator-set label stored in extra_config.display_name.
+// app_id is identifier (not credential) — plaintext and safe to surface.
+export type AgentChannelRow = {
+    channel_id: string;
+    channel_type: 'slack' | 'discord' | 'microsoft_teams' | 'whatsapp';
+    is_configured: boolean;
+    is_connected: boolean;
+    display_name: string | null;
+    app_id: string | null;
+    created_at: string | null;
+    updated_at: string | null;
 };
 
 export type SkillCatalogEntry = {

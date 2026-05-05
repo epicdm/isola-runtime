@@ -291,6 +291,13 @@ export default function CrossStoreTenantDetail() {
                                                             >
                                                                 {t('admin.agents.manageSkillsBtn', 'Manage Skills')}
                                                             </button>
+                                                            {/* S6 R32: Edit Policy navigates to per-agent policy page (autonomy + escalation + channels). Always enabled — Clawith-owned, no Paperclip dependency (R29 business_hours degrades to "Not configured" when Paperclip linkage absent). */}
+                                                            <button
+                                                                onClick={() => navigate(`/admin/companies/${encodeURIComponent(tenantId!)}/agents/${encodeURIComponent(a.id)}/policy`)}
+                                                                style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', color: 'var(--text-primary)', fontSize: 12, marginRight: 6 }}
+                                                            >
+                                                                {t('admin.agents.editPolicyBtn', 'Edit Policy')}
+                                                            </button>
                                                             <button
                                                                 onClick={() => setModalMode({ mode: 'edit', agent: a })}
                                                                 style={{ padding: '4px 10px', background: 'none', border: '1px solid var(--border)', borderRadius: 6, cursor: 'pointer', color: 'var(--text-primary)', fontSize: 12, marginRight: 6 }}
