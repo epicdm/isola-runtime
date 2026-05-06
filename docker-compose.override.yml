@@ -27,3 +27,8 @@ services:
       BFF_CLAWITH_SHARED_SECRET: ${BFF_CLAWITH_SHARED_SECRET:-}
       PAPERCLIP_API_URL: ${PAPERCLIP_API_URL:-}
       PAPERCLIP_API_TOKEN: ${PAPERCLIP_API_TOKEN:-}
+      # L5 S0.5 — Langfuse trace emission from backend/app/services/llm/client.py.
+      # All 3 vars sourced from /opt/isola-runtime/.env (provisioned via Infisical 2026-05-06).
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}

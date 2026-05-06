@@ -39,6 +39,7 @@ dependencies = [
     "pypinyin>=0.52.0",
     "anyascii>=0.3.2",
     "Pillow>=10.0.0",
+    "langfuse>=4.5.1",
 ]
 
 [project.optional-dependencies]

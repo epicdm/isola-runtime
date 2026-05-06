@@ -641,7 +641,95 @@ async def call_agent_llm(
         return f"⚠️ 调用模型出错: {error_msg[:150]}"
 
 
+
+# ─── L5 S1: Langfuse v4 traced wrapper for call_agent_llm_with_tools ─────────
+# Top-level agent_loop trace via @observe (v4 idiomatic). Resolves Paperclip
+# company_id at trace-emit-time via BFF /api/internal/cross-store/clawith-
+# tenants/[id] (Q1 sub-question (a) lock).
+#
+# capture_input=False / capture_output=False: prompts + reply contain
+# customer PII (per ADR-0062 PII discipline); we tag metadata only.
+#
+# Trace failures NEVER break the agent path; all SDK calls are guarded.
+try:
+    from langfuse import observe as _lf_observe, get_client as _lf_get_client
+    _LANGFUSE_AVAILABLE = True
+except ImportError:
+    _LANGFUSE_AVAILABLE = False
+    def _lf_observe(*args, **kwargs):  # noqa: ARG001
+        def deco(fn):
+            return fn
+        return deco
+    def _lf_get_client():
+        return None
+
+
+@_lf_observe(name="agent_loop", as_type="agent", capture_input=False, capture_output=False)
 async def call_agent_llm_with_tools(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    system_prompt: str,
+    user_prompt: str,
+    max_rounds: int = 50,
+    session_id: str = "",
+) -> str:
+    """Traced entry. Delegates to _call_agent_llm_with_tools_impl."""
+    lf = _lf_get_client() if _LANGFUSE_AVAILABLE else None
+    paperclip_id = None
+    clawith_tenant_id = None
+    agent_name = None
+
+    if lf is not None:
+        try:
+            from app.observability.tenant_resolver import resolve_paperclip_company_id
+            from app.models.agent import Agent as _AgentModel
+            ag_r = await db.execute(select(_AgentModel).where(_AgentModel.id == agent_id))
+            agent_row = ag_r.scalar_one_or_none()
+            if agent_row is not None:
+                agent_name = agent_row.name
+                if agent_row.tenant_id is not None:
+                    clawith_tenant_id = str(agent_row.tenant_id)
+                    paperclip_id = await resolve_paperclip_company_id(clawith_tenant_id)
+            lf.update_current_span(
+                metadata={
+                    "agent_id": str(agent_id),
+                    "agent_name": agent_name,
+                    "paperclip_company_id": paperclip_id,
+                    "clawith_tenant_id": clawith_tenant_id,
+                    "session_id": session_id,
+                    "max_rounds": max_rounds,
+                    "tags": (
+                        ([f"paperclip:{paperclip_id}"] if paperclip_id else [])
+                        + ([f"clawith:{clawith_tenant_id}"] if clawith_tenant_id else [])
+                    ),
+                    "outcome": "pending",
+                },
+            )
+        except Exception as e:
+            logger.warning("[langfuse] trace setup failed: %s", e)
+
+    outcome = "errored"
+    result_str = ""
+    try:
+        result_str = await _call_agent_llm_with_tools_impl(
+            db, agent_id, system_prompt, user_prompt, max_rounds, session_id
+        )
+        if result_str and not (result_str.startswith("⚠️") or result_str.startswith("[Error]")):
+            outcome = "completed"
+        return result_str
+    finally:
+        if lf is not None:
+            try:
+                lf.update_current_span(metadata={
+                    "outcome": outcome,
+                    "reply_length": len(result_str or ""),
+                })
+                lf.flush()
+            except Exception as e:
+                logger.warning("[langfuse] trace finalize failed: %s", e)
+
+
+async def _call_agent_llm_with_tools_impl(
     db: AsyncSession,
     agent_id: uuid.UUID,
     system_prompt: str,
