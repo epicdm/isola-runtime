@@ -90,3 +90,25 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> Opti
         + (output_tokens / 1000.0) * rates["output"],
         6,
     )
+
+
+def split_usage_tokens(usage):
+    """Split provider-specific usage dict into (input_tokens, output_tokens).
+
+    Supports OpenAI (prompt_tokens/completion_tokens) and
+    Anthropic/Gemini-normalized (input_tokens/output_tokens) shapes.
+    Returns (0, 0) if usage is missing/unrecognized.
+    """
+    if not usage:
+        return (0, 0)
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        return (
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+        )
+    if "input_tokens" in usage or "output_tokens" in usage:
+        return (
+            int(usage.get("input_tokens") or 0),
+            int(usage.get("output_tokens") or 0),
+        )
+    return (0, 0)

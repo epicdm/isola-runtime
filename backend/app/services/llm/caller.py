@@ -1,3 +1,4 @@
+# _caller_followup_done
 """Unified LLM calling service with failover support for all execution paths.
 
 This module provides a shared entry point for all LLM calls across:
@@ -28,6 +29,18 @@ from app.services.token_tracker import record_token_usage, extract_usage_tokens,
 from .client import LLMError
 from .failover import classify_error, FailoverErrorType
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
+try:
+    from langfuse import observe as _lf_observe, get_client as _lf_get_client
+    _LANGFUSE_AVAILABLE = True
+except ImportError:
+    _LANGFUSE_AVAILABLE = False
+    def _lf_observe(*args, **kwargs):  # noqa: ARG001
+        def deco(fn):
+            return fn
+        return deco
+    def _lf_get_client():
+        return None
+
 
 if TYPE_CHECKING:
     from app.models.agent import Agent
@@ -193,6 +206,7 @@ def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
     return True, ""
 
 
+@_lf_observe(name="tool_call", as_type="tool", capture_input=False, capture_output=False)
 async def _process_tool_call(
     tc: dict,
     api_messages: list,
@@ -281,6 +295,62 @@ async def _process_tool_call(
 # Core LLM Call Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+# ─── L5 S1 follow-up: per-round generation span helper ───────────────────────
+@_lf_observe(name="llm_round", as_type="generation", capture_input=False, capture_output=False)
+async def _traced_llm_round(
+    client,
+    api_messages,
+    tools_for_llm,
+    temperature,
+    max_tokens,
+    on_chunk,
+    on_thinking,
+    model,
+    round_i: int,
+):
+    """Wrap a single client.stream() call with a Langfuse generation span.
+
+    Captures model + input/output tokens + cost_usd + latency_ms. Cache-hit
+    fixed false at MVP per Q2 lock; controller fast-path field for future.
+    Defensive: span update failures NEVER break the LLM call path.
+    """
+    import time as _t
+    _t_start = _t.time()
+    response = await client.stream(
+        messages=api_messages,
+        tools=tools_for_llm if tools_for_llm else None,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        on_chunk=on_chunk,
+        on_thinking=on_thinking,
+    )
+    _lf_inner = _lf_get_client() if _LANGFUSE_AVAILABLE else None
+    if _lf_inner is not None:
+        try:
+            from app.observability.langfuse_client import split_usage_tokens, estimate_cost_usd
+            in_tok, out_tok = split_usage_tokens(response.usage)
+            model_name = getattr(model, "model", None) or ""
+            cost = estimate_cost_usd(model_name, in_tok, out_tok)
+            _lat_ms = int((_t.time() - _t_start) * 1000)
+            _lf_inner.update_current_generation(
+                model=model_name,
+                usage_details={"input": in_tok, "output": out_tok, "total": in_tok + out_tok},
+                cost_details=({"total": cost} if cost is not None else None),
+                metadata={
+                    "latency_ms": _lat_ms,
+                    "round": round_i + 1,
+                    "provider": getattr(model, "provider", None),
+                    "cache_hit": False,
+                    "finish_reason": getattr(response, "finish_reason", None),
+                },
+            )
+        except Exception as _ge:
+            logger.warning("[langfuse] generation span update failed: %s", _ge)
+    return response
+
+
+@_lf_observe(name="call_llm", as_type="span", capture_input=False, capture_output=False)
 async def call_llm(
     model: LLMModel,
     messages: list[dict],
@@ -363,14 +433,17 @@ async def call_llm(
             ))
 
         try:
-            # Use streaming API for real-time responses
-            response = await client.stream(
-                messages=api_messages,
-                tools=tools_for_llm if tools_for_llm else None,
-                temperature=model.temperature,
-                max_tokens=max_tokens,
-                on_chunk=on_chunk,
-                on_thinking=on_thinking,
+            # Use streaming API for real-time responses (L5 S1: wrapped in generation span)
+            response = await _traced_llm_round(
+                client,
+                api_messages,
+                tools_for_llm,
+                model.temperature,
+                max_tokens,
+                on_chunk,
+                on_thinking,
+                model,
+                round_i,
             )
         except LLMError as e:
             logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
@@ -651,18 +724,6 @@ async def call_agent_llm(
 # customer PII (per ADR-0062 PII discipline); we tag metadata only.
 #
 # Trace failures NEVER break the agent path; all SDK calls are guarded.
-try:
-    from langfuse import observe as _lf_observe, get_client as _lf_get_client
-    _LANGFUSE_AVAILABLE = True
-except ImportError:
-    _LANGFUSE_AVAILABLE = False
-    def _lf_observe(*args, **kwargs):  # noqa: ARG001
-        def deco(fn):
-            return fn
-        return deco
-    def _lf_get_client():
-        return None
-
 
 @_lf_observe(name="agent_loop", as_type="agent", capture_input=False, capture_output=False)
 async def call_agent_llm_with_tools(

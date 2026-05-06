@@ -14,6 +14,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import is_agent_expired
 
+# ─── L5 S1 follow-up: Langfuse @observe wrapper for channel_turn ─────────────
+try:
+    from langfuse import observe as _lf_observe, get_client as _lf_get_client
+    _LANGFUSE_OK = True
+except ImportError:
+    _LANGFUSE_OK = False
+    def _lf_observe(*args, **kwargs):  # noqa: ARG001
+        def deco(fn):
+            return fn
+        return deco
+    def _lf_get_client():
+        return None
+# _channel_common_followup_done
+
+
 
 # Default LLM timeout (seconds). Fallback when a model has no
 # request_timeout set. Per-model request_timeout takes precedence via
@@ -45,6 +60,7 @@ def _get_llm_timeout(model) -> float:
     return _LLM_TIMEOUT_SECONDS_DEFAULT
 
 
+@_lf_observe(name="channel_turn", as_type="agent", capture_input=False, capture_output=False)
 async def _call_agent_llm(
     db: AsyncSession,
     agent_id: uuid.UUID,
@@ -72,6 +88,29 @@ async def _call_agent_llm(
     agent = agent_result.scalar_one_or_none()
     if not agent:
         return "⚠️ Agent not found"
+
+    # ─── L5 S1 follow-up: trace metadata + paperclip resolution ────
+    _lf = _lf_get_client() if _LANGFUSE_OK else None
+    if _lf is not None:
+        try:
+            from app.observability.tenant_resolver import resolve_paperclip_company_id
+            _clawith_tid = str(agent.tenant_id) if agent.tenant_id else None
+            _paperclip_id = await resolve_paperclip_company_id(_clawith_tid) if _clawith_tid else None
+            _lf.update_current_span(metadata={
+                "agent_id": str(agent_id),
+                "agent_name": agent.name,
+                "paperclip_company_id": _paperclip_id,
+                "clawith_tenant_id": _clawith_tid,
+                "session_id": session_id,
+                "channel": "wa_or_chat",
+                "tags": (
+                    ([f"paperclip:{_paperclip_id}"] if _paperclip_id else [])
+                    + ([f"clawith:{_clawith_tid}"] if _clawith_tid else [])
+                ),
+                "outcome": "pending",
+            })
+        except Exception as _e:
+            logger.warning("[langfuse] channel_turn metadata setup failed: {}".format(_e))
 
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
