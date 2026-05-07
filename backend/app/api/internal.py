@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1096,3 +1096,43 @@ async def delete_user_soft(
         "retired_by": str(user.retired_by) if getattr(user, "retired_by", None) else None,
         "noop": False,
     }
+
+
+# ── Wave-1.5 Issue B (2026-05-07): cross-store tenant agents list ────
+# X-Internal-Secret variant of admin_crossstore.py:328 list_agents.
+#
+# URL family per memory #28:
+#   /api/admin/cross-store/tenants/{id}/agents    Bearer + platform_admin
+#   /api/internal/cross-store/tenants/{id}/agents X-Internal-Secret  ← this
+#
+# The admin variant calls _resolve_clawith_tenant_id() to map a BFF tenant_id
+# → Clawith UUID via a BFF roundtrip. The internal variant skips that: BFF
+# callers (apps/bff-v2 Team aggregator) already resolved bridge.ids.clawithTenantId
+# from their own loadTenantBridgeIds() before calling here, so tenant_id is
+# already a Clawith UUID. Avoids a circular Clawith→BFF→Clawith roundtrip.
+#
+# Response shape: identical to admin variant (reuses _agent_view).
+
+from app.api.admin_crossstore import _agent_view as _xstore_agent_view
+from app.models.agent import Agent as _XStoreAgent
+
+
+@router.get("/cross-store/tenants/{tenant_id}/agents")
+async def list_cross_store_agents_internal(
+    tenant_id: str,
+    include_retired: bool = Query(False, alias="includeRetired"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """List agents for a Clawith tenant. Service-to-service variant."""
+    if not tenant_id or len(tenant_id) > 100:
+        raise HTTPException(status_code=400, detail="tenant_id must be 1-100 chars")
+    cid = _parse_uuid_str(tenant_id, "tenant_id")
+
+    q = select(_XStoreAgent).where(_XStoreAgent.tenant_id == cid)
+    if not include_retired:
+        q = q.where(_XStoreAgent.retired_at.is_(None))
+    q = q.order_by(_XStoreAgent.created_at.desc())
+
+    result = await db.execute(q)
+    agents = result.scalars().all()
+    return {"total": len(agents), "agents": [_xstore_agent_view(a) for a in agents]}
