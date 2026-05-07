@@ -39,3 +39,7 @@ docs/
 .deploy-history/
 .env.*-backup
 docker-compose.override.yml.*-backup
+
+# CC-created safety snapshots from rotation/migration work (per workspace-backup runbook)
+*.bak
+.bak-archive-*/
