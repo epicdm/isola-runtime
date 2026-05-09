@@ -249,6 +249,19 @@ export const crossStoreApi = {
             },
         ),
 
+    // -- drift retreat S3: provision new tenant --
+    provision: (payload: {
+        businessName: string;
+        ownerEmail: string;
+        plan?: string;
+        didSource?: string;
+        tone?: string;
+    }) =>
+        request<{ status: string; tenantId: string; businessName: string }>(
+            "/admin/cross-store/provision",
+            { method: "POST", body: JSON.stringify(payload) },
+        ),
+
     // ── S5 (2026-05-04): SOUL editor + skill attachment ambassador ──
     getAgentSoul: (tenantId: string, agentId: string) =>
         request<{ content: string; source: string; agent_id: string; tenant_id: string }>(

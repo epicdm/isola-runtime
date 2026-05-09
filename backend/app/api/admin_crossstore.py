@@ -14,7 +14,7 @@ URL family convention enforced by L4 S2 ratification:
 from __future__ import annotations
 
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -290,6 +290,47 @@ async def resolve_action(
         # Surface BFF's error verbatim (400/404/409 are all caller-actionable)
         raise HTTPException(status_code=status, detail=data.get("error", "BFF resolve-action failed"))
     return data
+
+
+# --- Provision new tenant (drift retreat S3) ---
+
+class ProvisionTenantBody(BaseModel):
+    businessName: str
+    ownerEmail: str
+    plan: str = "base"
+    didSource: str = "saga"
+    tone: str = "direct-curious-helpful"
+
+
+@router.post("/provision", status_code=202)
+async def provision_tenant(
+    body: ProvisionTenantBody,
+    current_user: User = Depends(require_role("platform_admin")),
+) -> dict[str, Any]:
+    """Trigger the tenant-provision Inngest saga.
+    Generates tenantId + ownerUserId server-side; operator supplies
+    businessName, ownerEmail, plan, didSource, tone.
+    Auth: platform_admin Bearer JWT (same as all /api/admin/* routes).
+    Proxies to POST /api/platform/trigger-provision on BFF.
+    """
+    tenant_id = str(uuid4())
+    owner_user_id = str(uuid4())
+    bff_body = {
+        "tenantId": tenant_id,
+        "businessName": body.businessName,
+        "ownerEmail": body.ownerEmail,
+        "ownerUserId": owner_user_id,
+        "plan": body.plan,
+        "didSource": body.didSource,
+        "tone": body.tone,
+    }
+    status, data = await _bff_post("/api/platform/trigger-provision", bff_body)
+    if status >= 400:
+        raise HTTPException(
+            status_code=status,
+            detail=data.get("error", "BFF trigger-provision failed"),
+        )
+    return {"status": "queued", "tenantId": tenant_id, "businessName": body.businessName}
 
 
 # ─── Agent CRUD (S4) ─────────────────────────────────────────────────
