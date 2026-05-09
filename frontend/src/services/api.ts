@@ -262,7 +262,18 @@ export const crossStoreApi = {
             { method: "POST", body: JSON.stringify(payload) },
         ),
 
-    // ── S5 (2026-05-04): SOUL editor + skill attachment ambassador ──
+    // -- drift retreat S4: DID edit --
+    patchDid: (
+        tenantId: string,
+        didId: string,
+        payload: { channel?: string; agentId?: string | null },
+    ) =>
+        request<{ did: { id: string; didNumber: string; magnusDidId: string | null; status: string; channel: string; agentId: string | null; createdAt: string; updatedAt: string } }>(
+            `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/dids/${encodeURIComponent(didId)}`,
+            { method: "PATCH", body: JSON.stringify(payload) },
+        ),
+
+        // ── S5 (2026-05-04): SOUL editor + skill attachment ambassador ──
     getAgentSoul: (tenantId: string, agentId: string) =>
         request<{ content: string; source: string; agent_id: string; tenant_id: string }>(
             `/admin/cross-store/tenants/${encodeURIComponent(tenantId)}/agents/${encodeURIComponent(agentId)}/soul`,

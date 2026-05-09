@@ -264,6 +264,17 @@ async def list_operator_queue(
     return await _bff_get("/api/internal/cross-store/operator-queue")
 
 
+async def _bff_patch(path: str, body: dict) -> tuple[int, dict]:
+    base, headers = _bff_config()
+    headers = {**headers, "content-type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=_BFF_TIMEOUT_SECONDS) as client:
+            r = await client.patch(f"{base}{path}", headers=headers, json=body)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"BFF unreachable: {type(e).__name__}: {e}")
+    return r.status_code, (r.json() if r.content else {})
+
+
 # ─── Resolve action ─────────────────────────────────────────────────
 
 class ResolveActionBody(BaseModel):
@@ -331,6 +342,36 @@ async def provision_tenant(
             detail=data.get("error", "BFF trigger-provision failed"),
         )
     return {"status": "queued", "tenantId": tenant_id, "businessName": body.businessName}
+
+
+# --- DID edit (drift retreat S4) ---
+
+class PatchDidBody(BaseModel):
+    channel: str | None = None
+    agentId: str | None = None
+
+
+@router.patch("/tenants/{tenant_id}/dids/{did_id}")
+async def patch_tenant_did(
+    tenant_id: str,
+    did_id: str,
+    body: PatchDidBody,
+    current_user: User = Depends(require_role("platform_admin")),
+) -> dict[str, Any]:
+    if body.channel is None and body.agentId is None:
+        raise HTTPException(status_code=400, detail="Provide at least one of: channel, agentId")
+    bff_body: dict[str, Any] = {}
+    if body.channel is not None:
+        bff_body["channel"] = body.channel
+    if body.agentId is not None:
+        bff_body["agentId"] = body.agentId
+    status, data = await _bff_patch(
+        f"/api/internal/operator/dids/{did_id}",
+        bff_body,
+    )
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data.get("error", "BFF DID patch failed"))
+    return data
 
 
 # ─── Agent CRUD (S4) ─────────────────────────────────────────────────

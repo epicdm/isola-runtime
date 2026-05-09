@@ -77,6 +77,11 @@ export default function CrossStoreTenantDetail() {
     // S7 Phase 2 (R42): cross-store tenant retire modal target
     const [retireOpen, setRetireOpen] = useState<boolean>(false);
     const [skillsTarget, setSkillsTarget] = useState<{ agentId: string; agentName: string } | null>(null);
+    // S4 drift retreat: DID inline edit state
+    const [didEditing, setDidEditing] = useState<string | null>(null);  // didId being edited
+    const [didPatch, setDidPatch] = useState<{ channel: string; agentId: string }>({ channel: '', agentId: '' });
+    const [didSaving, setDidSaving] = useState(false);
+    const [didSaveErr, setDidSaveErr] = useState<string | null>(null);
 
     const refetch = () => {
         if (!tenantId) return;
@@ -115,6 +120,24 @@ export default function CrossStoreTenantDetail() {
             setRetireErr(e instanceof Error ? e.message : String(e));
         } finally {
             setRetiringId(null);
+        }
+    };
+
+    const handlePatchDid = async (didId: string) => {
+        if (!tenantId) return;
+        setDidSaving(true);
+        setDidSaveErr(null);
+        try {
+            const payload: { channel?: string; agentId?: string | null } = {};
+            if (didPatch.channel) payload.channel = didPatch.channel;
+            payload.agentId = didPatch.agentId || null;
+            await crossStoreApi.patchDid(tenantId, didId, payload);
+            setDidEditing(null);
+            refetch();
+        } catch (e) {
+            setDidSaveErr(e instanceof Error ? e.message : String(e));
+        } finally {
+            setDidSaving(false);
         }
     };
 
@@ -400,6 +423,103 @@ export default function CrossStoreTenantDetail() {
                         <IdRow label="last error" value={bff.chatwootProvisionError} />
                     </div>
                 )}
+
+                {tab === 'channels' && (() => {
+                    const dids: Array<{
+                        id: string; didNumber: string; magnusDidId: string | null;
+                        status: string; channel: string; agentId: string | null;
+                        createdAt: string; updatedAt: string;
+                    }> = (bff.tenantDids as any[]) || [];
+                    return (
+                        <div style={{ marginTop: 24 }}>
+                            <h3 style={{ marginTop: 0, marginBottom: 12 }}>DIDs</h3>
+                            {dids.length === 0 ? (
+                                <div style={{ padding: '20px 0', color: 'var(--text-tertiary)', fontSize: 13 }}>
+                                    No DIDs provisioned yet.
+                                </div>
+                            ) : (
+                                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                                    <thead>
+                                        <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                                            <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 500, color: 'var(--text-tertiary)', width: 140 }}>DID number</th>
+                                            <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 500, color: 'var(--text-tertiary)', width: 100 }}>Channel</th>
+                                            <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 500, color: 'var(--text-tertiary)', width: 200 }}>Agent ID</th>
+                                            <th style={{ textAlign: 'left', padding: '6px 8px', fontWeight: 500, color: 'var(--text-tertiary)', width: 80 }}>Status</th>
+                                            <th style={{ padding: '6px 8px', width: 100 }} />
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {dids.map((did) => (
+                                            <tr key={did.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                                                {didEditing === did.id ? (
+                                                    <>
+                                                        <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 12 }}>{did.didNumber}</td>
+                                                        <td style={{ padding: '6px 8px' }}>
+                                                            <input
+                                                                value={didPatch.channel}
+                                                                onChange={(e) => setDidPatch((p) => ({ ...p, channel: e.target.value }))}
+                                                                style={{ width: 90, fontSize: 12, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-primary)' }}
+                                                            />
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px' }}>
+                                                            <input
+                                                                value={didPatch.agentId}
+                                                                onChange={(e) => setDidPatch((p) => ({ ...p, agentId: e.target.value }))}
+                                                                placeholder="(none)"
+                                                                style={{ width: 180, fontSize: 12, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--input-bg)', color: 'var(--text-primary)' }}
+                                                            />
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px' }}><StatusPill value={did.status} /></td>
+                                                        <td style={{ padding: '6px 8px', display: 'flex', gap: 6 }}>
+                                                            <button
+                                                                onClick={() => handlePatchDid(did.id)}
+                                                                disabled={didSaving}
+                                                                style={{ fontSize: 12, padding: '3px 10px', borderRadius: 4, border: 'none', background: '#3b82f6', color: '#fff', cursor: 'pointer' }}
+                                                            >
+                                                                {didSaving ? '…' : 'Save'}
+                                                            </button>
+                                                            <button
+                                                                onClick={() => { setDidEditing(null); setDidSaveErr(null); }}
+                                                                disabled={didSaving}
+                                                                style={{ fontSize: 12, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-tertiary)', cursor: 'pointer' }}
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                        </td>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 12 }}>{did.didNumber}</td>
+                                                        <td style={{ padding: '6px 8px', fontSize: 12 }}>{did.channel}</td>
+                                                        <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontSize: 11, color: did.agentId ? 'var(--text-primary)' : 'var(--text-tertiary)' }}>
+                                                            {did.agentId || '—'}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px' }}><StatusPill value={did.status} /></td>
+                                                        <td style={{ padding: '6px 8px' }}>
+                                                            <button
+                                                                onClick={() => {
+                                                                    setDidEditing(did.id);
+                                                                    setDidPatch({ channel: did.channel, agentId: did.agentId || '' });
+                                                                    setDidSaveErr(null);
+                                                                }}
+                                                                style={{ fontSize: 12, padding: '3px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-secondary)', cursor: 'pointer' }}
+                                                            >
+                                                                Edit
+                                                            </button>
+                                                        </td>
+                                                    </>
+                                                )}
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            )}
+                            {didSaveErr && (
+                                <div style={{ marginTop: 8, color: '#ef4444', fontSize: 12 }}>{didSaveErr}</div>
+                            )}
+                        </div>
+                    );
+                })()}
 
                 {tab === 'deferred' && (
                     <div style={{ maxWidth: 720, display: 'flex', flexDirection: 'column', gap: 12 }}>
