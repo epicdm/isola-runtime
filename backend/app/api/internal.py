@@ -372,16 +372,38 @@ class InternalAgentEnsureResponse(BaseModel):
     odoo_company_id: int | None = None
 
 
-def _resolve_template_hint(hint: str | None) -> tuple[str | None, str | None]:
-    """Parse 'role-vertical' into (role, vertical). Accepts 'rex-restaurant'
-    -> ('rex', 'restaurant'). Multi-word verticals supported via remaining
-    split ('tech-restaurant' works; 'mara-retail' works)."""
+async def _resolve_template_hint(hint: str | None, db: AsyncSession) -> tuple[str | None, str | None]:
+    """Parse 'role-vertical' into (role, vertical).
+
+    Compound key 'rex-restaurant' -> ('rex', 'restaurant').
+    Bare key 'rex' -> queries agent_templates ordered by vertical ascending,
+    returns (role, first_vertical) and logs the canonical pick.
+    Returns (None, None) for None/empty input or unrecognized role.
+    """
+    import logging as _logging
     if not hint:
         return None, None
     parts = hint.strip().lower().split("-", 1)
-    if len(parts) != 2:
-        return None, None
-    return parts[0], parts[1]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) == 1:
+        role = parts[0]
+        from app.models.agent import AgentTemplate
+        result = await db.execute(
+            select(AgentTemplate)
+            .where(AgentTemplate.role == role)
+            .order_by(AgentTemplate.vertical.asc())
+            .limit(1)
+        )
+        tpl = result.scalar_one_or_none()
+        if tpl is None:
+            return None, None
+        _logging.getLogger(__name__).info(
+            "[template_hint] bare key %r resolved to canonical '%s-%s'",
+            hint.strip().lower(), role, tpl.vertical,
+        )
+        return role, tpl.vertical
+    return None, None
 
 
 @router.post("/agents/ensure", response_model=InternalAgentEnsureResponse)
@@ -436,7 +458,7 @@ async def ensure_agent(
         )
 
     # 3. Resolve template_hint to AgentTemplate row (role, vertical).
-    role, vertical = _resolve_template_hint(data.template_hint)
+    role, vertical = await _resolve_template_hint(data.template_hint, db)
     template_id: uuid.UUID | None = None
     if role and vertical:
         tpl_r = await db.execute(
@@ -707,7 +729,6 @@ async def ensure_agent(
                 )
                 odoo_company_id = None
 
-    # F.1.c will add skill-seeding here.
     return InternalAgentEnsureResponse(
         id=agent.id,
         created=True,

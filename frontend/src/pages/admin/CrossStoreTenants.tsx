@@ -70,13 +70,13 @@ export default function CrossStoreTenants() {
     // Drift retreat S3: view switcher + provision form
     const [view, setView] = useState<'list' | 'provision'>('list');
     const AGENT_CHARACTERS = [
-        { value: 'rex',   label: 'Rex ??? Receptionist',  tagline: 'Front desk, bookings, FAQs' },
-        { value: 'mara',  label: 'Mara ??? Marketer',     tagline: 'Promos, posts, lead capture' },
-        { value: 'joey',  label: 'Joey ??? Sales',        tagline: 'Qualify leads, quote, follow up' },
-        { value: 'cash',  label: 'Cash ??? Collections',  tagline: 'Invoices, no-shows, late payers' },
-        { value: 'brief', label: 'Brief ??? Briefer',     tagline: 'Morning digest, weekly recap, insights' },
-        { value: 'tech',  label: 'Tech ??? Setup helper', tagline: 'Onboards tools, IT questions' },
-    ] as const;
+        { value: 'rex',   label: 'Rex — Receptionist',  tagline: 'Front desk, bookings, FAQs',   disabled: false },
+        { value: 'mara',  label: 'Mara — Marketer',     tagline: 'Pack coming soon',              disabled: true  },
+        { value: 'joey',  label: 'Joey — Sales',        tagline: 'Pack coming soon',              disabled: true  },
+        { value: 'cash',  label: 'Cash — Collections',  tagline: 'Pack coming soon',              disabled: true  },
+        { value: 'brief', label: 'Brief — Briefer',     tagline: 'Pack coming soon',              disabled: true  },
+        { value: 'tech',  label: 'Tech — Setup helper', tagline: 'Pack coming soon',              disabled: true  },
+    ];
     const [provForm, setProvForm] = useState({
         businessName: '',
         ownerEmail: '',
@@ -313,8 +313,8 @@ export default function CrossStoreTenants() {
                                     style={inputStyle}
                                 >
                                     {AGENT_CHARACTERS.map((c) => (
-                                        <option key={c.value} value={c.value} title={c.tagline}>
-                                            {c.label}
+                                        <option key={c.value} value={c.value} title={c.tagline} disabled={c.disabled}>
+                                            {c.label}{c.disabled ? ' (pack coming soon)' : ''}
                                         </option>
                                     ))}
                                 </select>
