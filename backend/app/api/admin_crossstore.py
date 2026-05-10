@@ -311,6 +311,7 @@ class ProvisionTenantBody(BaseModel):
     plan: str = "base"
     didSource: str = "saga"
     tone: str = "direct-curious-helpful"
+    agentTemplate: str | None = None
 
 
 @router.post("/provision", status_code=202)
@@ -334,6 +335,7 @@ async def provision_tenant(
         "plan": body.plan,
         "didSource": body.didSource,
         "tone": body.tone,
+        **({"agentTemplate": body.agentTemplate} if body.agentTemplate else {}),
     }
     status, data = await _bff_post("/api/platform/trigger-provision", bff_body)
     if status >= 400:

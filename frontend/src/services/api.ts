@@ -255,6 +255,7 @@ export const crossStoreApi = {
         ownerEmail: string;
         plan?: string;
         didSource?: string;
+        agentTemplate?: string;
         tone?: string;
     }) =>
         request<{ status: string; tenantId: string; businessName: string }>(

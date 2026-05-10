@@ -69,11 +69,20 @@ export default function CrossStoreTenants() {
 
     // Drift retreat S3: view switcher + provision form
     const [view, setView] = useState<'list' | 'provision'>('list');
+    const AGENT_CHARACTERS = [
+        { value: 'rex',   label: 'Rex ??? Receptionist',  tagline: 'Front desk, bookings, FAQs' },
+        { value: 'mara',  label: 'Mara ??? Marketer',     tagline: 'Promos, posts, lead capture' },
+        { value: 'joey',  label: 'Joey ??? Sales',        tagline: 'Qualify leads, quote, follow up' },
+        { value: 'cash',  label: 'Cash ??? Collections',  tagline: 'Invoices, no-shows, late payers' },
+        { value: 'brief', label: 'Brief ??? Briefer',     tagline: 'Morning digest, weekly recap, insights' },
+        { value: 'tech',  label: 'Tech ??? Setup helper', tagline: 'Onboards tools, IT questions' },
+    ] as const;
     const [provForm, setProvForm] = useState({
         businessName: '',
         ownerEmail: '',
         plan: 'base',
         didSource: 'saga',
+        agentTemplate: 'rex',
         tone: 'direct-curious-helpful',
     });
     const [provSubmitting, setProvSubmitting] = useState(false);
@@ -94,6 +103,7 @@ export default function CrossStoreTenants() {
                 ownerEmail: provForm.ownerEmail.trim(),
                 plan: provForm.plan,
                 didSource: provForm.didSource,
+                agentTemplate: provForm.agentTemplate,
                 tone: provForm.tone,
             });
             setProvResult({ tenantId: res.tenantId, businessName: res.businessName });
@@ -108,7 +118,7 @@ export default function CrossStoreTenants() {
     }
 
     function resetProvForm() {
-        setProvForm({ businessName: '', ownerEmail: '', plan: 'base', didSource: 'saga', tone: 'direct-curious-helpful' });
+        setProvForm({ businessName: '', ownerEmail: '', plan: 'base', didSource: 'saga', agentTemplate: 'rex', tone: 'direct-curious-helpful' });
         setProvResult(null);
         setProvError(null);
     }
@@ -295,6 +305,26 @@ export default function CrossStoreTenants() {
 
                             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                                 <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                                    {t('admin.provision.agentTemplate', 'Agent character')}
+                                </label>
+                                <select
+                                    value={provForm.agentTemplate}
+                                    onChange={(e) => setProvForm((f) => ({ ...f, agentTemplate: e.target.value }))}
+                                    style={inputStyle}
+                                >
+                                    {AGENT_CHARACTERS.map((c) => (
+                                        <option key={c.value} value={c.value} title={c.tagline}>
+                                            {c.label}
+                                        </option>
+                                    ))}
+                                </select>
+                                <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                                    {AGENT_CHARACTERS.find((c) => c.value === provForm.agentTemplate)?.tagline}
+                                </span>
+                            </div>
+
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>
                                     {t('admin.provision.tone', 'Agent tone')}
                                 </label>
                                 <input
@@ -305,7 +335,7 @@ export default function CrossStoreTenants() {
                                     style={inputStyle}
                                 />
                                 <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-                                    {t('admin.provision.toneHint', 'Personality descriptor passed to the Rex agent template')}
+                                    {t('admin.provision.toneHint', 'Personality descriptor passed to the agent')}
                                 </span>
                             </div>
 
