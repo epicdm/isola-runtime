@@ -93,6 +93,14 @@ class AgentManager:
             soul_content = soul_content.replace("{{creator_name}}", creator_name)
             soul_content = soul_content.replace("{{created_at}}", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
 
+        # CC-SOUL-OVERLAY: override with role-specific DB soul_template when present.
+        try:
+            db_soul = await self._apply_role_soul_template(db, agent, creator_name)
+            if db_soul:
+                soul_content = db_soul
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"DB soul template overlay failed for agent {agent.id}: {e}")
+
         def replace_or_append_section(content: str, section_name: str, section_content: str) -> str:
             """Replace existing ## SectionName or append if not found."""
             if not section_content:
@@ -206,6 +214,36 @@ class AgentManager:
             f"Applied '{tpl.role}' skill pack to agent {agent.id} "
             f"({len(list(src_skills.iterdir()))} skills)"
         )
+
+    async def _apply_role_soul_template(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        creator_name: str,
+    ) -> str | None:
+        """Render the role-specific soul template from agent_templates DB row.
+
+        Returns rendered string (mustache resolved) or None if no template.
+        Caller composes the actual file write.
+        """
+        if agent.template_id is None:
+            return None
+
+        from app.models.agent import AgentTemplate
+
+        r = await db.execute(
+            select(AgentTemplate).where(AgentTemplate.id == agent.template_id)
+        )
+        tpl = r.scalar_one_or_none()
+        if tpl is None or not tpl.soul_template or not tpl.soul_template.strip():
+            return None
+
+        content = tpl.soul_template
+        content = content.replace("{{agent_name}}", agent.name)
+        content = content.replace("{{role_description}}", agent.role_description or "general assistant")
+        content = content.replace("{{creator_name}}", creator_name)
+        content = content.replace("{{created_at}}", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        return content
 
     async def archive_agent_files(self, agent_id: uuid.UUID) -> Path:
         """Archive agent files to a backup location and return the archive directory."""
