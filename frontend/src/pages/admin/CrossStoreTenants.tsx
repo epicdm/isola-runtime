@@ -76,6 +76,7 @@ export default function CrossStoreTenants() {
         { value: 'cash',  label: 'Cash — Collections',  tagline: 'Pack coming soon',              disabled: true  },
         { value: 'brief', label: 'Brief — Briefer',     tagline: 'Pack coming soon',              disabled: true  },
         { value: 'tech',  label: 'Tech — Setup helper', tagline: 'Pack coming soon',              disabled: true  },
+        { value: 'chief', label: 'Chief — Chief of Staff',  tagline: 'Supervises team, reports to owner', disabled: false },
     ];
     const [provForm, setProvForm] = useState({
         businessName: '',
