@@ -57,6 +57,7 @@ class InternalTenantEnsureRequest(BaseModel):
     )
     name: str = Field(..., min_length=1, max_length=200)
     slug: str | None = Field(default=None, max_length=50)
+    im_provider: str | None = Field(default=None)
 
 
 class InternalTenantOut(BaseModel):
@@ -113,7 +114,7 @@ async def ensure_tenant(
         tenant = Tenant(
             name=data.name,
             slug=slug,
-            im_provider="web_only",
+            im_provider=data.im_provider or "web_only",
             timezone=(data.timezone or "UTC")[:50],
         )
         db.add(tenant)
