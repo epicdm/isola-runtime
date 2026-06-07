@@ -126,6 +126,13 @@ class Settings(BaseSettings):
     # is down or during migrations so tenant provisioning doesn't block.
     ODOO_ENABLED: bool = True
 
+    # Agent tool Odoo credentials — separate from ensure_company admin creds.
+    # Points to epic_sandbox via the public *.odoo.epic.dm proxy.
+    ODOO_AGENT_URL: str = "https://epic.odoo.epic.dm"
+    ODOO_AGENT_DB: str = "epic_sandbox"
+    ODOO_AGENT_LOGIN: str = ""
+    ODOO_AGENT_PASSWORD: str = ""
+
 
     # Sandbox configuration
     SANDBOX_TYPE: SandboxType = SandboxType.SUBPROCESS

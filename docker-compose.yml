@@ -62,6 +62,10 @@ services:
       # as bff-v2's INTERNAL_SECRET; consumer-side renamed to disambiguate.
       BFF_INTERNAL_SECRET: ${BFF_INTERNAL_SECRET:-}
       BFF_API_BASE_URL: ${BFF_API_BASE_URL:-https://bff.epic.dm}
+      ODOO_AGENT_URL: ${ODOO_AGENT_URL:-https://epic.odoo.epic.dm}
+      ODOO_AGENT_DB: ${ODOO_AGENT_DB:-epic_sandbox}
+      ODOO_AGENT_LOGIN: ${ODOO_AGENT_LOGIN:-}
+      ODOO_AGENT_PASSWORD: ${ODOO_AGENT_PASSWORD:-}
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents

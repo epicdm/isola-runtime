@@ -950,6 +950,39 @@ AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_customer_balance",
+            "description": "Look up outstanding AR balance for a specific customer (partner_id). Returns open invoices and total EC$ outstanding.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "partner_id": {
+                        "type": "integer",
+                        "description": "Odoo res.partner ID of the customer",
+                    },
+                },
+                "required": ["partner_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_overdue_invoices",
+            "description": "List overdue customer invoices sorted by amount (highest first). Returns invoice names, partner names, amounts owed, and due dates.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max invoices to return (default 10, max 50)",
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -1125,6 +1158,25 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     synchronous consult behaviour.
     """
     _always_tools = list(_always_core_tools)
+
+    # Ollama models reject the tools API entirely — skip tool injection
+    try:
+        from app.models.agent import Agent as _AgentM
+        from app.models.llm import LLMModel as _LLMMod
+        async with async_session() as _ollama_db:
+            _ag_r2 = await _ollama_db.execute(
+                select(_AgentM.primary_model_id).where(_AgentM.id == agent_id)
+            )
+            _pmid = _ag_r2.scalar_one_or_none()
+            if _pmid:
+                _llm_r2 = await _ollama_db.execute(
+                    select(_LLMMod.provider).where(_LLMMod.id == _pmid)
+                )
+                _prov = _llm_r2.scalar_one_or_none()
+                if _prov == "ollama":
+                    return []
+    except Exception:
+        pass
 
     # Check tenant-level a2a_async_enabled flag
     _a2a_async = False
@@ -1677,6 +1729,33 @@ async def execute_tool(
                 result = "❌ Missing required argument 'skill_name' for read_skill_md"
             else:
                 result = await _read_skill_md(agent_id, skill_name)
+        elif tool_name == "place_call":
+            result = await _place_call(agent_id, arguments)
+        elif tool_name == "get_customer_balance":
+            partner_id = arguments.get("partner_id")
+            if not partner_id:
+                result = "Error: partner_id is required"
+            else:
+                from app.services.odoo_service import agent_odoo_service, get_customer_balance, OdooError
+                try:
+                    import json as _json
+                    data = get_customer_balance(agent_odoo_service(), int(partner_id))
+                    result = _json.dumps(data)
+                except OdooError as e:
+                    result = f"Odoo error: {e}"
+                except Exception as e:
+                    result = f"Error querying customer balance: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "list_overdue_invoices":
+            from app.services.odoo_service import agent_odoo_service, list_overdue_invoices, OdooError
+            try:
+                import json as _json
+                limit = int(arguments.get("limit", 10))
+                data = list_overdue_invoices(agent_odoo_service(), limit=limit)
+                result = _json.dumps(data)
+            except OdooError as e:
+                result = f"Odoo error: {e}"
+            except Exception as e:
+                result = f"Error listing overdue invoices: {type(e).__name__}: {str(e)[:200]}"
         else:
             # Try MCP tool execution
             result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
@@ -9023,3 +9102,35 @@ async def _read_skill_md(agent_id: uuid.UUID, skill_name: str) -> str:
         return f"❌ Paperclip unreachable fetching skill body: {e}"
 
     return body
+
+
+# ─── Outbound Call Tool (S1.B) ────────────────────────────────────────────────
+
+async def _place_call(agent_id: uuid.UUID, args: dict) -> str:
+    """Place an outbound voice call via BFF -> LiveKit -> FreeSWITCH -> PSTN."""
+    phone = (args.get("phone") or "").strip()
+    if not phone:
+        return "❌ Please provide a phone number (E.164 format, e.g. +17678183742)"
+
+    bff_base = os.getenv("BFF_API_BASE_URL", "https://bff.epic.dm")
+    secret = os.getenv("BFF_INTERNAL_SECRET", "")
+    agent_id_str = str(agent_id)
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{bff_base}/api/internal/voice/outbound-call",
+                json={"agentId": agent_id_str, "toPhone": phone},
+                headers={"x-internal-secret": secret},
+            )
+        data = resp.json()
+        if resp.status_code == 200:
+            return (
+                f"✅ Calling {data.get('to', phone)} — your phone should ring within 30 seconds. "
+                f"(callId={data.get('callId', '?')})"
+            )
+        else:
+            return f"❌ Call failed: {data.get('error', resp.text[:200])}"
+    except Exception as e:
+        return f"❌ Could not place call: {str(e)[:200]}"
