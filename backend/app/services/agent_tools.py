@@ -164,6 +164,10 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
 channel_file_sender: ContextVar = ContextVar('channel_file_sender', default=None)
 # For web chat: agent_id needed to build download URL
 channel_web_agent_id: ContextVar = ContextVar('channel_web_agent_id', default=None)
+
+# DEF-006 fix: caller identity resolved by the CHANNEL (never the model).
+# {'phone': str, 'role': 'owner'|'customer'|'public', 'partner_id': int|None}
+caller_context: ContextVar = ContextVar('caller_context', default=None)
 # Set by Feishu channel handler — open_id of the message sender so calendar tool
 # can auto-invite them as attendee when no explicit attendee list is given
 channel_feishu_sender_open_id: ContextVar = ContextVar('channel_feishu_sender_open_id', default=None)
@@ -954,16 +958,16 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "get_customer_balance",
-            "description": "Look up outstanding AR balance for a specific customer (partner_id). Returns open invoices and total EC$ outstanding.",
+            "description": "Look up the outstanding balance and open invoices for the customer you are talking to. Call this whenever a customer asks what they owe - no arguments needed, the system knows who is asking. (partner_id honored only for the business owner.)",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "partner_id": {
                         "type": "integer",
-                        "description": "Odoo res.partner ID of the customer",
+                        "description": "OPTIONAL, owner only: specific customer partner id",
                     },
                 },
-                "required": ["partner_id"],
+                "required": [],
             },
         },
     },
@@ -1732,7 +1736,19 @@ async def execute_tool(
         elif tool_name == "place_call":
             result = await _place_call(agent_id, arguments)
         elif tool_name == "get_customer_balance":
-            partner_id = arguments.get("partner_id")
+            _cc = caller_context.get()
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any account records to look that up — I'm a customer-facing assistant, not a billing/finance tool."
+            if _cc is not None and _cc.get("role") == "public":
+                return "This information is only available to account holders. I can help with plans, prices and booking!"
+            if _cc is not None and _cc.get("role") == "customer":
+                _req = arguments.get("partner_id")
+                if _req and int(_req) != int(_cc.get("partner_id") or 0):
+                    return "I can only look up the account belonging to this phone number. For privacy, each customer must ask about their own account."
+                partner_id = _cc.get("partner_id")
+            else:
+                partner_id = arguments.get("partner_id")
             if not partner_id:
                 result = "Error: partner_id is required"
             else:
@@ -1745,7 +1761,83 @@ async def execute_tool(
                     result = f"Odoo error: {e}"
                 except Exception as e:
                     result = f"Error querying customer balance: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "create_lead":
+            _cc = caller_context.get() or {}
+            from app.services.odoo_service import agent_odoo_service, create_lead, OdooError
+            try:
+                import json as _json
+                _phone = _cc.get("phone") or arguments.get("phone") or ""
+                data = create_lead(agent_odoo_service(),
+                                   arguments.get("name") or "WhatsApp contact",
+                                   _phone,
+                                   arguments.get("interest", ""),
+                                   arguments.get("notes", ""))
+                result = _json.dumps(data)
+            except OdooError as e:
+                result = f"Odoo error: {e}"
+            except Exception as e:
+                result = f"Error creating lead: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "log_interaction":
+            _cc = caller_context.get() or {}
+            _pid = _cc.get("partner_id") if _cc.get("role") == "customer" else arguments.get("partner_id")
+            if not _pid:
+                result = "No customer record linked to this conversation yet - create a lead first."
+            else:
+                from app.services.odoo_service import agent_odoo_service, log_interaction, OdooError
+                try:
+                    import json as _json
+                    result = _json.dumps(log_interaction(agent_odoo_service(), _pid, arguments.get("summary", "")))
+                except OdooError as e:
+                    result = f"Odoo error: {e}"
+                except Exception as e:
+                    result = f"Error logging: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "request_booking":
+            _cc = caller_context.get() or {}
+            from app.services.odoo_service import agent_odoo_service, request_booking, find_or_create_partner, OdooError
+            try:
+                import json as _json
+                _svc = agent_odoo_service()
+                _pid = _cc.get("partner_id")
+                if not _pid:
+                    _pid, _ = find_or_create_partner(_svc, arguments.get("name") or "WhatsApp contact", _cc.get("phone") or "")
+                data = request_booking(_svc, _pid, arguments.get("service", "installation"),
+                                       arguments.get("preferred_date"), arguments.get("notes", ""))
+                result = _json.dumps(data)
+            except OdooError as e:
+                result = f"Odoo error: {e}"
+            except Exception as e:
+                result = f"Error booking: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "list_recent_leads":
+            _cc = caller_context.get() or {}
+            if _cc is not None and _cc.get("role") != "owner":
+                return "That overview is only available to the business owner."
+            # AgriLink owner-identity fix: business-data tools require a per-tenant
+            # Odoo binding (odoo_context set). Without it the agent has NO business
+            # data of its own and must NOT fall back to the shared/global Odoo.
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any business records to look that up — I'm a customer-facing assistant, not a back-office/finance tool."
+            from app.services.odoo_service import agent_odoo_service, list_recent_leads, OdooError
+            try:
+                import json as _json
+                result = _json.dumps(list_recent_leads(agent_odoo_service(), int(arguments.get("limit", 10))))
+            except OdooError as e:
+                result = f"Odoo error: {e}"
+            except Exception as e:
+                result = f"Error listing leads: {type(e).__name__}: {str(e)[:200]}"
         elif tool_name == "list_overdue_invoices":
+            _cc = caller_context.get()
+            from app.services.odoo_service import odoo_context as _octx
+            _o=_octx.get() or {}
+            logger.info(f"[ARTOOL] cc={_cc} url={_o.get('url')} db={_o.get('db')} login={_o.get('login')} pwlen={len(_o.get('password') or '')}")
+            if _cc is not None and _cc.get("role") != "owner":
+                return "That overview is only available to the business owner."
+            # AgriLink owner-identity fix: business-data tools require a per-tenant
+            # Odoo binding (odoo_context set). Without it the agent has NO business
+            # data of its own and must NOT fall back to the shared/global Odoo.
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any business records to look that up — I'm a customer-facing assistant, not a back-office/finance tool."
             from app.services.odoo_service import agent_odoo_service, list_overdue_invoices, OdooError
             try:
                 import json as _json
