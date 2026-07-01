@@ -865,10 +865,11 @@ _AUTONOMY_KEY_WHITELIST = (
     "financial_operations",
 )
 
-# Wave-1 enforcement reality (R35): only these 2 keys actually gate via
-# _TOOL_AUTONOMY_MAP in agent_tools.py:1309. The other 7 are scaffolded —
-# saved + persisted but no tool currently checks them.
-_AUTONOMY_ENFORCED_WAVE1 = frozenset(("write_workspace_files", "delete_files"))
+# Wave-1 enforcement reality (R35, updated fix/business-write-gate): these 3
+# keys actually gate via _TOOL_AUTONOMY_MAP in agent_tools.py. access_business_system_write
+# gates create_lead/log_interaction/request_booking as of the write-gate fix. The
+# remaining 6 are scaffolded — saved + persisted but no tool currently checks them.
+_AUTONOMY_ENFORCED_WAVE1 = frozenset(("write_workspace_files", "delete_files", "access_business_system_write"))
 
 _AUTONOMY_VALUES = ("L1", "L2", "L3")
 
