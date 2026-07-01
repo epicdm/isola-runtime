@@ -137,6 +137,9 @@ class Agent(Base):
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     retired_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
+    # Phase 2 LCR: industry vertical for intent routing. NULL = non-vertical agent.
+    vertical: Mapped[str | None] = mapped_column(String(32), index=True, nullable=True)
+
     # Relationships
     creator: Mapped["User"] = relationship("User", back_populates="created_agents", foreign_keys=[creator_id])
 

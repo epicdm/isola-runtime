@@ -139,6 +139,144 @@ async def _call_agent_llm(
     if not model:
         return f"⚠️ {agent.name} has no LLM model configured. Set one in admin."
 
+    # ── Phase 2: LCR model selection ─────────────────────────────────────────
+    # Active when agent.vertical is set; falls back silently to primary_model_id on any failure.
+    # FLOOR-13: replace with LiteLLM virtual key selection
+    _lcr_result = None
+    _intent_pattern: str | None = None
+    _intent_difficulty: str | None = None
+    _intent_confidence: float = 1.0
+    _bucket_renews_at = None
+
+    if getattr(agent, "vertical", None):
+        try:
+            from sqlalchemy import text as _sa_text
+            from app.services.intent_classifier import classify_intent as _classify_intent
+            from app.services.lcr import (
+                lcr_detailed as _lcr_detailed,
+                PoolModel as _PoolModel,
+                IntentRow as _IntentRow,
+                TenantBucket as _TenantBucket,
+            )
+            from app.services.cost_estimator import (
+                estimate_call_cost as _estimate_call_cost,
+                enforce_pre_call_cap as _enforce_pre_call_cap,
+            )
+
+            _intent_pattern, _intent_difficulty, _intent_confidence = _classify_intent(
+                user_text, agent.vertical
+            )
+
+            _ir_res = await db.execute(
+                _sa_text(
+                    "SELECT preferred_tier, capability_required, max_cost_cents, fallback_tier"
+                    " FROM intent_routing"
+                    " WHERE vertical = :v AND intent_pattern = :p LIMIT 1"
+                ),
+                {"v": agent.vertical, "p": _intent_pattern},
+            )
+            _ir_row = _ir_res.fetchone()
+
+            _sub_res = await db.execute(
+                _sa_text(
+                    "SELECT ts.bucket_state, ts.credit_balance_cents,"
+                    "       p.tier_access, p.included_tokens, p.overage_policy, p.id as plan_id"
+                    " FROM tenant_subscription ts JOIN plan p ON p.id = ts.plan_id"
+                    " WHERE ts.tenant_id = :tid LIMIT 1"
+                ),
+                {"tid": str(agent.tenant_id)},
+            )
+            _sub_row = _sub_res.fetchone()
+
+            if _ir_row and _sub_row:
+                _bkt = _sub_row.bucket_state or {}
+                _bucket_renews_at = _bkt.get("renewed_at")
+                _tb = _TenantBucket(
+                    plan_id=str(_sub_row.plan_id),
+                    entitled_tiers=list(_sub_row.tier_access or []),
+                    tokens_used=int(_bkt.get("tokens_used", 0)),
+                    included_tokens=int(_sub_row.included_tokens or 0),
+                    overage_policy=_sub_row.overage_policy or "degrade",
+                    credit_balance_cents=int(_sub_row.credit_balance_cents or 0),
+                )
+                _intent_row = _IntentRow(
+                    vertical=agent.vertical,
+                    intent_pattern=_intent_pattern,
+                    difficulty=_intent_difficulty,
+                    preferred_tier=_ir_row.preferred_tier or "standard",
+                    capability_required=list(_ir_row.capability_required or []),
+                    max_cost_cents=_ir_row.max_cost_cents,
+                )
+                _pool_res = await db.execute(
+                    _sa_text(
+                        "SELECT id, provider, model, tier, enabled, health_status,"
+                        "       latency_p95_ms, cost_per_1k_output_cents, capability_tags"
+                        " FROM llm_models"
+                        " WHERE tenant_id IS NULL AND enabled = TRUE AND health_status = 'healthy'"
+                    )
+                )
+                _pool = [
+                    _PoolModel(
+                        id=str(_r.id), provider=_r.provider, model=_r.model,
+                        tier=_r.tier, enabled=_r.enabled, health_status=_r.health_status,
+                        latency_p95_ms=_r.latency_p95_ms,
+                        cost_per_1k_output_cents=float(_r.cost_per_1k_output_cents or 0),
+                        capability_tags=list(_r.capability_tags or []),
+                    )
+                    for _r in _pool_res.fetchall()
+                ]
+                _lcr_result = _lcr_detailed(_intent_row, _tb, _pool)
+
+                if _lcr_result:
+                    # Pre-call cost guardrail (S8) — FLOOR-13: replaceable by LiteLLM spend limits
+                    _est_cost = _estimate_call_cost(user_text, _lcr_result.model)
+                    _cap = _enforce_pre_call_cap(_est_cost, _intent_row.max_cost_cents)
+                    if not _cap.allowed:
+                        from decimal import Decimal as _Decimal
+                        from app.services.telemetry import write_telemetry_row as _write_telem
+                        asyncio.create_task(_write_telem(
+                            tenant_id=str(agent.tenant_id), agent_id=str(agent_id),
+                            intent=_intent_pattern, difficulty=_intent_difficulty,
+                            selected_model_id=_lcr_result.model.id,
+                            selected_provider=_lcr_result.model.provider,
+                            selected_model_name=_lcr_result.model.model,
+                            byo_used=False, fallback_used=_lcr_result.fallback_used,
+                            input_tokens=0, output_tokens=0,
+                            cost_cents=_Decimal("0"), cost_billed_to="epic",
+                            latency_ms=None, success=False,
+                            error_class="pre_call_cap_exceeded",
+                            classified_by="rules",
+                            classifier_confidence=_Decimal(str(_intent_confidence)),
+                        ))
+                        return (
+                            "This question requires more detail than your current plan allows per message. "
+                            "Try a shorter version, or contact us directly."
+                        )
+
+                    # Override model with LCR-selected pool row ORM object
+                    _pool_orm = (
+                        await db.execute(
+                            select(LLMModel).where(
+                                LLMModel.id == uuid.UUID(_lcr_result.model.id)
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if _pool_orm and _pool_orm.enabled:
+                        model = _pool_orm
+                        fallback_model = None  # LCR owns selection; primary_model_id dormant
+                        logger.info(
+                            "[LCR] agent={} vertical={} intent={}/{} → {}/{}"
+                            " degraded={} safety_override={}",
+                            agent_id, agent.vertical,
+                            _intent_pattern, _intent_difficulty,
+                            _lcr_result.model.provider, _lcr_result.model.model,
+                            _lcr_result.degraded, _lcr_result.safety_override,
+                        )
+        except Exception as _lcr_exc:
+            logger.warning("[LCR] routing failed, using primary_model_id: {}", _lcr_exc)
+            _lcr_result = None
+    # ── end Phase 2 LCR ──────────────────────────────────────────────────────
+
     messages: list[dict] = []
     ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
     if history:
@@ -173,6 +311,40 @@ async def _call_agent_llm(
             ),
             timeout=_timeout,
         )
+        # ── Phase 2: post-call debit + telemetry + footer ────────────────────
+        # FLOOR-13: debit/telemetry replaceable by LiteLLM callbacks; footer stays in Clawith
+        if agent.vertical and _lcr_result:
+            from decimal import Decimal as _Decimal
+            from app.services.bucket import debit_bucket as _debit_bucket
+            from app.services.telemetry import write_telemetry_row as _write_telem, compute_cost as _compute_cost
+            from app.services.degradation_footer import apply_degradation_footer as _apply_footer
+            from app.services.cost_estimator import estimate_tokens_from_chars as _estimate_tokens
+            _in_tok = _estimate_tokens(user_text)
+            _out_tok = _estimate_tokens(reply)
+            asyncio.create_task(_debit_bucket(str(agent.tenant_id), _in_tok, _out_tok))
+            asyncio.create_task(_write_telem(
+                tenant_id=str(agent.tenant_id), agent_id=str(agent_id),
+                intent=_intent_pattern, difficulty=_intent_difficulty,
+                selected_model_id=_lcr_result.model.id,
+                selected_provider=_lcr_result.model.provider,
+                selected_model_name=_lcr_result.model.model,
+                byo_used=False, fallback_used=_lcr_result.fallback_used,
+                input_tokens=_in_tok, output_tokens=_out_tok,
+                cost_cents=_compute_cost(_lcr_result.model, _out_tok),
+                cost_billed_to="epic",
+                latency_ms=None, success=True, error_class=None,
+                classified_by="rules",
+                classifier_confidence=_Decimal(str(_intent_confidence)),
+            ))
+            try:
+                reply = _apply_footer(
+                    base_reply=reply,
+                    lcr_result=_lcr_result,
+                    intent_difficulty=_intent_difficulty or "low",
+                    bucket_renews_at=_bucket_renews_at,
+                )
+            except Exception as _fe:
+                logger.warning("[footer] failed: %s", _fe)
         return reply
     except asyncio.TimeoutError:
         logger.error(

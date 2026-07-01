@@ -26,6 +26,7 @@ import {
     IconArrowUpRight,
     IconBuilding,
     IconChevronUp,
+    IconChevronDown,
     IconSwitchHorizontal,
     IconChevronRight,
     IconCheck,
@@ -325,13 +326,13 @@ export default function Layout() {
             return;
         }
         const data = await res.json();
-        if (data.redirect_url) {
-            localStorage.setItem('token', data.access_token);
-            window.location.href = data.redirect_url;
-        } else if (data.access_token) {
-            localStorage.setItem('token', data.access_token);
-            window.location.reload();
-        }
+        if (!data.access_token) return;
+        localStorage.setItem('token', data.access_token);
+        // Ignore backend's redirect_url — it's hardcoded to localhost:8800 (dev origin).
+        // After tenant switch, the role becomes the tenant-scoped role (e.g. org_admin),
+        // so /admin/* pages that gate to platform_admin will reject. Always navigate to
+        // a tenant-safe landing page instead of staying on the (potentially gated) URL.
+        window.location.href = '/dashboard';
     };
 
     // Open the tenant switcher modal — also fetch self-create config
@@ -561,6 +562,44 @@ export default function Layout() {
                     <div className="sidebar-logo">
                         <img src={theme === 'dark' ? '/logo-white.png' : '/logo-black.png'} alt="" style={{ width: 22, height: 22 }} />
                         <span className="sidebar-logo-text">Isola</span>
+                        {!isSidebarCollapsed && Array.isArray(myTenants) && myTenants.length > 1 && (
+                            <button
+                                className="btn btn-ghost tenant-switcher-tab"
+                                onClick={openTenantModal}
+                                title={isChinese ? '切换企业' : 'Switch tenant'}
+                                style={{
+                                    marginLeft: '10px',
+                                    padding: '4px 8px',
+                                    fontSize: '12px',
+                                    fontWeight: 500,
+                                    background: 'var(--bg-tertiary, rgba(255,255,255,0.05))',
+                                    border: '1px solid var(--border-primary, rgba(255,255,255,0.10))',
+                                    borderRadius: '6px',
+                                    color: 'var(--text-primary)',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '6px',
+                                    maxWidth: '150px',
+                                    overflow: 'hidden',
+                                    cursor: 'pointer',
+                                    transition: 'background 120ms ease, border-color 120ms ease',
+                                }}
+                                onMouseEnter={(e) => {
+                                    (e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-hover, rgba(255,255,255,0.08))';
+                                }}
+                                onMouseLeave={(e) => {
+                                    (e.currentTarget as HTMLButtonElement).style.background = 'var(--bg-tertiary, rgba(255,255,255,0.05))';
+                                }}
+                            >
+                                <IconBuilding size={13} stroke={1.6} style={{ flexShrink: 0, color: 'var(--text-secondary)' }} />
+                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, textAlign: 'left' }}>
+                                    {(myTenants as Array<{ tenant_id: string; tenant_name: string }>)
+                                        .find(tt => tt.tenant_id === user?.tenant_id)?.tenant_name
+                                        || (isChinese ? '选择企业' : 'Select tenant')}
+                                </span>
+                                <IconChevronDown size={12} stroke={1.8} style={{ flexShrink: 0, opacity: 0.6 }} />
+                            </button>
+                        )}
                         <button className="btn btn-ghost sidebar-collapse-btn" onClick={toggleSidebar} style={{
                             padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center',
                             marginLeft: 'auto', color: 'var(--text-tertiary)',
