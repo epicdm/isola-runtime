@@ -61,6 +61,12 @@ class InternalDispatchRequest(BaseModel):
     odoo_db: str | None = None
     odoo_login: str | None = None
     odoo_password: str | None = None
+    # Test/Preview console (owner-facing sandbox chat). When True, the same
+    # dispatch + LLM + tool-calling path runs as a live request, but any tool
+    # tagged in agent_tools.SANDBOX_GATED_TOOLS is short-circuited instead of
+    # performing its real side effect (Odoo write, message send, etc). See
+    # agent_tools.dispatch_sandbox_mode / SANDBOX_GATED_TOOLS.
+    sandbox: bool = False
 
 
 class InternalDispatchResponse(BaseModel):
@@ -71,6 +77,9 @@ class InternalDispatchResponse(BaseModel):
     # Step 4 wires per-skill tool definitions + the read_skill_md body-loader.
     skills: list[dict] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    # Echoes body.sandbox so callers (test-chat UI) can confirm the server
+    # actually ran this turn in sandbox mode, not just that the request asked for it.
+    sandbox: bool = False
 
 
 async def _verify_bff_shared_secret(
@@ -206,6 +215,12 @@ async def internal_dispatch(
         else:
             effective_role += "\n\n## CALLER CONTEXT (system-verified)\nThis caller is an UNIDENTIFIED member of the public - treat as a potential customer (lead). Help with products, prices, booking. NEVER reveal business internals, financials, or any customer information."
     # 4. Run inference. role_description_override carries SOUL + skill list.
+    #    Test/Preview console: set the sandbox contextvar BEFORE the LLM runs
+    #    so any tool call the LLM makes during this turn sees it (agent_tools
+    #    reads it in execute_tool, same contextvar-per-request pattern already
+    #    used by odoo_context/caller_context elsewhere in this file's history).
+    from app.services.agent_tools import dispatch_sandbox_mode
+    dispatch_sandbox_mode.set(bool(body.sandbox))
     try:
         draft = await _call_agent_llm(
             db=db,
@@ -228,4 +243,5 @@ async def internal_dispatch(
         soul_codepoints=len(soul_str),
         skills_count=len(skill_refs),
         skills=skill_refs,
+        sandbox=bool(body.sandbox),
     )
