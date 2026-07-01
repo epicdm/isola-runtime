@@ -1366,6 +1366,9 @@ async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
 _TOOL_AUTONOMY_MAP = {
     "write_file": "write_workspace_files",
     "delete_file": "delete_files",
+    "create_lead": "access_business_system_write",
+    "log_interaction": "access_business_system_write",
+    "request_booking": "access_business_system_write",
     "send_feishu_message": "send_feishu_message",
     "send_message_to_agent": "send_feishu_message",
     "send_file_to_agent": "send_feishu_message",
@@ -1763,6 +1766,9 @@ async def execute_tool(
                     result = f"Error querying customer balance: {type(e).__name__}: {str(e)[:200]}"
         elif tool_name == "create_lead":
             _cc = caller_context.get() or {}
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any business records to create a lead in — I'm a customer-facing assistant, not a back-office/finance tool."
             from app.services.odoo_service import agent_odoo_service, create_lead, OdooError
             try:
                 import json as _json
@@ -1779,6 +1785,9 @@ async def execute_tool(
                 result = f"Error creating lead: {type(e).__name__}: {str(e)[:200]}"
         elif tool_name == "log_interaction":
             _cc = caller_context.get() or {}
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any business records to log this against — I'm a customer-facing assistant, not a back-office/finance tool."
             _pid = _cc.get("partner_id") if _cc.get("role") == "customer" else arguments.get("partner_id")
             if not _pid:
                 result = "No customer record linked to this conversation yet - create a lead first."
@@ -1793,6 +1802,9 @@ async def execute_tool(
                     result = f"Error logging: {type(e).__name__}: {str(e)[:200]}"
         elif tool_name == "request_booking":
             _cc = caller_context.get() or {}
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any business records to book this against — I'm a customer-facing assistant, not a back-office/finance tool."
             from app.services.odoo_service import agent_odoo_service, request_booking, find_or_create_partner, OdooError
             try:
                 import json as _json
@@ -1829,7 +1841,7 @@ async def execute_tool(
             _cc = caller_context.get()
             from app.services.odoo_service import odoo_context as _octx
             _o=_octx.get() or {}
-            logger.info(f"[ARTOOL] cc={_cc} url={_o.get('url')} db={_o.get('db')} login={_o.get('login')} pwlen={len(_o.get('password') or '')}")
+            logger.info(f"[ARTOOL] cc={_cc} url={_o.get('url')} db={_o.get('db')} pwlen={len(_o.get('password') or '')}")
             if _cc is not None and _cc.get("role") != "owner":
                 return "That overview is only available to the business owner."
             # AgriLink owner-identity fix: business-data tools require a per-tenant
