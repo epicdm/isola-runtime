@@ -1608,6 +1608,30 @@ BUILTIN_TOOLS = [
         "config": {},
         "config_schema": {},
     },
+    # --- Payments (CHUNK C) ---
+    # is_default: False -- NOT auto-assigned to any agent. Wave-1 scope is
+    # EMA only, granted by an explicit AgentTool row (see
+    # _PAYMENT_LINK_ALLOWED_AGENT_IDS in agent_tools.py for the matching
+    # code-level allowlist -- both must agree before the tool actually runs).
+    {
+        "name": "create_payment_link",
+        "display_name": "Create Payment Link",
+        "description": "Mint a hosted, secure card-payment link for a customer to pay a specific amount. The agent never sees card details.",
+        "category": "payment",
+        "icon": "💳",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "description": "Amount to charge, in major currency units (e.g. 25.00). 5.00-500.00."},
+                "currency": {"type": "string", "description": "USD or XCD"},
+                "description": {"type": "string", "description": "OPTIONAL: what the payment is for, shown to the customer"},
+            },
+            "required": ["amount", "currency"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
 ]
 
 # ── AgentBay Tools ──────────────────────────────────────────────────────────
