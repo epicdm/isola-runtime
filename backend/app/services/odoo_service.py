@@ -292,6 +292,64 @@ class OdooService:
         return int(rows[0]["id"]) if rows else None
 
 
+def get_customer_balance(svc: OdooService, partner_id: int) -> dict:
+    """Return total AR balance for a partner (sum of open invoices)."""
+    uid = svc._authenticate()
+    invoices = svc._execute(
+        uid,
+        "account.move",
+        "search_read",
+        [[
+            ["partner_id", "=", partner_id],
+            ["move_type", "=", "out_invoice"],
+            ["payment_state", "in", ["not_paid", "partial"]],
+            ["state", "=", "posted"],
+        ]],
+        {"fields": ["name", "amount_residual", "currency_id", "invoice_date_due"]},
+    )
+    total = sum(float(inv.get("amount_residual") or 0) for inv in invoices)
+    return {
+        "partner_id": partner_id,
+        "open_invoices": len(invoices),
+        "total_outstanding": total,
+        "invoices": invoices,
+    }
+
+
+def list_overdue_invoices(svc: OdooService, limit: int = 10) -> list:
+    """Return top overdue invoices across all customers ordered by amount desc."""
+    from datetime import date
+    uid = svc._authenticate()
+    today = date.today().isoformat()
+    return svc._execute(
+        uid,
+        "account.move",
+        "search_read",
+        [[
+            ["move_type", "=", "out_invoice"],
+            ["payment_state", "in", ["not_paid", "partial"]],
+            ["state", "=", "posted"],
+            ["invoice_date_due", "<", today],
+        ]],
+        {
+            "fields": ["name", "partner_id", "amount_residual", "invoice_date_due"],
+            "limit": limit,
+            "order": "amount_residual desc",
+        },
+    )
+
+
+def agent_odoo_service() -> OdooService:
+    """Factory for agent AR queries — uses ODOO_AGENT_* env vars (epic_sandbox)."""
+    s = get_settings()
+    return OdooService(
+        url=s.ODOO_AGENT_URL,
+        db=s.ODOO_AGENT_DB,
+        login=s.ODOO_AGENT_LOGIN,
+        password=s.ODOO_AGENT_PASSWORD,
+    )
+
+
 def odoo_service() -> OdooService:
     """Factory that reads current settings. Use inside request handlers so
     settings changes at runtime (rare) take effect without restart."""

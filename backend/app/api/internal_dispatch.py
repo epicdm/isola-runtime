@@ -54,6 +54,13 @@ class InternalDispatchRequest(BaseModel):
     user_id: str | None = None
     session_id: str = ""
     history: list[dict] = Field(default_factory=list)
+    # DEF-006/007: caller identity + per-tenant odoo (BFF-resolved)
+    caller_phone: str | None = None
+    owner_phone: str | None = None
+    odoo_url: str | None = None
+    odoo_db: str | None = None
+    odoo_login: str | None = None
+    odoo_password: str | None = None
 
 
 class InternalDispatchResponse(BaseModel):
@@ -164,6 +171,40 @@ async def internal_dispatch(
     else:
         effective_role = soul_str or ""
 
+    # DEF-006/007: bind per-tenant odoo + caller identity before tools run.
+    from app.services.odoo_service import odoo_context
+    from app.services.agent_tools import caller_context
+    if body.odoo_db and body.odoo_password:
+        _ourl = body.odoo_url or "http://odoo-epic-app:8069"
+        if "127.0.0.1" in _ourl or "localhost" in _ourl:
+            _ourl = "http://odoo-epic-app:8069"  # container-net translation
+        odoo_context.set({"url": _ourl, "db": body.odoo_db, "login": body.odoo_login or "admin", "password": body.odoo_password})
+    if body.caller_phone:
+        from app.services.caller_identity import resolve_caller
+        class _A: owner_phone = body.owner_phone
+        _cc = await resolve_caller(_A(), body.caller_phone)
+        caller_context.set(_cc)
+        _role = _cc.get("role")
+        # DEF-006/007 + AgriLink owner-identity fix:
+        # A business-data agent is one with per-tenant Odoo configured
+        # (body.odoo_db + body.odoo_password present). ONLY such agents may
+        # divert the OWNER into business-owner mode (balances/debtors/reports).
+        # For customer-facing agents with NO business data (e.g. Isola AgriLink),
+        # the owner must KEEP the agent's soul/identity -- the agent stays itself
+        # and simply acknowledges this is its owner/admin, never flipping into a
+        # generic business-owner/executive assistant that ignores the soul.
+        # This mirrors the BFF-side fix (resolveOdooConnection().isConfigured;
+        # commit 0cb58c8f) so both dispatch paths classify owners identically.
+        _is_business_data_agent = bool(body.odoo_db and body.odoo_password)
+        if _role == "owner" and _is_business_data_agent:
+            effective_role += "\n\n## CALLER CONTEXT (system-verified)\nYou are speaking with the BUSINESS OWNER (verified by phone). Give direct business answers: balances, debtors, summaries, reports. Use your business data tools freely. Never give them the customer sales pitch."
+        elif _role == "owner":
+            # Customer-facing / non-business-data agent: stay in character.
+            effective_role += "\n\n## CALLER CONTEXT (system-verified)\nYou are speaking with your OWNER / ADMIN (verified by phone). Stay fully in your own identity and persona -- do NOT switch into a generic business-owner or executive assistant. You have no business-data/finance tools to offer. Greet them warmly as yourself, and if they ask you to do something operational you cannot do, say so plainly in your own voice. You may speak a little more candidly than with the public, but you remain exactly who you are."
+        elif _role == "customer":
+            effective_role += "\n\n## CALLER CONTEXT (system-verified)\nYou are speaking with a VERIFIED EXISTING CUSTOMER. You may look up and discuss THEIR OWN account and invoices (use get_customer_balance - no arguments needed). Never discuss other customers or internal business data."
+        else:
+            effective_role += "\n\n## CALLER CONTEXT (system-verified)\nThis caller is an UNIDENTIFIED member of the public - treat as a potential customer (lead). Help with products, prices, booking. NEVER reveal business internals, financials, or any customer information."
     # 4. Run inference. role_description_override carries SOUL + skill list.
     try:
         draft = await _call_agent_llm(
