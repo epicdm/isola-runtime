@@ -987,6 +987,37 @@ AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_payment_link",
+            "description": (
+                "Create a hosted, secure payment link a customer can open to pay by card. "
+                "Use this only when a customer has agreed to pay a specific amount right now. "
+                "You never see or handle card details yourself — the link takes the customer to "
+                "a separate secure page for that. If card collection isn't live yet on this "
+                "account, say so honestly; never claim a link works if it doesn't."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "number",
+                        "description": "Amount to charge, in major currency units (e.g. 25.00). Must be between 5.00 and 500.00.",
+                    },
+                    "currency": {
+                        "type": "string",
+                        "description": "Currency code: USD or XCD",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "OPTIONAL short description of what the payment is for, shown to the customer on the pay page.",
+                    },
+                },
+                "required": ["amount", "currency"],
+            },
+        },
+    },
 ]
 
 
@@ -1375,6 +1406,11 @@ _TOOL_AUTONOMY_MAP = {
     "web_search": "web_search",
     "execute_code": "execute_code",
     "execute_code_e2b": "execute_code",
+    # Money-moving action — its own gate, deliberately NOT
+    # access_business_system_write. See _DEFAULT_L3_ACTIONS in
+    # autonomy_service.py: this key fails closed to L3 even before any
+    # agent.autonomy_policy row explicitly sets it.
+    "create_payment_link": "access_payment_collection",
 }
 
 
@@ -1438,6 +1474,12 @@ async def _execute_tool_direct(
         elif tool_name == "send_file_to_agent":
             return await _send_file_to_agent(agent_id, ws, arguments)
         else:
+            # NOTE: create_lead/log_interaction/request_booking/create_payment_link
+            # are all deliberately absent here too -- odoo_context is a per-request
+            # ContextVar bound by internal_dispatch.py and does not survive into
+            # this later, separately-triggered post-approval execution path.
+            # Re-binding tenant context safely for L3 resume is an existing gap
+            # across the whole odoo-context-gated tool family, not new to this tool.
             return f"Tool {tool_name} does not support post-approval execution"
     except Exception as e:
         logger.exception(f"[DirectTool] Error executing {tool_name}: {e}")
@@ -1819,6 +1861,15 @@ async def execute_tool(
                 result = f"Odoo error: {e}"
             except Exception as e:
                 result = f"Error booking: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "create_payment_link":
+            # Guard like the other write tools: no tenant binding -> honest
+            # refusal, never a fabricated link. odoo_context is the same
+            # per-tenant-provisioning signal the business-write tools use --
+            # an agent with no odoo_context has no verified tenant identity.
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have a verified business account bound to this conversation — I'm a customer-facing assistant, not a back-office/finance tool. I can't create a payment link here."
+            result = await _create_payment_link(agent_id, _agent_tenant_id, arguments)
         elif tool_name == "list_recent_leads":
             _cc = caller_context.get() or {}
             if _cc is not None and _cc.get("role") != "owner":
@@ -9238,3 +9289,76 @@ async def _place_call(agent_id: uuid.UUID, args: dict) -> str:
             return f"❌ Call failed: {data.get('error', resp.text[:200])}"
     except Exception as e:
         return f"❌ Could not place call: {str(e)[:200]}"
+
+
+# ─── Payment Link Tool (CHUNK C) ──────────────────────────────────────────────
+
+# Wave-1 scope: only EMA (the EPIC tenant-zero agent) may mint payment links.
+# Default is the EMA agentId cross-referenced from prior floor logs
+# (day5_cutover_live, project_lite_concierge_build_state, reference_isola_voice_known_good_config
+# all independently confirm 8166ea11-8db0-4f26-879a-e2067be0a018) — override via env
+# without a code change once ops confirms it against the live agents table.
+_PAYMENT_LINK_ALLOWED_AGENT_IDS = frozenset(
+    x.strip() for x in os.getenv(
+        "PAYMENT_LINK_ALLOWED_AGENT_IDS", "8166ea11-8db0-4f26-879a-e2067be0a018"
+    ).split(",") if x.strip()
+)
+
+
+async def _create_payment_link(agent_id: uuid.UUID, tenant_id: str | None, args: dict) -> str:
+    """Mint a hosted Fiserv payment link via BFF POST /api/internal/payment-link.
+
+    Never touches card data itself -- only requests a link the customer opens
+    separately. Two independent "not live" gates must both be satisfied before
+    this ever reaches a real customer: PAYMENT_COLLECTION_LIVE here (isola-runtime
+    side) and FISERV_CHARGE_ENABLED on the BFF (checked at charge time, not mint
+    time -- the mint contract has no live status field to query, so this tool
+    carries its own mirror of the same off-by-default posture rather than
+    trusting a link it can't verify is actually chargeable).
+    """
+    agent_id_str = str(agent_id)
+    if agent_id_str not in _PAYMENT_LINK_ALLOWED_AGENT_IDS:
+        return "Payment link creation isn't enabled for this agent yet."
+
+    if os.getenv("PAYMENT_COLLECTION_LIVE", "false").lower() != "true":
+        return "Card collection isn't live on this account yet — I can't send a payment link right now."
+
+    raw_amount = args.get("amount")
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        return "❌ Please provide a numeric amount, e.g. 25.00."
+    if not (5 <= amount <= 500):
+        return "❌ Payment links must be between 5.00 and 500.00."
+
+    currency = (args.get("currency") or "").strip().upper()
+    if currency not in ("USD", "XCD"):
+        return "❌ currency must be USD or XCD."
+
+    description = args.get("description")
+    bff_base = os.getenv("BFF_API_BASE_URL", "https://bff.epic.dm")
+    secret = os.getenv("BFF_INTERNAL_SECRET", "")
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{bff_base}/api/internal/payment-link",
+                json={
+                    "amount": amount,
+                    "currency": currency,
+                    "description": description if isinstance(description, str) else None,
+                    "tenantId": tenant_id,
+                    "agentId": agent_id_str,
+                    "createdBy": f"ema-agent:{agent_id_str}",
+                },
+                headers={"x-internal-secret": secret},
+            )
+        data = resp.json()
+    except Exception as e:
+        return f"❌ Could not reach the payment system: {str(e)[:200]}"
+
+    if resp.status_code != 200 or not data.get("ok"):
+        return f"❌ Couldn't create the payment link: {data.get('error', resp.text[:200])}"
+
+    return f"✅ Payment link ready: {data.get('url')} (expires {data.get('expiresAt', 'soon')})"

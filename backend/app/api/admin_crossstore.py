@@ -850,9 +850,11 @@ from fastapi import Request, Response
 from app.models.channel_config import ChannelConfig
 
 
-# 9-key autonomy whitelist (R35). Source: agents.autonomy_policy schema default
-# in app/models/agent.py line 76. access_business_system splits into _read + _write
-# (NOT 8 keys as v1.0 plan body claimed; corrected to 9 per probe surface).
+# 10-key autonomy whitelist (R35 + CHUNK C). Source: agents.autonomy_policy schema
+# default in app/models/agent.py line 76. access_business_system splits into
+# _read + _write (NOT 8 keys as v1.0 plan body claimed; corrected to 9 per probe
+# surface). access_payment_collection added by CHUNK C (create_payment_link) —
+# deliberately its own key, not folded into access_business_system_write.
 _AUTONOMY_KEY_WHITELIST = (
     "write_workspace_files",
     "delete_files",
@@ -863,13 +865,17 @@ _AUTONOMY_KEY_WHITELIST = (
     "access_business_system_write",
     "create_calendar_event",
     "financial_operations",
+    "access_payment_collection",
 )
 
-# Wave-1 enforcement reality (R35, updated fix/business-write-gate): these 3
-# keys actually gate via _TOOL_AUTONOMY_MAP in agent_tools.py. access_business_system_write
-# gates create_lead/log_interaction/request_booking as of the write-gate fix. The
+# Wave-1 enforcement reality (R35, updated fix/business-write-gate, then CHUNK C):
+# these 4 keys actually gate via _TOOL_AUTONOMY_MAP in agent_tools.py. access_business_system_write
+# gates create_lead/log_interaction/request_booking as of the write-gate fix.
+# access_payment_collection gates create_payment_link as of CHUNK C. The
 # remaining 6 are scaffolded — saved + persisted but no tool currently checks them.
-_AUTONOMY_ENFORCED_WAVE1 = frozenset(("write_workspace_files", "delete_files", "access_business_system_write"))
+_AUTONOMY_ENFORCED_WAVE1 = frozenset((
+    "write_workspace_files", "delete_files", "access_business_system_write", "access_payment_collection",
+))
 
 _AUTONOMY_VALUES = ("L1", "L2", "L3")
 

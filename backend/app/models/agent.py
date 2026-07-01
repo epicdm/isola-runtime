@@ -85,6 +85,13 @@ class Agent(Base):
             "delete_files": "L3",
             "create_calendar_event": "L2",
             "financial_operations": "L3",
+            # CHUNK C: payment-link minting gets its own key, not
+            # access_business_system_write -- money never shares a gate.
+            # This Python-side default only applies to newly-created agent
+            # rows; check_and_enforce() in autonomy_service.py also fails
+            # closed to L3 for this key on any pre-existing row that lacks
+            # it, so an unmigrated row is never silently L2.
+            "access_payment_collection": "L3",
         },
     )
 

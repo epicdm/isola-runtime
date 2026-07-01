@@ -20,6 +20,16 @@ from app.models.channel_config import ChannelConfig
 from app.models.user import User
 
 
+# Action types that must fail closed to L3 (require approval) when an
+# agent's stored autonomy_policy doesn't yet have an explicit entry for them.
+# The Agent model's Python-side column default (app/models/agent.py) only
+# applies to newly-INSERTed rows -- a pre-existing agent row (e.g. one
+# provisioned before this key existed) has no way to pick it up retroactively,
+# so a plain `.get(action_type, "L2")` would silently auto-execute a
+# money-moving action the first time it's ever seen for that agent. CHUNK C.
+_DEFAULT_L3_ACTIONS = frozenset({"access_payment_collection"})
+
+
 class AutonomyService:
     """Enforce autonomy boundaries for agent operations."""
 
@@ -37,7 +47,8 @@ class AutonomyService:
             }
         """
         policy = agent.autonomy_policy or {}
-        level = policy.get(action_type, "L2")  # Default to L2
+        default_level = "L3" if action_type in _DEFAULT_L3_ACTIONS else "L2"
+        level = policy.get(action_type, default_level)
 
         # Log the action regardless of level
         audit = AuditLog(
