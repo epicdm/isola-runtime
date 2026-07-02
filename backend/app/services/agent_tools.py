@@ -172,6 +172,18 @@ caller_context: ContextVar = ContextVar('caller_context', default=None)
 # can auto-invite them as attendee when no explicit attendee list is given
 channel_feishu_sender_open_id: ContextVar = ContextVar('channel_feishu_sender_open_id', default=None)
 
+# Test/Preview console (owner-facing sandbox chat, dispatch-level "sandbox"
+# flag in InternalDispatchRequest). Set once per dispatch by
+# internal_dispatch.py before the LLM/tool-calling loop runs for that turn.
+dispatch_sandbox_mode: ContextVar = ContextVar('dispatch_sandbox_mode', default=False)
+
+# Tools tagged here perform a real external mutation (Odoo write, outbound
+# message, owner ping, real-money payment link, etc). When dispatch_sandbox_mode
+# is True, execute_tool short-circuits any tool_name in this set instead of
+# running its real handler -- no real record or charge lands from a
+# test/preview dispatch.
+SANDBOX_GATED_TOOLS: set = {"create_lead", "log_interaction", "request_booking", "create_payment_link"}
+
 # ─── Tool Definitions (OpenAI function-calling format) ──────────
 
 AGENT_TOOLS = [
@@ -1499,6 +1511,22 @@ async def execute_tool(
         session_id: The ChatSession ID, used to isolate AgentBay instances
                     per conversation. Passed through to agentbay_* tools.
     """
+    # ── Test/Preview console sandbox gate ──
+    # Short-circuit BEFORE any workspace/DB/tool work for tools tagged as
+    # side-effecting. Faithful to the real dispatch otherwise -- same
+    # recognition, same tool selection by the LLM -- only the external
+    # mutation itself is suppressed.
+    if dispatch_sandbox_mode.get() and tool_name in SANDBOX_GATED_TOOLS:
+        logger.info(
+            f"[sandbox] short-circuiting side-effecting tool '{tool_name}' "
+            f"for agent {agent_id} (test/preview dispatch, no real action taken)"
+        )
+        return (
+            f"[TEST MODE] '{tool_name}' would run with arguments {arguments} -- "
+            "no real record was created or modified because this is a "
+            "sandbox/preview dispatch."
+        )
+
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
     ws = await ensure_workspace(agent_id, tenant_id=_agent_tenant_id)
