@@ -178,11 +178,11 @@ channel_feishu_sender_open_id: ContextVar = ContextVar('channel_feishu_sender_op
 dispatch_sandbox_mode: ContextVar = ContextVar('dispatch_sandbox_mode', default=False)
 
 # Tools tagged here perform a real external mutation (Odoo write, outbound
-# message, owner ping, etc). When dispatch_sandbox_mode is True, execute_tool
-# short-circuits any tool_name in this set instead of running its real
-# handler -- no real record lands from a test/preview dispatch.
-# create_payment_link is added by the payment lane when its runtime PR lands.
-SANDBOX_GATED_TOOLS: set = {"create_lead", "log_interaction", "request_booking"}
+# message, owner ping, real-money payment link, etc). When dispatch_sandbox_mode
+# is True, execute_tool short-circuits any tool_name in this set instead of
+# running its real handler -- no real record or charge lands from a
+# test/preview dispatch.
+SANDBOX_GATED_TOOLS: set = {"create_lead", "log_interaction", "request_booking", "create_payment_link"}
 
 # ─── Tool Definitions (OpenAI function-calling format) ──────────
 
