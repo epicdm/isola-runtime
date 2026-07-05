@@ -12,6 +12,12 @@ its routes. Day-4b's design decision #1 calls for a DISTINCT trust
 boundary -- BFF uses Authorization: Bearer with its own shared secret
 (BFF_CLAWITH_SHARED_SECRET), not the apps/isola X-Internal-Secret.
 
+PKT-04 / decision d35 (2026-07-05): the staging BFF (bff-v2-staging)
+presents a second, staging-only value, BFF_CLAWITH_SHARED_SECRET_STAGING.
+Both secrets are valid Bearer tokens for this same endpoint -- see
+app/core/bff_clawith_auth.py for the matching logic. Production behavior
+is unchanged when the staging secret is left unset.
+
 Failure mode (Eric's Day-4b decision #4): FAIL-CLOSED on Paperclip
 unreachability. Returns HTTP 503; BFF dead-letters the inbound message
 upstream. The /channel/whatsapp/{id}/webhook route is unaffected (and
@@ -24,8 +30,6 @@ the read_skill_md body-loader as one coherent change.
 
 from __future__ import annotations
 
-import os
-import secrets
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -35,6 +39,10 @@ from sqlalchemy import update as _sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.channel_common import _call_agent_llm
+from app.core.bff_clawith_auth import (
+    any_bff_clawith_secret_configured,
+    resolve_bff_clawith_secret,
+)
 from app.database import get_db
 from app.models.agent import Agent as _Agent
 from app.services import paperclip_client
@@ -85,9 +93,9 @@ class InternalDispatchResponse(BaseModel):
 async def _verify_bff_shared_secret(
     authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> None:
-    """FastAPI dep: 401 unless Authorization: Bearer <BFF_CLAWITH_SHARED_SECRET>."""
-    expected = os.environ.get("BFF_CLAWITH_SHARED_SECRET", "").strip()
-    if not expected:
+    """FastAPI dep: 401 unless Authorization: Bearer matches the prod or
+    staging BFF-Clawith shared secret (see app/core/bff_clawith_auth.py)."""
+    if not any_bff_clawith_secret_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="dispatch_misconfigured: BFF_CLAWITH_SHARED_SECRET unset",
@@ -98,7 +106,7 @@ async def _verify_bff_shared_secret(
             detail="missing_bearer_token",
         )
     presented = authorization[7:]
-    if not secrets.compare_digest(presented, expected):
+    if resolve_bff_clawith_secret(presented) is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="bad_bearer_token",
