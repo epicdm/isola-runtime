@@ -2061,6 +2061,7 @@ BUILTIN_TOOLS = [
     *BUILTIN_TOOLS,
     # ── AgentBay Tools ──  
     *AGENTBAY_TOOLS,
+    {"name": "place_call", "display_name": "Place Outbound Call", "description": "Place an outbound voice call to a phone number. Use ONLY after explicit consent and confirmed number.", "category": "communication", "icon": "phone", "is_default": False, "parameters_schema": {"type": "object", "properties": {"phone": {"type": "string", "description": "Phone number in E.164 format"}, "agentId": {"type": "string", "description": "Agent ID placing the call"}}, "required": ["phone"]}, "config": {}, "config_schema": {}},
 ]
 
 async def seed_builtin_tools():

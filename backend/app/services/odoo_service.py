@@ -339,8 +339,16 @@ def list_overdue_invoices(svc: OdooService, limit: int = 10) -> list:
     )
 
 
+from contextvars import ContextVar
+# DEF-007: per-dispatch odoo target set by internal_dispatch (multi-tenant)
+odoo_context: ContextVar = ContextVar('odoo_context', default=None)
+
+
 def agent_odoo_service() -> OdooService:
     """Factory for agent AR queries — uses ODOO_AGENT_* env vars (epic_sandbox)."""
+    ctx = odoo_context.get()
+    if ctx:
+        return OdooService(url=ctx['url'], db=ctx['db'], login=ctx['login'], password=ctx['password'])
     s = get_settings()
     return OdooService(
         url=s.ODOO_AGENT_URL,
@@ -360,3 +368,68 @@ def odoo_service() -> OdooService:
         login=s.ODOO_ADMIN_LOGIN,
         password=s.ODOO_ADMIN_PASSWORD,
     )
+
+
+# ── WRITE LOOP (DEF: MISSION-WRITE-LOOP) ─────────────────────────────
+
+def _norm_phone(p):
+    return ''.join(ch for ch in (p or '') if ch.isdigit())[-10:]
+
+def find_or_create_partner(svc, name, phone):
+    """Idempotent on phone (last-10 match). Returns (partner_id, created)."""
+    uid = svc._authenticate()
+    np = _norm_phone(phone)
+    if np:
+        parts = svc._execute(uid, 'res.partner', 'search_read',
+                             [[]], {'fields': ['id', 'phone'], 'limit': 800})
+        hits = [p['id'] for p in parts if _norm_phone(p.get('phone')) == np]
+        if hits:
+            return hits[0], False
+    pid = svc._execute(uid, 'res.partner', 'create',
+                       [{'name': name or f'WhatsApp {phone}', 'phone': phone}])
+    return pid, True
+
+def create_lead(svc, name, phone, interest='', notes=''):
+    uid = svc._authenticate()
+    pid, created = find_or_create_partner(svc, name, phone)
+    lead_id = svc._execute(uid, 'crm.lead', 'create', [{
+        'name': f"WhatsApp lead: {interest or 'general enquiry'}",
+        'partner_id': pid, 'contact_name': name, 'phone': phone,
+        'description': notes or '',
+    }])
+    return {'ok': True, 'partner_id': pid, 'lead_id': lead_id,
+            'message': f"Lead saved for {name}. You're in the system."}
+
+
+def log_interaction(svc, partner_id, summary):
+    uid = svc._authenticate()
+    svc._execute(uid, 'res.partner', 'message_post', [[int(partner_id)]],
+                 {'body': summary[:2000]})
+    return {'ok': True, 'partner_id': int(partner_id), 'message': "Noted on the customer record."}
+
+def request_booking(svc, partner_id, service, preferred_date=None, notes=''):
+    import datetime as _dt
+    uid = svc._authenticate()
+    try:
+        d = _dt.date.fromisoformat((preferred_date or '').strip())
+    except Exception:
+        d = _dt.date.today() + _dt.timedelta(days=3)
+    start = f"{d.isoformat()} 09:00:00"
+    stop = f"{d.isoformat()} 10:00:00"
+    ev = svc._execute(uid, 'calendar.event', 'create', [{
+        'name': f"Install/booking: {service}",
+        'start': start, 'stop': stop,
+        'description': notes or '',
+        'partner_ids': [(4, int(partner_id))],
+    }])
+    return {'ok': True, 'event_id': ev, 'date': d.isoformat(), 'service': service,
+            'message': f"Booking confirmed for {service} on {d.isoformat()}."}
+
+
+def list_recent_leads(svc, limit=10):
+    """Recent CRM leads (owner view). Live from crm.lead."""
+    uid = svc._authenticate()
+    rows = svc._execute(uid, 'crm.lead', 'search_read',
+                        [[]], {'fields': ['contact_name','phone','name','create_date'],
+                               'limit': int(limit), 'order': 'id desc'})
+    return {'count': len(rows), 'leads': rows}

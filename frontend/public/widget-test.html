@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head><title>S6 Widget Test</title></head>
+<body>
+<h2>S6 Widget Test — Inbox 17 (Isola Web)</h2>
+<script>
+  window.chatwootSettings = {
+    hideMessageBubble: false,
+    position: 'right',
+    locale: 'en',
+    type: 'standard',
+  };
+  (function(d,t) {
+    var BASE_URL="https://inbox.epic.dm";
+    var g=d.createElement(t),s=d.getElementsByTagName(t)[0];
+    g.src=BASE_URL+"/packs/js/sdk.js";
+    g.defer = true;
+    g.async = true;
+    s.parentNode.insertBefore(g,s);
+    g.onload=function(){
+      window.chatwootSDK.run({
+        websiteToken: 'UpdpVqgt4oFz65ehSU4gsLHc',
+        baseUrl: BASE_URL
+      })
+    }
+  })(document,"script");
+</script>
+</body>
+</html>

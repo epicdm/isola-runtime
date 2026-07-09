@@ -283,7 +283,7 @@ async def list_agents(
     """List all agents the current user has access to."""
     # platform_admin & org_admin see all agents (optionally filtered by tenant)
     if current_user.role in ("platform_admin", "org_admin"):
-        stmt = select(Agent)
+        stmt = select(Agent).where(Agent.retired_at.is_(None))
         if tenant_id:
             stmt = stmt.where(Agent.tenant_id == tenant_id)
         result = await db.execute(stmt.order_by(Agent.created_at.desc()))
@@ -303,7 +303,7 @@ async def list_agents(
     user_tenant = current_user.tenant_id
 
     # Get agents user created (within their tenant)
-    created = select(Agent).where(Agent.creator_id == current_user.id, Agent.tenant_id == user_tenant)
+    created = select(Agent).where(Agent.creator_id == current_user.id, Agent.tenant_id == user_tenant, Agent.retired_at.is_(None))
 
     # Get agents user has permission to (within their tenant)
     permitted_ids = (
@@ -313,7 +313,7 @@ async def list_agents(
             | ((AgentPermission.scope_type == "user") & (AgentPermission.scope_id == current_user.id))
         )
     )
-    permitted = select(Agent).where(Agent.id.in_(permitted_ids), Agent.tenant_id == user_tenant)
+    permitted = select(Agent).where(Agent.id.in_(permitted_ids), Agent.tenant_id == user_tenant, Agent.retired_at.is_(None))
 
     # Union
     from sqlalchemy import union_all

@@ -378,10 +378,10 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
             detail="Username already taken. Please choose a different username.",
         )
     
-    # Auto-verify all users — email SMTP not operational in this environment
-    identity.email_verified = True
-    identity.is_active = True
-    await db.flush()
+    if is_first_user:
+        identity.email_verified = True
+        identity.is_active = True
+        await db.flush()
 
     # 4. Create Tenant User (Handles OrgMember binding and Participant creation)
     user = await registration_service.create_user_with_identity(
@@ -393,11 +393,9 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         registration_source="web"
     )
 
-    # Commit user + identity now — SMTP failure must NOT rollback registration
-    await db.commit()
-
     # Seed default agents for first user
     if is_first_user:
+        await db.commit()
         try:
             from app.services.agent_seeder import seed_default_agents
             await seed_default_agents()

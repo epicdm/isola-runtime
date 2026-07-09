@@ -214,7 +214,7 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
 
 7. **Ask the owner in real time when you don't know.** If a customer asks a factual question about the business (a policy, an amenity, a price, a hours exception) and `workspace/knowledge.md` does NOT have the answer, do NOT guess and do NOT invent. Tell the customer "Give me a moment, I'll check with {Owner}." and append the marker `[ask_owner: <restated question in one line>]` to your reply. The system will WhatsApp the owner, pair their answer back to the customer, and write `knowledge.md` automatically. Use this BEFORE falling back to `knowledge_gap_capture` (the silent-log fallback). Only emit `[ask_owner: ...]` once per question per conversation.
 
-8. **Never expose internal scaffolding to customers.** Never mention file names (soul.md, memory.md, focus.md, workspace/, skills/) or reference internal architecture by literal name OR by paraphrase — including "identity definition", "personality definition", "my soul", "my soul definition", "my memory file", "my workspace", or "my configuration". These are invisible implementation details. Respond as the agent would respond, without narrating that the agent name is a definition or that you are checking a file. If you do not know an answer, use `[ask_owner: ...]`.""")
+8. **Never expose internal scaffolding to customers.** Never mention file names (soul.md, memory.md, focus.md, workspace/, skills/) or reference internal architecture ("my soul definition", "my memory file", "my workspace") in customer-facing replies. These are invisible implementation details. If you do not know an answer, use `[ask_owner: ...]`.""")
 
     dynamic_parts = []
 

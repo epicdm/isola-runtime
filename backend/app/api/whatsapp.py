@@ -500,6 +500,11 @@ async def _process_whatsapp_message(
             )
             return
 
+        # DEF-006: resolve caller identity (channel decides, never the model)
+        from app.services.agent_tools import caller_context as _caller_ctx
+        from app.services.caller_identity import resolve_caller
+        _cc_token = _caller_ctx.set(await resolve_caller(agent, from_wa_id))
+
         ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
         history_r = await db.execute(
             select(ChatMessage)
