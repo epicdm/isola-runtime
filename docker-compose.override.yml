@@ -19,12 +19,19 @@
 # (external) alongside isolaruntime_dev. PAPERCLIP_API_URL switched
 # from http://172.17.0.1:3200 (docker0 host bridge) to http://paperclip:3100
 # (container DNS via isola-net alias).
+# 2026-07-05 (PKT-04 / decision d35): added
+# BFF_CLAWITH_SHARED_SECRET_STAGING passthrough. Second, staging-only
+# value accepted alongside BFF_CLAWITH_SHARED_SECRET by
+# /api/internal/dispatch (see app/core/bff_clawith_auth.py). Blank by
+# default -- an operator provisions the actual value later; this repo
+# change only wires the passthrough, it does not set or apply it.
 services:
   backend:
     ports:
       - "8800:8000"
     environment:
       BFF_CLAWITH_SHARED_SECRET: ${BFF_CLAWITH_SHARED_SECRET:-}
+      BFF_CLAWITH_SHARED_SECRET_STAGING: ${BFF_CLAWITH_SHARED_SECRET_STAGING:-}
       PAPERCLIP_API_URL: ${PAPERCLIP_API_URL:-}
       PAPERCLIP_API_TOKEN: ${PAPERCLIP_API_TOKEN:-}
       # L5 S0.5 — Langfuse trace emission from backend/app/services/llm/client.py.
