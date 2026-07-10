@@ -88,6 +88,10 @@ class InternalDispatchResponse(BaseModel):
     # Echoes body.sandbox so callers (test-chat UI) can confirm the server
     # actually ran this turn in sandbox mode, not just that the request asked for it.
     sandbox: bool = False
+    # S5: True when a tool this turn could not confidently answer from grounded
+    # Odoo data (see agent_tools.needs_handoff_signal). BFF reads this and pings
+    # the human owner via the existing pingOperatorOnEscalation path.
+    needs_handoff: bool = False
 
 
 async def _verify_bff_shared_secret(
@@ -227,8 +231,9 @@ async def internal_dispatch(
     #    so any tool call the LLM makes during this turn sees it (agent_tools
     #    reads it in execute_tool, same contextvar-per-request pattern already
     #    used by odoo_context/caller_context elsewhere in this file's history).
-    from app.services.agent_tools import dispatch_sandbox_mode
+    from app.services.agent_tools import dispatch_sandbox_mode, needs_handoff_signal
     dispatch_sandbox_mode.set(bool(body.sandbox))
+    needs_handoff_signal.set(False)
     try:
         draft = await _call_agent_llm(
             db=db,
@@ -252,4 +257,5 @@ async def internal_dispatch(
         skills_count=len(skill_refs),
         skills=skill_refs,
         sandbox=bool(body.sandbox),
+        needs_handoff=bool(needs_handoff_signal.get()),
     )

@@ -316,6 +316,41 @@ def get_customer_balance(svc: OdooService, partner_id: int) -> dict:
     }
 
 
+def get_lead_status(svc: OdooService, partner_id: int) -> dict:
+    """Return the status of the customer's most recent CRM enquiry (crm.lead) on file.
+
+    S5: crm.lead is the only Odoo model on the pilot tenant with real,
+    partner-linked, customer-facing records (confirmed by probe 2026-07-10 —
+    project.task/helpdesk.ticket carry no customer partner_id and are
+    internal-only). Mirrors get_customer_balance's read shape.
+    """
+    uid = svc._authenticate()
+    leads = svc._execute(
+        uid,
+        "crm.lead",
+        "search_read",
+        [[["partner_id", "=", partner_id]]],
+        {
+            "fields": ["name", "stage_id", "active", "create_date"],
+            "limit": 1,
+            "order": "create_date desc",
+        },
+    )
+    if not leads:
+        return {"partner_id": partner_id, "found": False}
+    lead = leads[0]
+    stage = lead.get("stage_id")
+    return {
+        "partner_id": partner_id,
+        "found": True,
+        "lead_id": lead["id"],
+        "name": lead.get("name"),
+        "stage": stage[1] if isinstance(stage, list) else None,
+        "active": bool(lead.get("active")),
+        "created": lead.get("create_date"),
+    }
+
+
 def list_overdue_invoices(svc: OdooService, limit: int = 10) -> list:
     """Return top overdue invoices across all customers ordered by amount desc."""
     from datetime import date
