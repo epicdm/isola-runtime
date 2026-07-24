@@ -392,6 +392,7 @@ from app.api.users import router as users_router
 from app.api.chat_sessions import router as chat_sessions_router
 from app.api.groups import router as groups_router
 from app.api.slack import router as slack_router
+from app.api.whatsapp import router as whatsapp_router  # ISOLA GLUE — native WA Cloud API router, upstream file, was never mounted
 from app.api.discord_bot import router as discord_router
 from app.api.dingtalk import router as dingtalk_router
 from app.api.google_workspace import router as google_workspace_router
@@ -435,6 +436,7 @@ app.include_router(enterprise_kb_router, prefix=settings.API_PREFIX)
 app.include_router(skills_router, prefix=settings.API_PREFIX)
 app.include_router(users_router, prefix=settings.API_PREFIX)
 app.include_router(slack_router, prefix=settings.API_PREFIX)
+app.include_router(whatsapp_router, prefix=settings.API_PREFIX)  # ISOLA GLUE — native WA Cloud API router
 app.include_router(discord_router, prefix=settings.API_PREFIX)
 app.include_router(dingtalk_router, prefix=settings.API_PREFIX)
 app.include_router(google_workspace_router, prefix=settings.API_PREFIX)
