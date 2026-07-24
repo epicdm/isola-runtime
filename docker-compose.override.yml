@@ -1,0 +1,6 @@
+services:
+  backend:
+    ports:
+    - 8801:8000
+    environment:
+      ISOLA_BRIDGE_SECRET: ${ISOLA_BRIDGE_SECRET:-}

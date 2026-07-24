@@ -455,6 +455,7 @@ app.include_router(webhooks_router)  # Public endpoint, no API prefix
 app.include_router(ws_router)
 app.include_router(group_ws_router)
 app.include_router(gateway_router, prefix=settings.API_PREFIX)
+app.include_router(__import__("app.api.isola_bridge", fromlist=["router"]).router, prefix=settings.API_PREFIX)  # ISOLA GLUE — additive bridge endpoint (not upstream)
 app.include_router(admin_router, prefix=settings.API_PREFIX)
 app.include_router(pages_router, prefix=settings.API_PREFIX)
 app.include_router(pages_public_router)  # Public endpoint for /p/{short_id}, no API prefix
