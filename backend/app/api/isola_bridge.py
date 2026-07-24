@@ -291,6 +291,13 @@ async def bridge_message(
             },
         )
 
+    # Selected-identity attribution (2026-07-24, R2 attribution close): the
+    # agent/tenant returned here are the SAME rows already loaded and
+    # validated by db.get(Agent, body.agent_id) above -- a direct primary-key
+    # fetch, never a lookup-by-tenant that could resolve ambiguously. This
+    # lets the caller (BFF) confirm the identity it dispatched to actually
+    # exists and matches its own persisted configuration, rather than
+    # trusting its own pre-dispatch config alone.
     return JSONResponse(
         status_code=200,
         content={
@@ -299,6 +306,9 @@ async def bridge_message(
             "matched_session": str(session_id),
             "status": final_status,
             "correlation_id": body.correlation_id,
+            "agent_id": str(agent.id),
+            "agent_name": agent.name,
+            "tenant_id": str(tenant_id),
         },
     )
 
