@@ -130,12 +130,23 @@ async def _load_assigned_smithery_connection(
     return {"namespace": namespace, "connection_id": connection_id}
 
 
+def _is_platform_admin_user(user: User) -> bool:
+    return user.role == "platform_admin" or bool(
+        getattr(getattr(user, "identity", None), "is_platform_admin", False)
+    )
+
+
 def _resolve_target_tenant_id(current_user: User, tenant_id: str | None = None) -> uuid.UUID | None:
     if tenant_id:
         try:
-            return uuid.UUID(tenant_id)
+            requested = uuid.UUID(tenant_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid tenant_id format")
+        # Tenant-isolation (def-clawith-tools-cross-tenant-write-2026-07-29):
+        # only platform admins may target another tenant; never trust the body otherwise.
+        if requested != current_user.tenant_id and not _is_platform_admin_user(current_user):
+            raise HTTPException(status_code=403, detail="Cannot target another tenant")
+        return requested
     return current_user.tenant_id
 
 
@@ -296,7 +307,12 @@ async def update_tools_bulk(
 ):
     """Bulk update the enabled status of multiple tools."""
     tool_ids = [uuid.UUID(u.tool_id) for u in updates]
-    result = await db.execute(select(Tool).where(Tool.id.in_(tool_ids)))
+    # Tenant-isolation (def-clawith-tools-cross-tenant-write-2026-07-29): non-admins
+    # may only toggle tools owned by their own tenant.
+    _bulk_q = select(Tool).where(Tool.id.in_(tool_ids))
+    if not _is_platform_admin_user(current_user):
+        _bulk_q = _bulk_q.where(Tool.tenant_id == current_user.tenant_id)
+    result = await db.execute(_bulk_q)
     tools_map = {str(t.id): t for t in result.scalars().all()}
     
     for update in updates:
@@ -320,6 +336,15 @@ async def update_tool(
     if not tool:
         raise HTTPException(status_code=404, detail="Tool not found")
 
+    # Tenant-isolation (def-clawith-tools-cross-tenant-write-2026-07-29): a custom
+    # (non-builtin) tool may only be modified by its owning tenant or a platform admin.
+    if (
+        not _is_platform_admin_user(current_user)
+        and tool.source != "builtin"
+        and tool.tenant_id != current_user.tenant_id
+    ):
+        raise HTTPException(status_code=403, detail="Cannot modify a tool outside your tenant")
+
     update_data = data.model_dump(exclude_unset=True)
     target_tenant_id = _resolve_target_tenant_id(current_user, update_data.pop("tenant_id", None))
 
@@ -332,6 +357,9 @@ async def update_tool(
         else:
             update_data["config"] = _encrypt_sensitive_fields(config_value, tool.config_schema)
 
+    if update_data and tool.source == "builtin" and not _is_platform_admin_user(current_user):
+        # builtin tools are shared platform rows; non-admins may only write tenant-scoped config
+        raise HTTPException(status_code=403, detail="Only platform admins can modify builtin tool fields")
     for field, value in update_data.items():
         setattr(tool, field, value)
     await db.commit()
@@ -351,6 +379,11 @@ async def delete_tool(
         raise HTTPException(status_code=404, detail="Tool not found")
     if tool.type == "builtin":
         raise HTTPException(status_code=400, detail="Cannot delete builtin tools")
+
+    # Tenant-isolation (def-clawith-tools-cross-tenant-write-2026-07-29): only the
+    # owning tenant or a platform admin may delete a custom tool.
+    if not _is_platform_admin_user(current_user) and tool.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot delete a tool outside your tenant")
 
     await db.execute(delete(AgentTool).where(AgentTool.tool_id == tool_id))
     await db.delete(tool)
@@ -636,15 +669,12 @@ async def update_mcp_server(
     2. URL query param (e.g. ?tavilyApiKey=xxx) — extracted from the URL
        and converted to Bearer by MCPClient automatically.
     """
-    # Resolve target tenant
-    target_tenant_id: uuid.UUID | None = None
-    if data.tenant_id:
-        try:
-            target_tenant_id = uuid.UUID(data.tenant_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid tenant_id format")
-    else:
-        target_tenant_id = current_user.tenant_id
+    # Tenant-isolation (def-clawith-tools-cross-tenant-write-2026-07-29): derive the
+    # target tenant server-side (only platform admins may target another tenant), and
+    # writing tenant-wide MCP credentials (URL + encrypted API key) requires an admin role.
+    if current_user.role not in ("platform_admin", "org_admin"):
+        raise HTTPException(status_code=403, detail="Requires admin role to update MCP server credentials")
+    target_tenant_id = _resolve_target_tenant_id(current_user, data.tenant_id)
 
     # Load all tools from this server under the target tenant
     result = await db.execute(
@@ -693,7 +723,10 @@ async def list_agent_installed_tools(
         .order_by(AgentTool.created_at.desc())
     )
     # Scope by tenant: only show tools installed by agents in this tenant
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    # Tenant-isolation (def-clawith-tools-cross-tenant-write-2026-07-29): reject a
+    # client-supplied foreign tenant for non-admins on this read.
+    _tid_uuid = _resolve_target_tenant_id(current_user, tenant_id)
+    tid = str(_tid_uuid) if _tid_uuid else None
     if tid:
         from app.models.agent import Agent as Ag
         # Some local/prod databases still have agents.tenant_id as varchar from
@@ -738,6 +771,12 @@ async def delete_agent_tool(
     at = at_r.scalar_one_or_none()
     if not at:
         raise HTTPException(status_code=404, detail="Agent tool assignment not found")
+    # Tenant-isolation guard (def-clawith-tools-cross-tenant-write-2026-07-29):
+    # resolve the owning agent; require manage access within the actor's own tenant.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    _guard_agent, _guard_access = await _check_agent_access(db, current_user, at.agent_id)
+    if _guard_access != "manage":
+        raise HTTPException(status_code=403, detail="Requires manage access to this agent")
     tool_id = at.tool_id
     await db.delete(at)
     await db.flush()
