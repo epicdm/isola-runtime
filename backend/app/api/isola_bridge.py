@@ -43,6 +43,97 @@ from app.services.chat_session_service import ensure_primary_platform_session
 
 router = APIRouter(prefix="/isola/bridge", tags=["isola-bridge"])
 
+
+# --- Foundation<->Clawith structured response contract (ADDITIVE, schema 1.0) ---
+# Emitted ONLY for agent ids in CLAWITH_STRUCTURED_CONTRACT_AGENT_IDS, nested under
+# the "contract" key so the legacy minimal envelope (relied on by 3742/bff-v2) is
+# preserved byte-for-byte for every other agent. Clawith PROPOSES tools; Foundation
+# executes them -- this endpoint never writes Odoo, calls Chatwoot, or sends messages.
+_CONTRACT_SCHEMA_VERSION = "1.0"
+_CONTRACT_AGENTS_ENV = "CLAWITH_STRUCTURED_CONTRACT_AGENT_IDS"
+_KNOWLEDGE_TOOL_NAMES = {
+    "read_file", "find_files", "search_files", "search_experience", "list_files",
+}
+
+
+def _contract_enabled_for(agent_id) -> bool:
+    ids = {s.strip() for s in os.environ.get(_CONTRACT_AGENTS_ENV, "").split(",") if s.strip()}
+    return str(agent_id) in ids
+
+
+def _derive_contract_fields(rows):
+    """Pure derivation from the run's tool-execution rows (unit-testable, no DB/IO)."""
+    escalation_requested = False
+    escalation_reason = None
+    knowledge_sources_used: list[str] = []
+    completed_tool_outcomes: list[dict] = []
+    for e in rows:
+        completed_tool_outcomes.append({
+            "name": e.tool_name,
+            "tool_call_id": e.tool_call_id,
+            "status": e.status,
+            "result_summary": (e.result_summary or "")[:500],
+            "error": None,
+        })
+        if e.tool_name == "escalate_to_human":
+            escalation_requested = True
+            args = e.sanitized_arguments or {}
+            escalation_reason = (
+                args.get("reason") or args.get("escalation_reason") or "customer_requested_human"
+            )
+        if e.tool_name in _KNOWLEDGE_TOOL_NAMES and "enterprise_info" in (e.result_summary or ""):
+            if e.tool_name not in knowledge_sources_used:
+                knowledge_sources_used.append(e.tool_name)
+    return escalation_requested, escalation_reason, knowledge_sources_used, completed_tool_outcomes
+
+
+def _assemble_contract(*, agent_id, agent_name, tenant_id, run_id, session_id,
+                       correlation_id, status, reply, derived):
+    escalation_requested, escalation_reason, knowledge_sources_used, completed_tool_outcomes = derived
+    return {
+        "schema_version": _CONTRACT_SCHEMA_VERSION,
+        "agent_id": str(agent_id),
+        "agent_name": agent_name,
+        "tenant_id": str(tenant_id),
+        "run_id": str(run_id),
+        "matched_session": str(session_id),
+        "correlation_id": correlation_id,
+        "status": status,
+        "response_text": reply,
+        # Model-emitted fields -- placeholders until the agent emits structured metadata.
+        "customer_facing_next_step": None,
+        "intent": None,
+        "confidence": None,
+        "missing_information": [],
+        # Clawith PROPOSES; Foundation executes. Populated once the agent emits proposals.
+        "proposed_tool_calls": [],
+        # Derived from this run's governed tool executions.
+        "knowledge_sources_used": knowledge_sources_used,
+        "completed_tool_outcomes": completed_tool_outcomes,
+        "escalation_requested": escalation_requested,
+        "escalation_reason": escalation_reason,
+        "follow_up_required": escalation_requested,
+    }
+
+
+async def _build_structured_contract(*, run_id, session_id, agent, tenant_id,
+                                     reply, final_status, correlation_id):
+    from app.models.agent_tool_execution import AgentToolExecution
+    rows = []
+    try:
+        async with async_session() as db:
+            rows = (await db.execute(
+                select(AgentToolExecution).where(AgentToolExecution.run_id == run_id)
+            )).scalars().all()
+    except Exception:
+        rows = []  # contract derivation must never break the bridge response
+    derived = _derive_contract_fields(rows)
+    return _assemble_contract(
+        agent_id=agent.id, agent_name=agent.name, tenant_id=tenant_id,
+        run_id=run_id, session_id=session_id, correlation_id=correlation_id,
+        status=final_status, reply=reply, derived=derived,
+    )
+
 # Stable namespace so a given phone always maps to the same tenant User row.
 _ISOLA_USER_NS = uuid.UUID("a1f0c0de-1501-4a00-b000-000000000000")
 _SECRET_ENV = "ISOLA_BRIDGE_SECRET"
@@ -298,19 +389,23 @@ async def bridge_message(
     # lets the caller (BFF) confirm the identity it dispatched to actually
     # exists and matches its own persisted configuration, rather than
     # trusting its own pre-dispatch config alone.
-    return JSONResponse(
-        status_code=200,
-        content={
-            "reply": reply,
-            "run_id": str(run_id),
-            "matched_session": str(session_id),
-            "status": final_status,
-            "correlation_id": body.correlation_id,
-            "agent_id": str(agent.id),
-            "agent_name": agent.name,
-            "tenant_id": str(tenant_id),
-        },
-    )
+    _content = {
+        "reply": reply,
+        "run_id": str(run_id),
+        "matched_session": str(session_id),
+        "status": final_status,
+        "correlation_id": body.correlation_id,
+        "agent_id": str(agent.id),
+        "agent_name": agent.name,
+        "tenant_id": str(tenant_id),
+    }
+    # Additive structured contract for gated agents; legacy envelope untouched otherwise.
+    if _contract_enabled_for(agent.id):
+        _content["contract"] = await _build_structured_contract(
+            run_id=run_id, session_id=session_id, agent=agent, tenant_id=tenant_id,
+            reply=reply, final_status=final_status, correlation_id=body.correlation_id,
+        )
+    return JSONResponse(status_code=200, content=_content)
 
 
 __all__ = ["router"]
