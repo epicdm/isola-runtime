@@ -123,6 +123,10 @@ class Settings(BaseSettings):
 
     # Agent Runtime
     AGENT_RUNTIME_V2_ENABLED: bool = False
+    # Seed the built-in demo agents (Morty/Meeseeks) and the OKR Agent on
+    # bootstrap. Disable in production so demo agents do not appear in a
+    # customer's tenant (def-clawith-demo-seed-in-customer-tenant).
+    SEED_DEFAULT_DEMO_AGENTS: bool = True
     AGENT_RUNTIME_V2_AGENT_IDS: str = ""
     AGENT_RUNTIME_V2_SOURCE_TYPES: str = "task"
     AGENT_RUNTIME_GRAPH_NAME: str = "clawith_agent_runtime"

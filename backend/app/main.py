@@ -260,13 +260,19 @@ async def lifespan(app: FastAPI):
 
         try:
             from app.services.agent_seeder import seed_default_agents
-            await seed_default_agents()
+            if settings.SEED_DEFAULT_DEMO_AGENTS:
+                await seed_default_agents()
+            else:
+                logger.info("[startup] Default demo agents seed disabled (SEED_DEFAULT_DEMO_AGENTS=false)")
         except Exception as e:
             logger.warning(f"[startup] Default agents seed failed: {e}")
 
         try:
             from app.services.agent_seeder import seed_okr_agent
-            await seed_okr_agent()
+            if settings.SEED_DEFAULT_DEMO_AGENTS:
+                await seed_okr_agent()
+            else:
+                logger.info("[startup] OKR Agent seed disabled (SEED_DEFAULT_DEMO_AGENTS=false)")
         except Exception as e:
             logger.warning(f"[startup] OKR Agent seed failed: {e}")
 
