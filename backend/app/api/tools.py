@@ -366,6 +366,10 @@ async def get_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Get tools for a specific agent with their enabled status."""
+    # Tenant-isolation guard - def-clawith-tools-cross-tenant-write-2026-07-29:
+    # derive tenancy from the authenticated actor; deny cross-tenant access.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    await _check_agent_access(db, current_user, agent_id)
     from app.services.agent_tools import _agent_has_feishu
     has_feishu = await _agent_has_feishu(agent_id)
 
@@ -456,6 +460,12 @@ async def update_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Update tool assignments for an agent."""
+    # Tenant-isolation guard - def-clawith-tools-cross-tenant-write-2026-07-29:
+    # writes require manage access within the actor's own tenant.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    _guard_agent, _guard_access = await _check_agent_access(db, current_user, agent_id)
+    if _guard_access != "manage":
+        raise HTTPException(status_code=403, detail="Requires manage access to this agent")
     agent_obj = await _load_agent_for_tool_scope(db, agent_id)
     assignments = await _load_agent_tool_assignments(db, agent_id)
     for u in updates:
@@ -760,6 +770,10 @@ async def get_agent_tool_config(
     Both configs are decrypted before returning. Global sensitive fields are
     masked so the frontend can show a key is configured without exposing it.
     """
+    # Tenant-isolation guard - def-clawith-tools-cross-tenant-write-2026-07-29:
+    # derive tenancy from the authenticated actor; deny cross-tenant access.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    await _check_agent_access(db, current_user, agent_id)
     tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = tool_r.scalar_one_or_none()
     if not tool:
@@ -799,6 +813,12 @@ async def update_agent_tool_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Save per-agent config override for a tool."""
+    # Tenant-isolation guard - def-clawith-tools-cross-tenant-write-2026-07-29:
+    # writes require manage access within the actor's own tenant.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    _guard_agent, _guard_access = await _check_agent_access(db, current_user, agent_id)
+    if _guard_access != "manage":
+        raise HTTPException(status_code=403, detail="Requires manage access to this agent")
     # Check permission: only platform_admin and org_admin can modify allow_network
     if "allow_network" in data.config:
         if current_user.role not in ("platform_admin", "org_admin"):
@@ -841,6 +861,10 @@ async def get_agent_tools_with_config(
     rather than Tool.config. We resolve those as part of the global config so
     the agent-level UI can show the inherited key hint.
     """
+    # Tenant-isolation guard - def-clawith-tools-cross-tenant-write-2026-07-29:
+    # derive tenancy from the authenticated actor; deny cross-tenant access.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    await _check_agent_access(db, current_user, agent_id)
     from app.services.agent_tools import _agent_has_feishu
     has_feishu = await _agent_has_feishu(agent_id)
 
@@ -1141,6 +1165,12 @@ async def test_category_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Test connectivity for a tool category."""
+    # Tenant-isolation guard - def-clawith-tools-cross-tenant-write-2026-07-29:
+    # writes require manage access within the actor's own tenant.
+    from app.core.permissions import check_agent_access as _check_agent_access
+    _guard_agent, _guard_access = await _check_agent_access(db, current_user, agent_id)
+    if _guard_access != "manage":
+        raise HTTPException(status_code=403, detail="Requires manage access to this agent")
     if category == "atlassian":
         from app.api.atlassian import test_atlassian_channel
         return await test_atlassian_channel(agent_id, current_user, db)
