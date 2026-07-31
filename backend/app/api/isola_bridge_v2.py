@@ -43,7 +43,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
@@ -651,4 +653,57 @@ async def _touch(db, request_id) -> None:
     await db.commit()
 
 
-__all__ = ["router"]
+# ---------------------------------------------------------------------------
+# M89: validation errors must not echo the customer's data back.
+#
+# FastAPI's default 422 body includes `input` -- the rejected request body.
+# On a real turn that is the customer's phone number and message text sitting
+# in an error response. Nothing secret, but nothing anyone needs either.
+# Scoped to this router's prefix: every other API client keeps the default
+# shape, because changing them is not this lane's business.
+# ---------------------------------------------------------------------------
+
+_SANITIZE_PREFIX = "/api/isola/bridge/v2"
+
+_SAFE_MESSAGES = {
+    "extra_forbidden": "Unexpected field",
+    "missing": "Field required",
+    "uuid_parsing": "Invalid identifier format",
+    "uuid_type": "Invalid identifier format",
+    "string_too_short": "Value is too short",
+    "string_too_long": "Value is too long",
+    "string_type": "Expected a string",
+    "dict_type": "Expected an object",
+    "json_invalid": "Malformed JSON",
+    "int_parsing": "Expected an integer",
+    "enum": "Value not permitted",
+}
+
+
+async def sanitized_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    if not request.url.path.startswith(_SANITIZE_PREFIX):
+        return await request_validation_exception_handler(request, exc)
+    detail = [
+        {
+            "code": "validation_error",
+            "location": [str(part) for part in err.get("loc", ())],
+            "type": err.get("type"),
+            "message": _SAFE_MESSAGES.get(str(err.get("type")), "Invalid value"),
+        }
+        for err in exc.errors()
+    ]
+    body: dict = {"error": "validation_error", "detail": detail}
+    correlation = request.headers.get("x-correlation-id")
+    if correlation:
+        body["correlation_id"] = correlation[:200]
+    return JSONResponse(status_code=422, content=body)
+
+
+def install_validation_sanitizer(app) -> None:
+    """Called once from main.py, immediately after this router is mounted."""
+    app.add_exception_handler(RequestValidationError, sanitized_validation_handler)
+
+
+__all__ = ["router", "install_validation_sanitizer"]
