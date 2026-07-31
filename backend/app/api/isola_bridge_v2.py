@@ -41,10 +41,11 @@ import asyncio
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 
 from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -79,11 +80,68 @@ _RETRY_AFTER_S = 3
 
 _ALLOWLIST_ENV = "ISOLA_BRIDGE_V2_CUSTOMER_AGENTS"
 
-STATE_RUNNING = "running"
-STATE_COMPLETED = "completed"
-STATE_FAILED = "failed"
-STATE_CANCELLED = "cancelled"
-STATE_EXPIRED = "expired"
+class BridgeRequestState(str, Enum):
+    """What is PERSISTED in isola_bridge_requests.state. Guarded by a DB check
+    constraint; every value here must exist in that constraint."""
+
+    ACCEPTED = "accepted"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
+
+
+class BridgeResultStatus(str, Enum):
+    """What a RETRIEVAL returns. Deliberately a different vocabulary: `pending`
+    is derived, and `not_found` cannot be persisted because there is no row."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+    NOT_FOUND = "not_found"
+
+
+_STATE_TO_STATUS: dict[BridgeRequestState, BridgeResultStatus] = {
+    BridgeRequestState.ACCEPTED: BridgeResultStatus.PENDING,
+    BridgeRequestState.RUNNING: BridgeResultStatus.PENDING,
+    BridgeRequestState.COMPLETED: BridgeResultStatus.COMPLETED,
+    BridgeRequestState.FAILED: BridgeResultStatus.FAILED,
+    BridgeRequestState.CANCELLED: BridgeResultStatus.CANCELLED,
+    BridgeRequestState.EXPIRED: BridgeResultStatus.EXPIRED,
+    BridgeRequestState.REJECTED: BridgeResultStatus.FAILED,
+}
+
+
+def result_status_for(state: str | None, has_terminal_result: bool) -> BridgeResultStatus:
+    """The ONE place a persisted state becomes a retrieval status.
+
+    Fails closed: an unknown persisted state, or `completed` with no terminal
+    message, is reported as failed rather than as a usable result.
+    """
+    if state is None:
+        return BridgeResultStatus.NOT_FOUND
+    try:
+        persisted = BridgeRequestState(state)
+    except ValueError:
+        return BridgeResultStatus.FAILED
+    mapped = _STATE_TO_STATUS[persisted]
+    if persisted is BridgeRequestState.COMPLETED and not has_terminal_result:
+        return BridgeResultStatus.FAILED
+    if mapped is BridgeResultStatus.PENDING and has_terminal_result:
+        return BridgeResultStatus.COMPLETED
+    return mapped
+
+
+# Aliases kept so persistence sites read as persistence, not as API status.
+STATE_RUNNING = BridgeRequestState.RUNNING.value
+STATE_COMPLETED = BridgeRequestState.COMPLETED.value
+STATE_FAILED = BridgeRequestState.FAILED.value
+STATE_CANCELLED = BridgeRequestState.CANCELLED.value
+STATE_EXPIRED = BridgeRequestState.EXPIRED.value
 
 
 def _customer_agent_allowlist() -> set[str]:
@@ -100,6 +158,10 @@ def _iso(value: datetime | None) -> str | None:
 
 
 class BridgeRequestIn(BaseModel):
+    # Unknown properties are REFUSED, not ignored. An undeclared field is an
+    # unbounded authority channel (tool_authority, system_prompt, overrides).
+    model_config = ConfigDict(extra="forbid")
+
     agent_id: uuid.UUID
     phone: str = Field(min_length=3, max_length=64)
     text: str = Field(min_length=1)
@@ -388,13 +450,13 @@ async def get_request(
             await db.execute(_SELECT_BY_ID_SQL, {"id": str(bridge_request_id)})
         ).mappings().first()
         if row is None:
-            return JSONResponse(status_code=404, content={"state": "not_found"})
+            return JSONResponse(status_code=404, content={"state": BridgeResultStatus.NOT_FOUND.value})
 
         # Cross-tenant retrieval is refused as not_found: a holder of the
         # shared secret must not be able to confirm a request exists in
         # another tenant by probing ids.
         if claimed_tenant and str(row["tenant_id"]).lower() != claimed_tenant.strip().lower():
-            return JSONResponse(status_code=404, content={"state": "not_found"})
+            return JSONResponse(status_code=404, content={"state": BridgeResultStatus.NOT_FOUND.value})
 
         r = _Row(row)
 
@@ -405,7 +467,7 @@ async def get_request(
             return JSONResponse(
                 status_code=200,
                 content={
-                    "state": r.state,
+                    "state": result_status_for(r.state, False).value,
                     "bridge_request_id": str(r.id),
                     "error_class": r.error_class,
                     "correlation_id": r.correlation_id,
@@ -417,7 +479,10 @@ async def get_request(
             await _mark(db, r.id, STATE_EXPIRED, error_class="retention_expired")
             return JSONResponse(
                 status_code=200,
-                content={"state": STATE_EXPIRED, "bridge_request_id": str(r.id)},
+                content={
+                    "state": result_status_for(BridgeRequestState.EXPIRED.value, False).value,
+                    "bridge_request_id": str(r.id),
+                },
             )
 
         run_status: str | None = None
@@ -461,7 +526,7 @@ async def get_request(
         return JSONResponse(
             status_code=200,
             content={
-                "state": "pending",
+                "state": result_status_for(r.state, False).value,
                 "bridge_request_id": str(r.id),
                 "run_state": run_status,
                 "settled": run_status in _SETTLED_STATUSES if run_status else False,
@@ -498,7 +563,7 @@ async def _completed_payload(db, r) -> dict:
             (r.completed_at.astimezone(UTC) - r.accepted_at.astimezone(UTC)).total_seconds() * 1000
         )
     return {
-        "state": STATE_COMPLETED,
+        "state": result_status_for(r.state, bool(content and content.strip())).value,
         "bridge_request_id": str(r.id),
         "response": content,
         "terminal_message_id": str(r.terminal_message_id) if r.terminal_message_id else None,
