@@ -2535,6 +2535,42 @@ async def test_allowed_tool_names_invalid_type_raises_context_build_error() -> N
 
 
 @pytest.mark.asyncio
+async def test_allowed_tool_names_explicit_null_fails_closed_not_treated_as_absent() -> None:
+    """An explicit JSON `null` for `allowed_tool_names` (key PRESENT, value
+    `None`) must be treated as malformed input, never silently conflated
+    with the key being ABSENT (which means "no override"). Regression test
+    for a `.get(key)` vs. `key in dict` distinction bug."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    initial_input = dict(state["snapshots"].initial_input)
+    initial_input["allowed_tool_names"] = None
+    assert "allowed_tool_names" in initial_input
+    state["snapshots"] = RunInputSnapshots(
+        session_context=state["snapshots"].session_context,
+        session_context_version=state["snapshots"].session_context_version,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input=initial_input,
+    )
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=_finish_completion,
+        tool_provider=_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    result = await service.complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error["code"] == "invalid_runtime_input"
+
+
+@pytest.mark.asyncio
 async def test_allowed_tool_names_override_also_applies_to_fallback_model_tools() -> None:
     """The fallback-model branch must inherit the same restriction as the
     primary branch — it derives from the same filtered

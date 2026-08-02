@@ -3253,3 +3253,44 @@ async def test_allowed_tool_names_override_malformed_raises_tool_execution_error
     assert executed == []
     assert result.error is not None
     assert result.error["code"] == "invalid_runtime_input"
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_explicit_null_fails_closed_not_treated_as_absent() -> None:
+    """An explicit JSON `null` for `allowed_tool_names` (key PRESENT, value
+    `None`) must be treated as malformed input, never silently conflated
+    with the key being ABSENT (which means "no override" and would let the
+    tool execute). Regression test for a `.get(key)` vs. `key in dict`
+    distinction bug."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "read_file")
+    state = _state(tenant_id, agent, (call,))
+    initial_input = dict(state["snapshots"].initial_input)
+    initial_input["allowed_tool_names"] = None
+    assert "allowed_tool_names" in initial_input
+    state["snapshots"] = RunInputSnapshots(
+        session_context=state["snapshots"].session_context,
+        session_context_version=state["snapshots"].session_context_version,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input=initial_input,
+    )
+    executed: list[str] = []
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        executed.append(name)
+        raise AssertionError("must not execute when the override is an explicit null")
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert executed == []
+    assert result.error is not None
+    assert result.error["code"] == "invalid_runtime_input"

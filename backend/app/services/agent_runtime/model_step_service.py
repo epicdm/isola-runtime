@@ -370,10 +370,14 @@ def _allowed_tool_names_override(state: RuntimeGraphState) -> frozenset[str] | N
     exactly like `application_tools_enabled` above. `None` means no override
     was requested for this Run — every other caller (both legacy bridges,
     Direct/Group/A2A chat) is completely unaffected. An empty list means
-    zero Application tools for this Run, not "no restriction"."""
-    value = state["snapshots"].initial_input.get("allowed_tool_names")
-    if value is None:
+    zero Application tools for this Run, not "no restriction". Key ABSENCE
+    (not the value `None`) is what means "no override" — an explicit JSON
+    `null` is malformed input, not a no-op, so it must fail closed rather
+    than be silently treated as "no restriction"."""
+    initial_input = state["snapshots"].initial_input
+    if "allowed_tool_names" not in initial_input:
         return None
+    value = initial_input["allowed_tool_names"]
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ContextBuildError(
             "invalid_runtime_input",

@@ -160,11 +160,14 @@ def _allowed_tool_names(tools: Sequence[Mapping[str, object]]) -> frozenset[str]
 def _allowed_tool_names_override(state: RuntimeGraphState) -> frozenset[str] | None:
     """Same per-Run override `model_step_service._allowed_tool_names_override`
     reads — re-checked independently here so execution can never honor a
-    tool name that was filtered out of what the model was offered. `None`
-    means no override for this Run (every existing caller today)."""
-    value = state["snapshots"].initial_input.get("allowed_tool_names")
-    if value is None:
+    tool name that was filtered out of what the model was offered. Key
+    ABSENCE (not the value `None`) means no override for this Run (every
+    existing caller today) — an explicit JSON `null` is malformed input
+    and must fail closed, not be treated as a no-op."""
+    initial_input = state["snapshots"].initial_input
+    if "allowed_tool_names" not in initial_input:
         return None
+    value = initial_input["allowed_tool_names"]
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ToolExecutionError(
             "invalid_runtime_input",

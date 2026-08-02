@@ -68,6 +68,8 @@ DESIGN
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import Literal
@@ -250,10 +252,11 @@ _CLAIM_SQL = text(
     """
     INSERT INTO isola_bridge_requests (
         id, tenant_id, stable_request_id, correlation_id, external_conversation_id,
-        contact_ref, agent_id, state, accepted_at, idempotency_key
+        contact_ref, agent_id, state, accepted_at, idempotency_key, metadata_labels
     ) VALUES (
         :id, :tenant_id, :stable_request_id, :correlation_id, :external_conversation_id,
-        :contact_ref, :agent_id, :state, :accepted_at, :idempotency_key
+        :contact_ref, :agent_id, :state, :accepted_at, :idempotency_key,
+        CAST(:metadata_labels AS JSONB)
     )
     ON CONFLICT (tenant_id, stable_request_id) DO NOTHING
     RETURNING id
@@ -365,7 +368,26 @@ async def _resolve_effective_tool_names(
     return effective, unsupported
 
 
-async def _claim(*, tenant_id, stable_key: str, correlation_id: str, body: StructuredBridgeMessageIn):
+def _tool_policy_digest(effective_tool_names: list[str]) -> str:
+    """A short, order-independent fingerprint of one turn's effective tool
+    set, stored alongside the idempotency claim (in the existing
+    `metadata_labels` JSONB column — no migration). Lets a request that
+    loses the claim detect whether it is a genuine retry of the SAME
+    turn-defining policy, or a `correlation_id` reused with a DIFFERENT
+    `allowed_tools` — which must never silently inherit another policy's
+    already-produced result."""
+    canonical = ",".join(sorted(effective_tool_names))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+async def _claim(
+    *,
+    tenant_id,
+    stable_key: str,
+    correlation_id: str,
+    body: StructuredBridgeMessageIn,
+    tool_policy_digest: str,
+):
     """Atomic claim attempt against isola_bridge_requests. Returns
     (won: bool, row: _Row)."""
     claim_id = uuid.uuid4()
@@ -386,6 +408,9 @@ async def _claim(*, tenant_id, stable_key: str, correlation_id: str, body: Struc
                         "state": "accepted",
                         "accepted_at": accepted_at,
                         "idempotency_key": f"{tenant_id}:{stable_key}",
+                        "metadata_labels": json.dumps(
+                            {"tool_policy_digest": tool_policy_digest}
+                        ),
                     },
                 )
             ).first()
@@ -598,11 +623,38 @@ async def bridge_structured_message(
             },
         )
 
+    tool_policy_digest = _tool_policy_digest(effective_tool_names)
+
     won, claim_row = await _claim(
-        tenant_id=tenant_id, stable_key=stable_key, correlation_id=correlation_id, body=body
+        tenant_id=tenant_id,
+        stable_key=stable_key,
+        correlation_id=correlation_id,
+        body=body,
+        tool_policy_digest=tool_policy_digest,
     )
     if claim_row is None:  # pragma: no cover - defensive; claim always leaves a row
         return JSONResponse(status_code=500, content={"error": "claim_failed"})
+
+    stored_labels = claim_row.metadata_labels if hasattr(claim_row, "metadata_labels") else None
+    stored_digest = stored_labels.get("tool_policy_digest") if isinstance(stored_labels, dict) else None
+    if stored_digest is not None and stored_digest != tool_policy_digest:
+        # This correlation_id is already claimed under a DIFFERENT
+        # allowed_tools policy than this request just resolved. Whatever
+        # Run that claim is attached to was authorized under a different
+        # effective tool set — this request must never silently inherit
+        # its result (or its policy), so it is rejected rather than
+        # joining the existing claim. A genuine retry of the SAME logical
+        # turn always recomputes the SAME digest and is unaffected.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "correlation_id_policy_mismatch",
+                "detail": (
+                    "this correlation_id is already claimed under a "
+                    "different allowed_tools policy"
+                ),
+            },
+        )
 
     if won:
         try:

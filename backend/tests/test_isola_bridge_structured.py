@@ -248,7 +248,7 @@ class _FakeClaimStore:
 
 
 def _wire_claim_store(monkeypatch, store: _FakeClaimStore):
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         return store.claim(tenant_id, stable_key, correlation_id)
 
     async def fake_wait_for_claim_population(row_id):
@@ -297,7 +297,7 @@ async def test_golden_request_produces_a_foundation_parseable_response(monkeypat
     # layer + envelope construction — the piece unique to this endpoint —
     # behaves correctly. The separate `won` DB-wiring is exercised by
     # `test_won_claim_calls_enqueue_chat_runtime_exactly_once`.
-    async def fake_claim_pre_enqueued(*, tenant_id, stable_key, correlation_id, body):
+    async def fake_claim_pre_enqueued(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         won, row = store.claim(tenant_id, stable_key, correlation_id)
         if won:
             store.populate_enqueued(
@@ -404,7 +404,7 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
 
     win_count = {"n": 0}
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         won, row = store.claim(tenant_id, stable_key, correlation_id)
         if won:
             win_count["n"] += 1
@@ -496,7 +496,7 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
     completed_row.state = "completed"
     completed_row.terminal_message_id = uuid.uuid4()
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         return False, completed_row  # always a replay of the already-completed row
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
@@ -620,7 +620,7 @@ async def test_unsupported_tool_rejected_with_400_before_claim(monkeypatch, clie
 
     claim_calls = []
 
-    async def spy_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def spy_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         claim_calls.append(correlation_id)
         raise AssertionError("must not claim before tool governance passes")
 
@@ -658,7 +658,7 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
 
     claim_calls = []
 
-    async def spy_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def spy_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         claim_calls.append(correlation_id)
         return False, SimpleNamespace(
             id=uuid.uuid4(),
@@ -744,7 +744,7 @@ async def test_duplicate_tool_names_in_request_deduplicate_to_one_name(
         structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
     )
 
-    async def spy_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def spy_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         return False, SimpleNamespace(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
@@ -847,7 +847,7 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
         structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
     )
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body):
+    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
         return True, SimpleNamespace(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
@@ -951,3 +951,158 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
     assert response.status_code == 200
     assert len(enqueue_calls) == 1
     assert enqueue_calls[0]["allowed_tool_names"] == ["crm.lead.create"]
+
+
+@pytest.mark.asyncio
+async def test_correlation_id_reused_with_different_allowed_tools_is_rejected_not_joined(
+    monkeypatch, client
+):
+    """Regression test for a race an adversarial review flagged BLOCKING:
+    a `correlation_id` already claimed under one `allowed_tools` policy
+    must never let a request carrying a DIFFERENT policy silently join and
+    inherit that claim's result — the mismatched request must be rejected
+    deterministically instead."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    winner_digest = structured_api._tool_policy_digest(["crm.lead.create"])
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+        metadata_labels={"tool_policy_digest": winner_digest},
+    )
+
+    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+        # Always reports the loser path against the pre-existing winning
+        # claim, mirroring test_replay_after_completion's pattern.
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    wait_calls = []
+
+    async def fake_wait_for_claim_population(row_id):
+        wait_calls.append(row_id)
+        return existing_row
+
+    monkeypatch.setattr(
+        structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
+    )
+
+    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
+        raise AssertionError(
+            "must not poll/return a mismatched-policy claim's result"
+        )
+
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
+
+    # Requests an EMPTY allowlist -- a different policy than the digest
+    # already recorded on the existing claim (which was computed from
+    # ["crm.lead.create"]).
+    payload = dict(GOLDEN_REQUEST, allowed_tools=[])
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/structured/message", json=payload, headers=_headers()
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "correlation_id_policy_mismatch"
+    # The mismatch is caught before the loser's wait/poll path is ever
+    # reached -- no partial progress down that path.
+    assert wait_calls == []
+
+
+@pytest.mark.asyncio
+async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_claim(
+    monkeypatch, client
+):
+    """A genuine retry of the SAME logical turn (identical resolved
+    `allowed_tools` policy, hence identical digest) must NOT be rejected --
+    only a policy MISMATCH is rejected, never a legitimate retry."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    matching_digest = structured_api._tool_policy_digest(["crm.lead.create"])
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+        metadata_labels={"tool_policy_digest": matching_digest},
+    )
+
+    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    async def fake_wait_for_claim_population(row_id):
+        return existing_row
+
+    monkeypatch.setattr(
+        structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
+    )
+
+    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
+        return True, "completed", "Yes — same policy, legitimate retry."
+
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
+
+    async def fake_read_last_assistant(db, session_id, after):
+        return SimpleNamespace(id=uuid.uuid4(), content="Yes — same policy, legitimate retry.")
+
+    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
+
+    class _NoopSession:
+        async def execute(self, *a, **k):
+            return SimpleNamespace(first=lambda: None, mappings=lambda: SimpleNamespace(first=lambda: None))
+
+        async def commit(self):
+            return None
+
+        async def get(self, *a, **k):
+            return None
+
+    class _NoopSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return _NoopSession()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
+
+    payload = dict(
+        GOLDEN_REQUEST,
+        allowed_tools=[
+            {"name": "crm.lead.create", "description": "Create", "arguments": [], "mutating": True}
+        ],
+    )
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/structured/message", json=payload, headers=_headers()
+        )
+
+    assert response.status_code == 200
+    assert response.json()["customer_reply"] == "Yes — same policy, legitimate retry."
