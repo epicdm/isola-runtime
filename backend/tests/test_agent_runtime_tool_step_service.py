@@ -3045,3 +3045,252 @@ async def test_group_cross_space_policy_does_not_change_other_tool_paths(
     assert result.error is None
     assert dispatched == [tool_name]
     assert result.messages[0]["execution_status"] == "succeeded"
+
+
+# ── Per-turn `allowed_tool_names` governance
+# (dec-clawith-structured-per-turn-tool-governance-2026-08-02) ───────────────
+# This is the DIRECT-EXECUTION-PROHIBITED enforcement point: even if a tool
+# were somehow offered to the model outside `_gated_application_tools`
+# (model_step_service), execution here independently re-checks the same
+# per-Run override before dispatching to `tool_executor` — so a filtered-out
+# tool can never actually run.
+
+
+def _state_with_allowed_tool_names(
+    tenant_id: uuid.UUID,
+    agent: Agent,
+    calls: tuple[dict, ...],
+    allowed_tool_names,
+) -> RuntimeGraphState:
+    state = _state(tenant_id, agent, calls)
+    initial_input = dict(state["snapshots"].initial_input)
+    if allowed_tool_names is not None:
+        initial_input["allowed_tool_names"] = allowed_tool_names
+    state["snapshots"] = RunInputSnapshots(
+        session_context=state["snapshots"].session_context,
+        session_context_version=state["snapshots"].session_context_version,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input=initial_input,
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_override_blocks_execution_of_filtered_out_tool() -> None:
+    """A tool the model was NOT offered (filtered out of this turn's
+    effective set) must never execute, even if named in a tool call —
+    zero business-effect execution is proven via the executor spy."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "write_file")
+    state = _state_with_allowed_tool_names(tenant_id, agent, (call,), ["read_file"])
+    executed: list[str] = []
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        executed.append(name)
+        raise AssertionError("must not execute a tool outside the effective set")
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert executed == []
+    assert result.error is not None
+    assert result.error["code"] == "tool_not_enabled"
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_override_permits_intersected_tool(
+    monkeypatch,
+) -> None:
+    """A tool that IS in the effective set still executes normally."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "read_file")
+    state = _state_with_allowed_tool_names(tenant_id, agent, (call,), ["read_file"])
+    context = _context(state)
+    execution = _execution(tenant_id, uuid.UUID(context.run_id), "call-1", "read_file")
+    executed: list[str] = []
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        del arguments, agent_id, user_id, session_id, on_output
+        executed.append(name)
+        return ToolExecutionOutcome(
+            status="succeeded", result_summary="file contents", result_ref=None
+        )
+
+    async def mark(db, **kwargs):
+        del db, kwargs
+        execution.status = "succeeded"
+        return execution
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_succeeded", mark)
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, context, (call,))
+
+    assert executed == ["read_file"]
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_empty_override_blocks_every_tool_execution() -> None:
+    """EMPTY ALLOWLIST at the execution layer: a tool that is normally
+    enabled for this Agent must still never execute when the per-turn
+    override is []."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "read_file")
+    state = _state_with_allowed_tool_names(tenant_id, agent, (call,), [])
+    executed: list[str] = []
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        executed.append(name)
+        raise AssertionError("must not execute any tool under an empty allowlist")
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert executed == []
+    assert result.error is not None
+    assert result.error["code"] == "tool_not_enabled"
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_override_absent_preserves_existing_behavior(
+    monkeypatch,
+) -> None:
+    """No per-Run override (every existing caller today): execution is
+    byte-for-byte unchanged from before this change."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "read_file")
+    state = _state(tenant_id, agent, (call,))
+    assert "allowed_tool_names" not in state["snapshots"].initial_input
+    context = _context(state)
+    execution = _execution(tenant_id, uuid.UUID(context.run_id), "call-1", "read_file")
+    executed: list[str] = []
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        del arguments, agent_id, user_id, session_id, on_output
+        executed.append(name)
+        return ToolExecutionOutcome(
+            status="succeeded", result_summary="file contents", result_ref=None
+        )
+
+    async def mark(db, **kwargs):
+        del db, kwargs
+        execution.status = "succeeded"
+        return execution
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_succeeded", mark)
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, context, (call,))
+
+    assert executed == ["read_file"]
+    assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_override_malformed_raises_tool_execution_error() -> None:
+    """A malformed override (not a list of strings) must fail closed —
+    never silently ignored, which would un-restrict — and must never reach
+    tool execution."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "read_file")
+    state = _state_with_allowed_tool_names(tenant_id, agent, (call,), "read_file")
+    executed: list[str] = []
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        executed.append(name)
+        raise AssertionError("must not execute when the override is malformed")
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert executed == []
+    assert result.error is not None
+    assert result.error["code"] == "invalid_runtime_input"
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_explicit_null_fails_closed_not_treated_as_absent() -> None:
+    """An explicit JSON `null` for `allowed_tool_names` (key PRESENT, value
+    `None`) must be treated as malformed input, never silently conflated
+    with the key being ABSENT (which means "no override" and would let the
+    tool execute). Regression test for a `.get(key)` vs. `key in dict`
+    distinction bug."""
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-1", "read_file")
+    state = _state(tenant_id, agent, (call,))
+    initial_input = dict(state["snapshots"].initial_input)
+    initial_input["allowed_tool_names"] = None
+    assert "allowed_tool_names" in initial_input
+    state["snapshots"] = RunInputSnapshots(
+        session_context=state["snapshots"].session_context,
+        session_context_version=state["snapshots"].session_context_version,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input=initial_input,
+    )
+    executed: list[str] = []
+
+    async def execute(name, arguments, agent_id, user_id, session_id="", on_output=None):
+        executed.append(name)
+        raise AssertionError("must not execute when the override is an explicit null")
+
+    service = tool_step_service.RuntimeToolStepService(
+        session_factory=_session_factory(agent),
+        cancel_source=_CancelSource(None),
+        tool_provider=_tools,
+        tool_executor=execute,
+    )
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert executed == []
+    assert result.error is not None
+    assert result.error["code"] == "invalid_runtime_input"

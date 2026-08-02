@@ -2313,3 +2313,306 @@ async def test_retryable_primary_error_without_fallback_pauses_for_resume() -> N
     assert str(result.waiting_request["correlation_id"]).startswith("model-provider-retry:")
     assert "4 attempts" in str(result.waiting_request["reason"])
     assert calls == 4
+
+
+# ── Per-turn `allowed_tool_names` governance
+# (dec-clawith-structured-per-turn-tool-governance-2026-08-02) ───────────────
+# `allowed_tool_names` is captured into the Run's immutable input snapshot
+# exactly like `application_tools_enabled` above (S2.1A). These tests prove
+# the offering side of enforcement: what is handed to the model as callable
+# tools. The execution-side re-check lives in
+# test_agent_runtime_tool_step_service.py.
+
+
+def _state_with_allowed_tool_names(
+    tenant_id: uuid.UUID,
+    model: LLMModel,
+    agent: Agent,
+    allowed_tool_names,
+) -> RuntimeGraphState:
+    state = _state(tenant_id, model, agent)
+    initial_input = dict(state["snapshots"].initial_input)
+    if allowed_tool_names is not None:
+        initial_input["allowed_tool_names"] = allowed_tool_names
+    state["snapshots"] = RunInputSnapshots(
+        session_context=state["snapshots"].session_context,
+        session_context_version=state["snapshots"].session_context_version,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input=initial_input,
+    )
+    return state
+
+
+async def _two_tools(agent_id: uuid.UUID) -> list[dict]:
+    del agent_id
+    return [
+        {
+            "type": "function",
+            "function": {"name": "read_file", "description": "Read", "parameters": {}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "write_file", "description": "Write", "parameters": {}},
+        },
+    ]
+
+
+async def _three_tools(agent_id: uuid.UUID) -> list[dict]:
+    del agent_id
+    return [
+        {"type": "function", "function": {"name": "read_file", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "write_file", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "send_email", "description": "", "parameters": {}}},
+    ]
+
+
+async def _finish_completion(_model, messages, **kwargs):
+    del messages, kwargs
+    return LLMCompletionStep(
+        content="",
+        tool_calls=(
+            {
+                "id": "finish-1",
+                "type": "function",
+                "function": {"name": "finish", "arguments": '{"content":"done"}'},
+            },
+        ),
+        reasoning_content=None,
+        retry_instruction=None,
+        usage=TokenUsage(total_tokens=10),
+    )
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_empty_list_hides_all_application_tools() -> None:
+    """EMPTY ALLOWLIST: an Agent configured for a broader tool set must be
+    offered zero Application tools when the per-turn override is []."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state_with_allowed_tool_names(tenant_id, model, agent, [])
+    calls = []
+
+    async def complete(model_arg, messages, **kwargs):
+        calls.append(kwargs)
+        return await _finish_completion(model_arg, messages, **kwargs)
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=complete,
+        tool_provider=_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    await service.complete_once(state, _context(state))
+
+    offered = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    assert "read_file" not in offered
+    # The turn-control tools stay available — they are not Application tools.
+    assert offered == {"finish", "wait"}
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_subset_keeps_only_named_tool() -> None:
+    """VALID SUBSET: an Agent configured with multiple tools, one permitted."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state_with_allowed_tool_names(tenant_id, model, agent, ["read_file"])
+    calls = []
+
+    async def complete(model_arg, messages, **kwargs):
+        calls.append(kwargs)
+        return await _finish_completion(model_arg, messages, **kwargs)
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=complete,
+        tool_provider=_two_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    await service.complete_once(state, _context(state))
+
+    offered = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    assert "read_file" in offered
+    assert "write_file" not in offered
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_multiple_permitted_tools_all_offered() -> None:
+    """Multiple permitted tools out of a broader configured set: every
+    permitted name is offered, the one excluded name is not."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state_with_allowed_tool_names(
+        tenant_id, model, agent, ["read_file", "write_file"]
+    )
+    calls = []
+
+    async def complete(model_arg, messages, **kwargs):
+        calls.append(kwargs)
+        return await _finish_completion(model_arg, messages, **kwargs)
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=complete,
+        tool_provider=_three_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    await service.complete_once(state, _context(state))
+
+    offered = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    assert {"read_file", "write_file"}.issubset(offered)
+    assert "send_email" not in offered
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_absent_preserves_full_application_tools() -> None:
+    """No per-Run override (every existing caller today, both legacy
+    bridges included): behavior is byte-for-byte unchanged — the Agent's
+    full configured tool set is offered, exactly as before this change."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    assert "allowed_tool_names" not in state["snapshots"].initial_input
+    calls = []
+
+    async def complete(model_arg, messages, **kwargs):
+        calls.append(kwargs)
+        return await _finish_completion(model_arg, messages, **kwargs)
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=complete,
+        tool_provider=_two_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    await service.complete_once(state, _context(state))
+
+    offered = {tool["function"]["name"] for tool in calls[0]["tools"]}
+    assert {"read_file", "write_file"}.issubset(offered)
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_invalid_type_raises_context_build_error() -> None:
+    """A malformed override (not a list of strings) must fail closed as a
+    build error, never be silently ignored (which would un-restrict).
+    `complete_once`'s outer handler converts every `ContextBuildError` into
+    an error `ModelStepResult` — the same convention already established
+    for `application_tools_enabled`'s own type check."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state_with_allowed_tool_names(tenant_id, model, agent, "read_file")
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=_finish_completion,
+        tool_provider=_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    result = await service.complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error["code"] == "invalid_runtime_input"
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_explicit_null_fails_closed_not_treated_as_absent() -> None:
+    """An explicit JSON `null` for `allowed_tool_names` (key PRESENT, value
+    `None`) must be treated as malformed input, never silently conflated
+    with the key being ABSENT (which means "no override"). Regression test
+    for a `.get(key)` vs. `key in dict` distinction bug."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    initial_input = dict(state["snapshots"].initial_input)
+    initial_input["allowed_tool_names"] = None
+    assert "allowed_tool_names" in initial_input
+    state["snapshots"] = RunInputSnapshots(
+        session_context=state["snapshots"].session_context,
+        session_context_version=state["snapshots"].session_context_version,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input=initial_input,
+    )
+
+    service = RuntimeModelStepService(
+        session_factory=_session_factory(model, agent),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=_finish_completion,
+        tool_provider=_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+    result = await service.complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error["code"] == "invalid_runtime_input"
+
+
+@pytest.mark.asyncio
+async def test_allowed_tool_names_override_also_applies_to_fallback_model_tools() -> None:
+    """The fallback-model branch must inherit the same restriction as the
+    primary branch — it derives from the same filtered
+    `available_application_tools`, so there is exactly one enforcement
+    point upstream rather than two independently-maintained ones."""
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    fallback = _model(tenant_id)
+    fallback.model = "fallback-model"
+    agent = _agent(tenant_id)
+    agent.fallback_model_id = fallback.id
+    state = _state_with_allowed_tool_names(tenant_id, model, agent, [])
+    offered_by_model_id: dict[uuid.UUID, set[str]] = {}
+
+    async def complete(model_arg, messages, **kwargs):
+        offered_by_model_id[model_arg.id] = {
+            tool["function"]["name"] for tool in kwargs["tools"]
+        }
+        if model_arg.id == model.id:
+            raise TimeoutError("provider timeout")
+        return LLMCompletionStep(
+            content="",
+            tool_calls=(
+                {
+                    "id": "finish-fallback",
+                    "type": "function",
+                    "function": {"name": "finish", "arguments": '{"content":"ok"}'},
+                },
+            ),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+        )
+
+    result = await _failover_service(
+        model,
+        fallback,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "finish"
+    assert "read_file" not in offered_by_model_id[model.id]
+    assert "read_file" not in offered_by_model_id[fallback.id]

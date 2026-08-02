@@ -157,6 +157,25 @@ def _allowed_tool_names(tools: Sequence[Mapping[str, object]]) -> frozenset[str]
     return frozenset(name for name in (_tool_name(tool) for tool in tools) if name)
 
 
+def _allowed_tool_names_override(state: RuntimeGraphState) -> frozenset[str] | None:
+    """Same per-Run override `model_step_service._allowed_tool_names_override`
+    reads — re-checked independently here so execution can never honor a
+    tool name that was filtered out of what the model was offered. Key
+    ABSENCE (not the value `None`) means no override for this Run (every
+    existing caller today) — an explicit JSON `null` is malformed input
+    and must fail closed, not be treated as a no-op."""
+    initial_input = state["snapshots"].initial_input
+    if "allowed_tool_names" not in initial_input:
+        return None
+    value = initial_input["allowed_tool_names"]
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ToolExecutionError(
+            "invalid_runtime_input",
+            "allowed_tool_names must be a list of strings or absent",
+        )
+    return frozenset(value)
+
+
 def _call_fields(call: JsonObject) -> tuple[str, str, dict]:
     call_id = call.get("id")
     function = call.get("function")
@@ -1076,6 +1095,9 @@ class RuntimeToolStepService:
                     state,
                 )
             )
+            allowed_tool_names_override = _allowed_tool_names_override(state)
+            if allowed_tool_names_override is not None:
+                allowed_names = allowed_names & allowed_tool_names_override
             messages: list[JsonObject] = []
             for index, call in enumerate(tool_calls):
                 cancel = await self._cancel_source.get_cancel(state, context)

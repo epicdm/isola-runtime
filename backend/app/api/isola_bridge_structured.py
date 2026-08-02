@@ -18,11 +18,21 @@ DESIGN
   runtime primitives ``isola_bridge.py`` already uses —
   ``ensure_primary_platform_session`` + ``enqueue_chat_runtime`` +
   ``open_run_state_reader`` — via the SAME synchronous poll-then-read pattern.
-  It does not duplicate agent reasoning or create a second runtime, and it
-  does not wire ``allowed_tools`` into the agent's own tool authorization —
-  Clawith gains no new authority from this envelope; that field is accepted
-  for contract completeness and ignored for execution in this dark-launch
-  slice.
+  It does not duplicate agent reasoning or create a second runtime.
+* Per-turn tool governance (`dec-clawith-structured-per-turn-tool-governance
+  -2026-08-02`): ``allowed_tools`` is enforced, not merely accepted. The
+  effective set for this turn is the intersection of the exact names the
+  caller supplied and the names the designated Agent is already
+  persistently configured with (`_resolve_effective_tool_names`) — any
+  requested name outside that intersection is rejected with 400 BEFORE the
+  idempotency claim, the Agent's own tool configuration is never mutated,
+  and the effective set is threaded through `enqueue_chat_runtime` into the
+  one Run's immutable input snapshot only, where both the model-offering
+  step and the tool-execution step re-check it independently (see
+  `model_step_service._allowed_tool_names_override` /
+  `tool_step_service._allowed_tool_names_override`). Clawith still gains no
+  NEW authority from this envelope — the effective set can only narrow what
+  the Agent already had, never widen it.
 * Tenant is DERIVED, never trusted: ``designated_agent_id`` is resolved
   against Clawith's own ``agents`` table and ITS ``tenant_id`` is
   authoritative. The request's own ``tenant_id`` field is compared against
@@ -58,6 +68,8 @@ DESIGN
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import Literal
@@ -82,6 +94,7 @@ from app.services.agent_runtime.run_state_reader import (
     RunStateReadError,
     open_run_state_reader,
 )
+from app.services.agent_tools import get_runtime_agent_tools_for_llm
 from app.services.chat_session_service import ensure_primary_platform_session
 
 router = APIRouter(prefix="/isola/bridge/structured", tags=["isola-bridge-structured"])
@@ -239,10 +252,11 @@ _CLAIM_SQL = text(
     """
     INSERT INTO isola_bridge_requests (
         id, tenant_id, stable_request_id, correlation_id, external_conversation_id,
-        contact_ref, agent_id, state, accepted_at, idempotency_key
+        contact_ref, agent_id, state, accepted_at, idempotency_key, metadata_labels
     ) VALUES (
         :id, :tenant_id, :stable_request_id, :correlation_id, :external_conversation_id,
-        :contact_ref, :agent_id, :state, :accepted_at, :idempotency_key
+        :contact_ref, :agent_id, :state, :accepted_at, :idempotency_key,
+        CAST(:metadata_labels AS JSONB)
     )
     ON CONFLICT (tenant_id, stable_request_id) DO NOTHING
     RETURNING id
@@ -325,7 +339,62 @@ async def _resolve_tenant(body: StructuredBridgeMessageIn):
     return tenant_id, None
 
 
-async def _claim(*, tenant_id, stable_key: str, correlation_id: str, body: StructuredBridgeMessageIn):
+async def _resolve_effective_tool_names(
+    agent_id: uuid.UUID, requested: frozenset[str]
+) -> tuple[list[str], frozenset[str]]:
+    """Per-turn `allowed_tools` governance
+    (`dec-clawith-structured-per-turn-tool-governance-2026-08-02`): the
+    effective set for this turn is the intersection of the exact names the
+    caller supplied with the names the designated Agent is ALREADY
+    persistently configured with — never a superset, and never touching
+    that persistent configuration. Uses the SAME catalogue function the
+    Runtime itself resolves tools from (`get_runtime_agent_tools_for_llm`),
+    so "supported for this agent" here means exactly what it will mean when
+    the Run actually executes. Returns (effective_names, unsupported_names);
+    a non-empty `unsupported_names` means the caller asked for at least one
+    tool this Agent/tenant does not have — the caller must reject before
+    any durable side effect."""
+    configured = await get_runtime_agent_tools_for_llm(agent_id)
+    configured_names = {
+        name
+        for name in (
+            tool.get("function", {}).get("name") if isinstance(tool, dict) else None
+            for tool in configured
+        )
+        if isinstance(name, str) and name
+    }
+    unsupported = requested - configured_names
+    effective = sorted(requested & configured_names)
+    return effective, unsupported
+
+
+def _tool_policy_digest(effective_tool_names: list[str]) -> str:
+    """A short, order-independent fingerprint of one turn's effective tool
+    set, stored alongside the idempotency claim (in the existing
+    `metadata_labels` JSONB column — no migration). Lets a request that
+    loses the claim detect whether it is a genuine retry of the SAME
+    turn-defining policy, or a `correlation_id` reused with a DIFFERENT
+    `allowed_tools` — which must never silently inherit another policy's
+    already-produced result.
+
+    Canonicalized via JSON array serialization, NOT a naive comma-join:
+    `Tool.name` is an unconstrained `String(100)` (app/models/tool.py),
+    so a tool literally named e.g. "a,b" makes a naive `",".join(...)` of
+    `["a,b", "c"]` collide with `["a", "b,c"]`. JSON's per-element quoting
+    disambiguates the boundary in every such case.
+    """
+    canonical = json.dumps(sorted(effective_tool_names), separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+async def _claim(
+    *,
+    tenant_id,
+    stable_key: str,
+    correlation_id: str,
+    body: StructuredBridgeMessageIn,
+    tool_policy_digest: str,
+):
     """Atomic claim attempt against isola_bridge_requests. Returns
     (won: bool, row: _Row)."""
     claim_id = uuid.uuid4()
@@ -346,6 +415,9 @@ async def _claim(*, tenant_id, stable_key: str, correlation_id: str, body: Struc
                         "state": "accepted",
                         "accepted_at": accepted_at,
                         "idempotency_key": f"{tenant_id}:{stable_key}",
+                        "metadata_labels": json.dumps(
+                            {"tool_policy_digest": tool_policy_digest}
+                        ),
                     },
                 )
             ).first()
@@ -540,11 +612,74 @@ async def bridge_structured_message(
     if err is not None:
         return err
 
+    requested_tool_names = frozenset(tool.name for tool in body.allowed_tools)
+    effective_tool_names, unsupported_tool_names = await _resolve_effective_tool_names(
+        agent_id, requested_tool_names
+    )
+    if unsupported_tool_names:
+        # Reject BEFORE the idempotency claim: an unsupported tool name is a
+        # request-shape defect, not a Run outcome, so it must create no
+        # durable isola_bridge_requests row, no reasoning Run, and no
+        # tool execution — see
+        # dec-clawith-structured-per-turn-tool-governance-2026-08-02.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unsupported_tool",
+                "detail": sorted(unsupported_tool_names),
+            },
+        )
+
+    tool_policy_digest = _tool_policy_digest(effective_tool_names)
+
     won, claim_row = await _claim(
-        tenant_id=tenant_id, stable_key=stable_key, correlation_id=correlation_id, body=body
+        tenant_id=tenant_id,
+        stable_key=stable_key,
+        correlation_id=correlation_id,
+        body=body,
+        tool_policy_digest=tool_policy_digest,
     )
     if claim_row is None:  # pragma: no cover - defensive; claim always leaves a row
         return JSONResponse(status_code=500, content={"error": "claim_failed"})
+
+    # Fail-closed claim-row policy check: a missing/malformed digest (e.g.
+    # the pre-fix `{}` default) is treated as a MISMATCH, never as
+    # "compatible" — the winner's own just-inserted row always carries the
+    # digest it just wrote, so this is a no-op on the winning path and only
+    # ever rejects on the losing path.
+    #
+    # KNOWN RESIDUAL GAP (explicitly out of scope for this change, not
+    # silently accepted): isola_bridge_requests is a table SHARED with
+    # isola_bridge_v2, whose `stable_request_id` and `metadata_labels` are
+    # caller-supplied, not server-derived (see `BridgeRequestIn` in
+    # isola_bridge_v2.py). A caller with v2 access could in principle
+    # pre-claim `stable_request_id=f"structured:{correlation_id}"` with a
+    # forged `tool_policy_digest`. Closing that fully needs either a
+    # migration (a `bridge_origin` column distinguishing which endpoint
+    # created a row) or a v2 schema change to stop accepting caller-
+    # supplied `metadata_labels` — both out of bounds for this change (no
+    # migration; the three legacy routes, including v2, must stay
+    # byte-identical). Tracked for follow-up rather than addressed here.
+    stored_labels = claim_row.metadata_labels if hasattr(claim_row, "metadata_labels") else None
+    stored_digest = stored_labels.get("tool_policy_digest") if isinstance(stored_labels, dict) else None
+    if stored_digest != tool_policy_digest:
+        # This correlation_id is already claimed under a DIFFERENT (or
+        # unrecorded) allowed_tools policy than this request just resolved.
+        # Whatever Run that claim is attached to may have been authorized
+        # under a different effective tool set — this request must never
+        # silently inherit its result, so it is rejected rather than
+        # joining the existing claim. A genuine retry of the SAME logical
+        # turn always recomputes the SAME digest and is unaffected.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "correlation_id_policy_mismatch",
+                "detail": (
+                    "this correlation_id is already claimed under a "
+                    "different or unrecorded allowed_tools policy"
+                ),
+            },
+        )
 
     if won:
         try:
@@ -615,6 +750,7 @@ async def bridge_structured_message(
                             content=body.normalized_customer_message,
                             source_channel="web",
                             runtime_instruction=caller_directive,
+                            allowed_tool_names=effective_tool_names,
                             run_state_reader=reader,
                         )
                     if intake is None:
