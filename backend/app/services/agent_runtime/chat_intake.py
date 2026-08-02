@@ -486,6 +486,7 @@ async def enqueue_chat_runtime(
     persist_user_message: bool = True,
     source_execution_id_override: str | None = None,
     application_tools_enabled: bool = True,
+    allowed_tool_names: list[str] | None = None,
     channel_delivery_target: dict | None = None,
     run_state_reader: RunStateReader | None = None,
     settings_override: Settings | None = None,
@@ -495,6 +496,13 @@ async def enqueue_chat_runtime(
     Returning ``None`` means the Runtime intake is disabled for this new chat.
     Callers must fail closed; there is no legacy execution fallback. This
     function never commits; the ingress owns the transaction boundary.
+
+    ``allowed_tool_names``, when not ``None``, is captured into this one
+    Run's immutable input snapshot only (same channel as
+    ``application_tools_enabled`` below) and never touches the Agent's own
+    persistent tool configuration. ``model_step_service`` and
+    ``tool_step_service`` both read it back to gate, respectively, what the
+    model is offered and what may actually execute for this Run.
     """
     runtime_settings = settings_override or get_settings()
     decision = decide_runtime_v2(
@@ -700,6 +708,11 @@ async def enqueue_chat_runtime(
                 "source_channel": normalized_channel,
                 "user_id": str(user.id),
                 "application_tools_enabled": application_tools_enabled,
+                **(
+                    {"allowed_tool_names": allowed_tool_names}
+                    if allowed_tool_names is not None
+                    else {}
+                ),
                 **(
                     {"runtime_instruction": normalized_runtime_instruction}
                     if normalized_runtime_instruction

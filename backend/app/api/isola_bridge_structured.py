@@ -18,11 +18,21 @@ DESIGN
   runtime primitives ``isola_bridge.py`` already uses —
   ``ensure_primary_platform_session`` + ``enqueue_chat_runtime`` +
   ``open_run_state_reader`` — via the SAME synchronous poll-then-read pattern.
-  It does not duplicate agent reasoning or create a second runtime, and it
-  does not wire ``allowed_tools`` into the agent's own tool authorization —
-  Clawith gains no new authority from this envelope; that field is accepted
-  for contract completeness and ignored for execution in this dark-launch
-  slice.
+  It does not duplicate agent reasoning or create a second runtime.
+* Per-turn tool governance (`dec-clawith-structured-per-turn-tool-governance
+  -2026-08-02`): ``allowed_tools`` is enforced, not merely accepted. The
+  effective set for this turn is the intersection of the exact names the
+  caller supplied and the names the designated Agent is already
+  persistently configured with (`_resolve_effective_tool_names`) — any
+  requested name outside that intersection is rejected with 400 BEFORE the
+  idempotency claim, the Agent's own tool configuration is never mutated,
+  and the effective set is threaded through `enqueue_chat_runtime` into the
+  one Run's immutable input snapshot only, where both the model-offering
+  step and the tool-execution step re-check it independently (see
+  `model_step_service._allowed_tool_names_override` /
+  `tool_step_service._allowed_tool_names_override`). Clawith still gains no
+  NEW authority from this envelope — the effective set can only narrow what
+  the Agent already had, never widen it.
 * Tenant is DERIVED, never trusted: ``designated_agent_id`` is resolved
   against Clawith's own ``agents`` table and ITS ``tenant_id`` is
   authoritative. The request's own ``tenant_id`` field is compared against
@@ -82,6 +92,7 @@ from app.services.agent_runtime.run_state_reader import (
     RunStateReadError,
     open_run_state_reader,
 )
+from app.services.agent_tools import get_runtime_agent_tools_for_llm
 from app.services.chat_session_service import ensure_primary_platform_session
 
 router = APIRouter(prefix="/isola/bridge/structured", tags=["isola-bridge-structured"])
@@ -325,6 +336,35 @@ async def _resolve_tenant(body: StructuredBridgeMessageIn):
     return tenant_id, None
 
 
+async def _resolve_effective_tool_names(
+    agent_id: uuid.UUID, requested: frozenset[str]
+) -> tuple[list[str], frozenset[str]]:
+    """Per-turn `allowed_tools` governance
+    (`dec-clawith-structured-per-turn-tool-governance-2026-08-02`): the
+    effective set for this turn is the intersection of the exact names the
+    caller supplied with the names the designated Agent is ALREADY
+    persistently configured with — never a superset, and never touching
+    that persistent configuration. Uses the SAME catalogue function the
+    Runtime itself resolves tools from (`get_runtime_agent_tools_for_llm`),
+    so "supported for this agent" here means exactly what it will mean when
+    the Run actually executes. Returns (effective_names, unsupported_names);
+    a non-empty `unsupported_names` means the caller asked for at least one
+    tool this Agent/tenant does not have — the caller must reject before
+    any durable side effect."""
+    configured = await get_runtime_agent_tools_for_llm(agent_id)
+    configured_names = {
+        name
+        for name in (
+            tool.get("function", {}).get("name") if isinstance(tool, dict) else None
+            for tool in configured
+        )
+        if isinstance(name, str) and name
+    }
+    unsupported = requested - configured_names
+    effective = sorted(requested & configured_names)
+    return effective, unsupported
+
+
 async def _claim(*, tenant_id, stable_key: str, correlation_id: str, body: StructuredBridgeMessageIn):
     """Atomic claim attempt against isola_bridge_requests. Returns
     (won: bool, row: _Row)."""
@@ -540,6 +580,24 @@ async def bridge_structured_message(
     if err is not None:
         return err
 
+    requested_tool_names = frozenset(tool.name for tool in body.allowed_tools)
+    effective_tool_names, unsupported_tool_names = await _resolve_effective_tool_names(
+        agent_id, requested_tool_names
+    )
+    if unsupported_tool_names:
+        # Reject BEFORE the idempotency claim: an unsupported tool name is a
+        # request-shape defect, not a Run outcome, so it must create no
+        # durable isola_bridge_requests row, no reasoning Run, and no
+        # tool execution — see
+        # dec-clawith-structured-per-turn-tool-governance-2026-08-02.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unsupported_tool",
+                "detail": sorted(unsupported_tool_names),
+            },
+        )
+
     won, claim_row = await _claim(
         tenant_id=tenant_id, stable_key=stable_key, correlation_id=correlation_id, body=body
     )
@@ -615,6 +673,7 @@ async def bridge_structured_message(
                             content=body.normalized_customer_message,
                             source_channel="web",
                             runtime_instruction=caller_directive,
+                            allowed_tool_names=effective_tool_names,
                             run_state_reader=reader,
                         )
                     if intake is None:

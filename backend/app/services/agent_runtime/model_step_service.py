@@ -364,6 +364,42 @@ def _application_tools_enabled(state: RuntimeGraphState) -> bool:
     return value
 
 
+def _allowed_tool_names_override(state: RuntimeGraphState) -> frozenset[str] | None:
+    """Per-Run tool allowlist (e.g. the structured bridge's per-turn
+    `allowed_tools`), captured once into the Run's immutable input snapshot
+    exactly like `application_tools_enabled` above. `None` means no override
+    was requested for this Run — every other caller (both legacy bridges,
+    Direct/Group/A2A chat) is completely unaffected. An empty list means
+    zero Application tools for this Run, not "no restriction"."""
+    value = state["snapshots"].initial_input.get("allowed_tool_names")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ContextBuildError(
+            "invalid_runtime_input",
+            "allowed_tool_names must be a list of strings or absent",
+        )
+    return frozenset(value)
+
+
+async def _gated_application_tools(
+    tool_provider: ToolProvider,
+    agent_id: uuid.UUID,
+    state: RuntimeGraphState,
+) -> list[dict]:
+    """The Application tools available for this Run's model step: the
+    Agent's persistently configured tools, narrowed to `allowed_tool_names`
+    when a per-Run override is present. Never mutates the Agent's own
+    configuration — the override lives only in this Run's input snapshot."""
+    if not _application_tools_enabled(state):
+        return []
+    tools = with_group_runtime_tools(await tool_provider(agent_id), state)
+    override = _allowed_tool_names_override(state)
+    if override is None:
+        return tools
+    return [tool for tool in tools if _tool_name(tool) in override]
+
+
 def _ledger_metadata(execution: AgentToolExecution) -> tuple[str, str]:
     stored = execution.sanitized_arguments
     metadata = stored.get(_LEDGER_METADATA_KEY) if isinstance(stored, dict) else None
@@ -1048,13 +1084,8 @@ class RuntimeModelStepService:
         """Profile the exact business request shape used by the Compact node."""
         model, agent, ledger = await self._load(context, state)
         allow_user_wait = not _is_group_agent_run(state)
-        application_tools = (
-            with_group_runtime_tools(
-                await self._tool_provider(agent.id),
-                state,
-            )
-            if _application_tools_enabled(state)
-            else []
+        application_tools = await _gated_application_tools(
+            self._tool_provider, agent.id, state
         )
         application_tools = _application_tools_for_model(
             application_tools,
@@ -1405,13 +1436,8 @@ class RuntimeModelStepService:
         try:
             model, agent, ledger = await self._load(context, state)
             allow_user_wait = not _is_group_agent_run(state)
-            application_tools = (
-                with_group_runtime_tools(
-                    await self._tool_provider(agent.id),
-                    state,
-                )
-                if _application_tools_enabled(state)
-                else []
+            application_tools = await _gated_application_tools(
+                self._tool_provider, agent.id, state
             )
             available_application_tools = application_tools
             application_tools = _application_tools_for_model(
