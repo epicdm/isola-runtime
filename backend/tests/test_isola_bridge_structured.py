@@ -208,7 +208,7 @@ class _FakeClaimStore:
     def __init__(self):
         self.rows: dict[str, SimpleNamespace] = {}
 
-    def claim(self, tenant_id, stable_key, correlation_id):
+    def claim(self, tenant_id, stable_key, correlation_id, tool_policy_digest=None):
         db_key = f"{tenant_id}:{stable_key}"
         if db_key in self.rows:
             return False, self.rows[db_key]
@@ -223,6 +223,11 @@ class _FakeClaimStore:
             initiating_message_id=None,
             terminal_message_id=None,
             error_class=None,
+            metadata_labels=(
+                {"tool_policy_digest": tool_policy_digest}
+                if tool_policy_digest is not None
+                else {}
+            ),
         )
         self.rows[db_key] = row
         return True, row
@@ -249,7 +254,7 @@ class _FakeClaimStore:
 
 def _wire_claim_store(monkeypatch, store: _FakeClaimStore):
     async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
-        return store.claim(tenant_id, stable_key, correlation_id)
+        return store.claim(tenant_id, stable_key, correlation_id, tool_policy_digest)
 
     async def fake_wait_for_claim_population(row_id):
         for row in store.rows.values():
@@ -298,7 +303,7 @@ async def test_golden_request_produces_a_foundation_parseable_response(monkeypat
     # behaves correctly. The separate `won` DB-wiring is exercised by
     # `test_won_claim_calls_enqueue_chat_runtime_exactly_once`.
     async def fake_claim_pre_enqueued(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
-        won, row = store.claim(tenant_id, stable_key, correlation_id)
+        won, row = store.claim(tenant_id, stable_key, correlation_id, tool_policy_digest)
         if won:
             store.populate_enqueued(
                 row.id, session_id=SESSION_ID, run_id=RUN_ID, initiating_message_id=uuid.uuid4()
@@ -405,7 +410,7 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
     win_count = {"n": 0}
 
     async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
-        won, row = store.claim(tenant_id, stable_key, correlation_id)
+        won, row = store.claim(tenant_id, stable_key, correlation_id, tool_policy_digest)
         if won:
             win_count["n"] += 1
             store.populate_enqueued(
@@ -490,7 +495,12 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
         _fake_resolve_effective_tool_names_permit_all,
     )
 
-    completed_row = store.claim(TENANT_ID, structured_api._stable_key(GOLDEN_REQUEST["correlation_id"]), GOLDEN_REQUEST["correlation_id"])[1]
+    completed_row = store.claim(
+        TENANT_ID,
+        structured_api._stable_key(GOLDEN_REQUEST["correlation_id"]),
+        GOLDEN_REQUEST["correlation_id"],
+        structured_api._tool_policy_digest(["crm.lead.create"]),
+    )[1]
     completed_row.session_id = SESSION_ID
     completed_row.run_id = RUN_ID
     completed_row.state = "completed"
@@ -688,6 +698,7 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
             run_id=RUN_ID,
             state="running",
             initiating_message_id=None,
+            metadata_labels={"tool_policy_digest": tool_policy_digest},
         )
 
     monkeypatch.setattr(structured_api, "_claim", spy_claim)
@@ -770,6 +781,7 @@ async def test_duplicate_tool_names_in_request_deduplicate_to_one_name(
         return False, SimpleNamespace(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
+            metadata_labels={"tool_policy_digest": tool_policy_digest},
         )
 
     monkeypatch.setattr(structured_api, "_claim", spy_claim)
@@ -873,6 +885,7 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
         return True, SimpleNamespace(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
+            metadata_labels={"tool_policy_digest": tool_policy_digest},
         )
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)

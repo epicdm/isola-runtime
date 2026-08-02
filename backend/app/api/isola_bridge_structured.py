@@ -642,14 +642,32 @@ async def bridge_structured_message(
     if claim_row is None:  # pragma: no cover - defensive; claim always leaves a row
         return JSONResponse(status_code=500, content={"error": "claim_failed"})
 
+    # Fail-closed claim-row policy check: a missing/malformed digest (e.g.
+    # the pre-fix `{}` default) is treated as a MISMATCH, never as
+    # "compatible" — the winner's own just-inserted row always carries the
+    # digest it just wrote, so this is a no-op on the winning path and only
+    # ever rejects on the losing path.
+    #
+    # KNOWN RESIDUAL GAP (explicitly out of scope for this change, not
+    # silently accepted): isola_bridge_requests is a table SHARED with
+    # isola_bridge_v2, whose `stable_request_id` and `metadata_labels` are
+    # caller-supplied, not server-derived (see `BridgeRequestIn` in
+    # isola_bridge_v2.py). A caller with v2 access could in principle
+    # pre-claim `stable_request_id=f"structured:{correlation_id}"` with a
+    # forged `tool_policy_digest`. Closing that fully needs either a
+    # migration (a `bridge_origin` column distinguishing which endpoint
+    # created a row) or a v2 schema change to stop accepting caller-
+    # supplied `metadata_labels` — both out of bounds for this change (no
+    # migration; the three legacy routes, including v2, must stay
+    # byte-identical). Tracked for follow-up rather than addressed here.
     stored_labels = claim_row.metadata_labels if hasattr(claim_row, "metadata_labels") else None
     stored_digest = stored_labels.get("tool_policy_digest") if isinstance(stored_labels, dict) else None
-    if stored_digest is not None and stored_digest != tool_policy_digest:
-        # This correlation_id is already claimed under a DIFFERENT
-        # allowed_tools policy than this request just resolved. Whatever
-        # Run that claim is attached to was authorized under a different
-        # effective tool set — this request must never silently inherit
-        # its result (or its policy), so it is rejected rather than
+    if stored_digest != tool_policy_digest:
+        # This correlation_id is already claimed under a DIFFERENT (or
+        # unrecorded) allowed_tools policy than this request just resolved.
+        # Whatever Run that claim is attached to may have been authorized
+        # under a different effective tool set — this request must never
+        # silently inherit its result, so it is rejected rather than
         # joining the existing claim. A genuine retry of the SAME logical
         # turn always recomputes the SAME digest and is unaffected.
         return JSONResponse(
@@ -658,7 +676,7 @@ async def bridge_structured_message(
                 "error": "correlation_id_policy_mismatch",
                 "detail": (
                     "this correlation_id is already claimed under a "
-                    "different allowed_tools policy"
+                    "different or unrecorded allowed_tools policy"
                 ),
             },
         )
