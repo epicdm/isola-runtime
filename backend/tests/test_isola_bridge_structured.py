@@ -553,6 +553,28 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
 # rejected BEFORE the idempotency claim — no durable row, no reasoning Run.
 
 
+def test_tool_policy_digest_does_not_collide_across_comma_containing_tool_names():
+    """Regression test for a BLOCKING finding from adversarial review: a
+    naive comma-join canonicalization would let `["a,b", "c"]` and
+    `["a", "b,c"]` hash identically (both join to "a,b,c"), silently
+    treating two DIFFERENT effective tool sets as the same policy. Tool
+    names are an unconstrained `String(100)` (app/models/tool.py), so a
+    tool literally named with a comma is a real possibility, not a
+    theoretical one."""
+    digest_1 = structured_api._tool_policy_digest(["a,b", "c"])
+    digest_2 = structured_api._tool_policy_digest(["a", "b,c"])
+
+    assert digest_1 != digest_2
+
+
+def test_tool_policy_digest_is_order_independent():
+    """The digest must depend only on the SET of effective tool names, not
+    the order `allowed_tools` happened to list them in."""
+    assert structured_api._tool_policy_digest(
+        ["read_file", "write_file"]
+    ) == structured_api._tool_policy_digest(["write_file", "read_file"])
+
+
 @pytest.mark.asyncio
 async def test_resolve_effective_tool_names_intersects_and_reports_unsupported():
     """Pure proof of `_resolve_effective_tool_names`'s own contract: the

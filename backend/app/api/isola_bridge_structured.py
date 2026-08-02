@@ -375,8 +375,15 @@ def _tool_policy_digest(effective_tool_names: list[str]) -> str:
     loses the claim detect whether it is a genuine retry of the SAME
     turn-defining policy, or a `correlation_id` reused with a DIFFERENT
     `allowed_tools` — which must never silently inherit another policy's
-    already-produced result."""
-    canonical = ",".join(sorted(effective_tool_names))
+    already-produced result.
+
+    Canonicalized via JSON array serialization, NOT a naive comma-join:
+    `Tool.name` is an unconstrained `String(100)` (app/models/tool.py),
+    so a tool literally named e.g. "a,b" makes a naive `",".join(...)` of
+    `["a,b", "c"]` collide with `["a", "b,c"]`. JSON's per-element quoting
+    disambiguates the boundary in every such case.
+    """
+    canonical = json.dumps(sorted(effective_tool_names), separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
