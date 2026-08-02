@@ -1,0 +1,774 @@
+# ISOLA GLUE — additive structured bridge endpoint (not upstream)
+"""Structured Foundation → Clawith bridge endpoint.
+
+Implements `dec-clawith-structured-bridge-versioned-endpoint-2026-08-02` /
+`dec-structured-bridge-dark-launch-and-split-execution-2026-08-02` slice S2:
+an ADDITIVE versioned route, `POST /api/isola/bridge/structured/message`,
+carrying the ratified request/response envelope from
+`dec-foundation-clawith-structured-response-contract-2026-07-29`.
+
+This file changes NOTHING about the two existing bridge routes
+(`isola_bridge.py`, `isola_bridge_v2.py`). It is mounted by exactly one
+``include_router`` line (plus one validation-handler line, mirroring the
+pattern already used for the v2 router) in ``main.py``.
+
+DESIGN
+------
+* Translation, not a second brain: this endpoint drives the SAME internal
+  runtime primitives ``isola_bridge.py`` already uses —
+  ``ensure_primary_platform_session`` + ``enqueue_chat_runtime`` +
+  ``open_run_state_reader`` — via the SAME synchronous poll-then-read pattern.
+  It does not duplicate agent reasoning or create a second runtime, and it
+  does not wire ``allowed_tools`` into the agent's own tool authorization —
+  Clawith gains no new authority from this envelope; that field is accepted
+  for contract completeness and ignored for execution in this dark-launch
+  slice.
+* Tenant is DERIVED, never trusted: ``designated_agent_id`` is resolved
+  against Clawith's own ``agents`` table and ITS ``tenant_id`` is
+  authoritative. The request's own ``tenant_id`` field is compared against
+  that derived value and a mismatch is rejected — it is never used as an
+  authorization assertion on its own.
+* Durable correlation-keyed idempotency reuses the EXISTING
+  ``isola_bridge_requests`` table and its EXISTING
+  ``uq_isola_bridge_requests_tenant_stable`` unique constraint (added by
+  ``202607311800_add_isola_bridge_requests.py`` for the v2 async bridge). No
+  new column, index, table or migration is introduced. The structured
+  endpoint's ``correlation_id`` is namespaced into that table's
+  ``stable_request_id`` column as ``f"structured:{correlation_id}"`` — a
+  value distinct in shape from v2's own opaque, caller-supplied
+  ``stable_request_id`` strings, so the two bridges never collide inside one
+  shared row.
+* Claim BEFORE enqueue, not after: unlike ``isola_bridge_v2.submit_request``
+  (which checks-then-enqueues-then-inserts inside one transaction — a window
+  where two concurrent identical submissions could each pass the check and
+  each enqueue a run before either commits), this endpoint performs the
+  ``INSERT ... ON CONFLICT DO NOTHING`` claim FIRST, in its own short
+  transaction, and only the request that wins the claim proceeds to
+  ``enqueue_chat_runtime``. A request that loses the claim never enqueues —
+  it waits on the winner's row (durable, restart-safe, concurrent-safe,
+  process-independent) and returns/waits for that run's result instead.
+* Timeout is HTTP 504 (transport-level, retryable per
+  `dec-clawith-structured-bridge-versioned-endpoint-2026-08-02`'s retry
+  classification), not a structured envelope. The claimed row stays in
+  `running` state, so a retried request with the identical `correlation_id`
+  finds the SAME claim and waits for the SAME run rather than starting a
+  second one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from datetime import UTC, datetime
+from typing import Literal
+
+from fastapi import APIRouter, Header, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.api.isola_bridge import _authorize, _stable_user_id
+from app.database import async_session
+from app.models.agent import Agent, AgentUserOnboarding
+from app.models.audit import ChatMessage
+from app.models.llm import LLMModel
+from app.models.user import User
+from app.services.agent_runtime.chat_intake import (
+    ChatRuntimeIntakeError,
+    enqueue_chat_runtime,
+)
+from app.services.agent_runtime.run_state_reader import (
+    RunStateReadError,
+    open_run_state_reader,
+)
+from app.services.chat_session_service import ensure_primary_platform_session
+
+router = APIRouter(prefix="/isola/bridge/structured", tags=["isola-bridge-structured"])
+
+# ── Wire contract ────────────────────────────────────────────────────────────
+# Mirrors epicdm/Isola-Foundation artifacts/isola/lib/clawith/contract.ts
+# (dec-foundation-clawith-structured-response-contract-2026-07-29). Field
+# names, bounds and the ownership/escalation/qualification vocabularies are
+# copied from that file, not re-derived, so this endpoint accepts exactly
+# what Foundation's request builder emits.
+
+SCHEMA_VERSION = "1.0.0"
+SUPPORTED_SCHEMA_MAJOR = 1
+
+_OWNERSHIP_STATES = frozenset(
+    {"AI_OWNED", "HUMAN_REQUESTED", "HUMAN_OWNED", "HANDING_BACK", "AI_RESUMED"}
+)
+
+_MAX_HISTORY_TURNS = 20
+_MAX_KNOWLEDGE_SCOPE_IDS = 16
+_MAX_ALLOWED_TOOLS = 24
+_MAX_RESPONSE_DEADLINE_MS = 90_000
+# Same poll shape as isola_bridge.py's synchronous /message route, so both
+# routes give Foundation the same latency profile for the same underlying
+# work. Both stay comfortably under Foundation's DEFAULT_RESPONSE_DEADLINE_MS
+# (45_000ms).
+_POLL_TIMEOUT_S = 30.0
+_POLL_INTERVAL_S = 0.75
+_MESSAGE_GRACE_S = 5.0
+# How long a request that LOST the idempotency claim will wait for the
+# winner to finish enqueuing (populate session_id/run_id) before giving up
+# with a retryable 504. The claim row itself is untouched by this wait, so a
+# retry after this window still finds the same claim.
+_CLAIM_POPULATE_TIMEOUT_S = 8.0
+_CLAIM_POPULATE_INTERVAL_S = 0.5
+
+_SETTLED_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "waiting_user", "waiting_external", "waiting_agent"}
+)
+_TERMINAL_CLAIM_STATES = frozenset({"completed", "failed", "cancelled", "expired", "rejected"})
+
+
+class ClawithHistoryTurnIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ClawithToolDefinitionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    description: str
+    arguments: list[str] = Field(default_factory=list)
+    required: list[str] | None = None
+    mutating: bool
+
+
+class StructuredBridgeMessageIn(BaseModel):
+    """The full ratified structured envelope. Unknown fields are refused —
+    an undeclared field is an unbounded authority channel, same posture as
+    isola_bridge_v2.BridgeRequestIn."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: str
+    # NOT an authorization assertion — see _resolve_tenant below.
+    tenant_id: str = Field(min_length=1)
+    business_id: str = Field(min_length=1)
+    chatwoot_account_id: str = Field(min_length=1)
+    inbox_id: str = Field(min_length=1)
+    conversation_id: str = Field(min_length=1)
+    inbound_message_id: str = Field(min_length=1)
+    contact_ref: str = Field(min_length=1)
+    normalized_customer_message: str = Field(min_length=1, max_length=8_000)
+    bounded_conversation_history: list[ClawithHistoryTurnIn] = Field(default_factory=list)
+    designated_agent_id: uuid.UUID
+    knowledge_scope_ids: list[str] = Field(default_factory=list)
+    allowed_tools: list[ClawithToolDefinitionIn] = Field(default_factory=list)
+    ownership_state: str
+    # The per-turn operation boundary. Namespaced into isola_bridge_requests
+    # .stable_request_id (existing column, existing unique constraint) as
+    # f"structured:{correlation_id}"; that column's CHECK constraint requires
+    # length >= 8, so correlation_id has no independent minimum here beyond
+    # non-empty, and the "structured:" prefix (11 chars) always satisfies it.
+    correlation_id: str = Field(min_length=1, max_length=180)
+    locale: str = Field(min_length=1)
+    timezone: str = Field(min_length=1)
+    response_deadline_ms: int = Field(gt=0, le=_MAX_RESPONSE_DEADLINE_MS)
+
+    @field_validator("correlation_id", "tenant_id")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+    @field_validator("ownership_state")
+    @classmethod
+    def _known_ownership_state(cls, v: str) -> str:
+        if v not in _OWNERSHIP_STATES:
+            raise ValueError(f"unknown ownership_state {v!r}")
+        return v
+
+    @field_validator("bounded_conversation_history")
+    @classmethod
+    def _bound_history(cls, v: list[ClawithHistoryTurnIn]) -> list[ClawithHistoryTurnIn]:
+        if len(v) > _MAX_HISTORY_TURNS:
+            raise ValueError(f"bounded_conversation_history exceeds {_MAX_HISTORY_TURNS} turns")
+        return v
+
+    @field_validator("knowledge_scope_ids")
+    @classmethod
+    def _bound_knowledge_scope(cls, v: list[str]) -> list[str]:
+        if len(v) > _MAX_KNOWLEDGE_SCOPE_IDS:
+            raise ValueError(f"knowledge_scope_ids exceeds {_MAX_KNOWLEDGE_SCOPE_IDS} ids")
+        return v
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def _bound_allowed_tools(cls, v: list[ClawithToolDefinitionIn]) -> list[ClawithToolDefinitionIn]:
+        if len(v) > _MAX_ALLOWED_TOOLS:
+            raise ValueError(f"allowed_tools exceeds {_MAX_ALLOWED_TOOLS} tools")
+        return v
+
+
+def _schema_major(raw: object) -> int | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    head = raw.split(".", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def _sanitized_validation_body(exc: ValidationError) -> dict:
+    """Same posture as isola_bridge_v2's scoped 422 sanitizer, reimplemented
+    locally (not shared) so that file's own exception-handler registration —
+    and therefore its exact existing behaviour — is never touched."""
+    detail = [
+        {
+            "code": "validation_error",
+            "location": [str(part) for part in err.get("loc", ())],
+            "type": err.get("type"),
+        }
+        for err in exc.errors()
+    ]
+    return {"error": "validation_error", "detail": detail}
+
+
+# ── Durable correlation-keyed idempotency ───────────────────────────────────
+# Reuses isola_bridge_requests (202607311800_add_isola_bridge_requests.py)
+# and its existing uq_isola_bridge_requests_tenant_stable unique constraint.
+# NO migration, column, index or table is added by this file.
+
+_CLAIM_SQL = text(
+    """
+    INSERT INTO isola_bridge_requests (
+        id, tenant_id, stable_request_id, correlation_id, external_conversation_id,
+        contact_ref, agent_id, state, accepted_at, idempotency_key
+    ) VALUES (
+        :id, :tenant_id, :stable_request_id, :correlation_id, :external_conversation_id,
+        :contact_ref, :agent_id, :state, :accepted_at, :idempotency_key
+    )
+    ON CONFLICT (tenant_id, stable_request_id) DO NOTHING
+    RETURNING id
+    """
+)
+
+_SELECT_BY_STABLE_SQL = text(
+    "SELECT * FROM isola_bridge_requests WHERE tenant_id = :tenant_id "
+    "AND stable_request_id = :stable_request_id"
+)
+
+_SELECT_BY_ID_SQL = text("SELECT * FROM isola_bridge_requests WHERE id = :id")
+
+_UPDATE_ENQUEUED_SQL = text(
+    """
+    UPDATE isola_bridge_requests
+       SET session_id = :session_id,
+           run_id = :run_id,
+           initiating_message_id = :initiating_message_id,
+           started_at = :started_at,
+           state = 'running'
+     WHERE id = :id
+    """
+)
+
+_UPDATE_TERMINAL_SQL = text(
+    """
+    UPDATE isola_bridge_requests
+       SET state = :state,
+           terminal_message_id = COALESCE(CAST(:terminal_message_id AS UUID), terminal_message_id),
+           completed_at = COALESCE(:completed_at, completed_at),
+           error_class = COALESCE(:error_class, error_class),
+           last_checked_at = :now
+     WHERE id = :id
+    """
+)
+
+
+def _stable_key(correlation_id: str) -> str:
+    return f"structured:{correlation_id}"
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+class _Row:
+    def __init__(self, mapping):
+        self._m = mapping
+
+    def __getattr__(self, name):
+        try:
+            return self._m[name]
+        except KeyError as exc:  # pragma: no cover - programming error
+            raise AttributeError(name) from exc
+
+
+async def _resolve_tenant(body: StructuredBridgeMessageIn):
+    """Look up ONLY the scalar tenant_id column for the designated agent —
+    deliberately not the full Agent ORM object, so nothing here can be
+    accidentally used across a session boundary later. Returns
+    (tenant_id, error_response)."""
+    async with async_session() as db:
+        tenant_id = (
+            await db.execute(select(Agent.tenant_id).where(Agent.id == body.designated_agent_id))
+        ).scalar_one_or_none()
+    if tenant_id is None:
+        return None, JSONResponse(status_code=404, content={"error": "agent_not_found"})
+    if str(tenant_id).strip().lower() != body.tenant_id.strip().lower():
+        return (
+            None,
+            JSONResponse(
+                status_code=409,
+                content={
+                    "error": "tenant_mismatch",
+                    "detail": "request tenant_id does not match the designated agent's tenant",
+                },
+            ),
+        )
+    return tenant_id, None
+
+
+async def _claim(*, tenant_id, stable_key: str, correlation_id: str, body: StructuredBridgeMessageIn):
+    """Atomic claim attempt against isola_bridge_requests. Returns
+    (won: bool, row: _Row)."""
+    claim_id = uuid.uuid4()
+    accepted_at = _now()
+    async with async_session() as db:
+        async with db.begin():
+            inserted = (
+                await db.execute(
+                    _CLAIM_SQL,
+                    {
+                        "id": str(claim_id),
+                        "tenant_id": str(tenant_id),
+                        "stable_request_id": stable_key,
+                        "correlation_id": correlation_id,
+                        "external_conversation_id": body.conversation_id,
+                        "contact_ref": body.contact_ref,
+                        "agent_id": str(body.designated_agent_id),
+                        "state": "accepted",
+                        "accepted_at": accepted_at,
+                        "idempotency_key": f"{tenant_id}:{stable_key}",
+                    },
+                )
+            ).first()
+        row = (
+            await db.execute(
+                _SELECT_BY_STABLE_SQL, {"tenant_id": str(tenant_id), "stable_request_id": stable_key}
+            )
+        ).mappings().first()
+    won = inserted is not None
+    return won, (_Row(row) if row is not None else None)
+
+
+async def _wait_for_claim_population(row_id):
+    """Loser path: poll the claimed row until the winner has populated
+    session_id/run_id, or until it reaches a terminal state, or until the
+    grace window elapses. Never enqueues anything."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _CLAIM_POPULATE_TIMEOUT_S
+    while True:
+        async with async_session() as db:
+            row = (await db.execute(_SELECT_BY_ID_SQL, {"id": str(row_id)})).mappings().first()
+        r = _Row(row)
+        if r.state in _TERMINAL_CLAIM_STATES:
+            return r
+        if r.session_id is not None and r.run_id is not None:
+            return r
+        if loop.time() >= deadline:
+            return r
+        await asyncio.sleep(_CLAIM_POPULATE_INTERVAL_S)
+
+
+async def _read_last_assistant(db, session_id: uuid.UUID, after: datetime) -> ChatMessage | None:
+    result = await db.execute(
+        select(ChatMessage)
+        .where(
+            ChatMessage.conversation_id == str(session_id),
+            ChatMessage.role == "assistant",
+            ChatMessage.created_at >= after,
+        )
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _poll_and_read(tenant_id, run_id, session_id, initiating_at: datetime):
+    """Same settle-then-read shape as isola_bridge.bridge_message. Returns
+    (settled: bool, final_status: str | None, reply: str | None)."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _POLL_TIMEOUT_S
+    final_status: str | None = None
+
+    async with async_session() as poll_db:
+        async with open_run_state_reader(poll_db) as reader:
+            settled = False
+            while True:
+                poll_db.expire_all()
+                try:
+                    view = await reader.get_run_state(tenant_id, run_id)
+                    final_status = view.execution_status
+                except RunStateReadError:
+                    final_status = None
+                if final_status in _SETTLED_STATUSES:
+                    settled = True
+                    break
+                if loop.time() >= deadline:
+                    break
+                await asyncio.sleep(_POLL_INTERVAL_S)
+
+            if not settled:
+                return False, final_status, None
+
+            reply: str | None = None
+            grace_deadline = loop.time() + _MESSAGE_GRACE_S
+            while True:
+                poll_db.expire_all()
+                message = await _read_last_assistant(poll_db, session_id, initiating_at)
+                if message is not None:
+                    content = (message.content or "").strip()
+                    reply = content or None
+                if reply is not None or loop.time() >= grace_deadline:
+                    break
+                await asyncio.sleep(_POLL_INTERVAL_S)
+
+    return True, final_status, reply
+
+
+def _envelope(
+    *,
+    agent_id,
+    session_id,
+    correlation_id: str,
+    tenant_id,
+    customer_reply: str | None,
+    confidence: float,
+    escalation_requested: bool = False,
+    escalation_reason_code: str | None = None,
+    escalation_explanation: str | None = None,
+    latency_ms: int | None = None,
+) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "agent_id": str(agent_id),
+        "session_id": str(session_id),
+        "correlation_id": correlation_id,
+        "tenant_id": str(tenant_id),
+        "customer_reply": customer_reply,
+        "intent": None,
+        # Dark-launch approximation, not a qualification judgement: 1.0 when
+        # a settled reply was produced, 0.0 when the turn had to escalate
+        # instead. Real confidence scoring is out of scope for this slice.
+        "confidence": confidence,
+        "qualification_state": "unknown",
+        "knowledge_references": [],
+        # No tool-request translation in this dark-launch slice — Clawith's
+        # own internal tool calls stay internal; nothing here claims a tool
+        # succeeded, and nothing here asks Foundation to authorise one.
+        "tool_requests": [],
+        "escalation": {
+            "requested": escalation_requested,
+            "reason_code": escalation_reason_code,
+            "explanation": escalation_explanation,
+            "urgency": "normal" if escalation_requested else None,
+            "required_team": None,
+            "customer_handoff_message": None,
+        },
+        "missing_information": [],
+        "follow_up_required": False,
+        "usage": {"latency_ms": latency_ms} if latency_ms is not None else None,
+    }
+
+
+async def _mark_failed(request_id, error_class: str) -> None:
+    async with async_session() as db:
+        await db.execute(
+            _UPDATE_TERMINAL_SQL,
+            {
+                "id": str(request_id),
+                "state": "failed",
+                "terminal_message_id": None,
+                "completed_at": _now(),
+                "error_class": error_class,
+                "now": _now(),
+            },
+        )
+        await db.commit()
+
+
+@router.post("/message")
+async def bridge_structured_message(
+    request: Request,
+    x_isola_secret: str | None = Header(default=None, alias="X-Isola-Secret"),
+) -> JSONResponse:
+    denied = _authorize(x_isola_secret)
+    if denied is not None:
+        return denied
+
+    try:
+        raw = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "malformed_json"})
+
+    if not isinstance(raw, dict):
+        return JSONResponse(status_code=400, content={"error": "malformed_json"})
+
+    major = _schema_major(raw.get("schema_version"))
+    if major != SUPPORTED_SCHEMA_MAJOR:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unsupported_schema_version",
+                "schema_version": raw.get("schema_version"),
+                "supported_major": SUPPORTED_SCHEMA_MAJOR,
+            },
+        )
+
+    # Manual validation (not a FastAPI body-param dependency): this keeps
+    # RequestValidationError out of the picture entirely, so it can never
+    # collide with, or silently replace, isola_bridge_v2's own scoped 422
+    # exception-handler registration for the SAME exception class.
+    try:
+        body = StructuredBridgeMessageIn.model_validate(raw)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422, content=_sanitized_validation_body(exc))
+
+    agent_id = body.designated_agent_id
+    correlation_id = body.correlation_id
+    stable_key = _stable_key(correlation_id)
+    accepted_at = _now()
+
+    tenant_id, err = await _resolve_tenant(body)
+    if err is not None:
+        return err
+
+    won, claim_row = await _claim(
+        tenant_id=tenant_id, stable_key=stable_key, correlation_id=correlation_id, body=body
+    )
+    if claim_row is None:  # pragma: no cover - defensive; claim always leaves a row
+        return JSONResponse(status_code=500, content={"error": "claim_failed"})
+
+    if won:
+        try:
+            async with async_session() as db:
+                async with db.begin():
+                    agent = await db.get(Agent, agent_id)
+                    if agent is None:  # pragma: no cover - resolved moments ago
+                        await _mark_failed(claim_row.id, "agent_not_found")
+                        return JSONResponse(status_code=404, content={"error": "agent_not_found"})
+
+                    model = None
+                    if agent.primary_model_id is not None:
+                        model = await db.get(LLMModel, agent.primary_model_id)
+                    if model is None and agent.fallback_model_id is not None:
+                        model = await db.get(LLMModel, agent.fallback_model_id)
+                    if model is None:
+                        await _mark_failed(claim_row.id, "agent_has_no_model")
+                        return JSONResponse(status_code=409, content={"error": "agent_has_no_model"})
+
+                    # contact_ref is the structured contract's opaque customer
+                    # contact identity (dec-foundation-clawith-structured-response
+                    # -contract-2026-07-29) — the same role `phone` plays for the
+                    # legacy bridges. Reused here as the phone-shaped anchor
+                    # _stable_user_id already expects, so the same phone/ref
+                    # always maps to the same tenant-scoped User row.
+                    phone = body.contact_ref.strip()
+                    user_id = _stable_user_id(tenant_id, phone)
+                    await db.execute(
+                        pg_insert(User)
+                        .values(
+                            id=user_id,
+                            tenant_id=tenant_id,
+                            display_name=phone,
+                            role="member",
+                            is_active=True,
+                            registration_source="isola_bridge_structured",
+                        )
+                        .on_conflict_do_nothing(index_elements=["id"])
+                    )
+                    user = await db.get(User, user_id)
+                    if user is None:
+                        await _mark_failed(claim_row.id, "user_provision_failed")
+                        return JSONResponse(status_code=500, content={"error": "user_provision_failed"})
+
+                    await db.execute(
+                        pg_insert(AgentUserOnboarding)
+                        .values(agent_id=agent.id, user_id=user.id, phase="completed")
+                        .on_conflict_do_update(
+                            index_elements=["agent_id", "user_id"], set_={"phase": "completed"}
+                        )
+                    )
+
+                    session = await ensure_primary_platform_session(db, agent.id, user.id)
+
+                    caller_directive = (
+                        "The customer you are assisting is contacting via the Isola "
+                        f"structured bridge. Their verified contact reference is {phone}. "
+                        "Treat this as their confirmed identity."
+                    )
+
+                    async with open_run_state_reader(db) as reader:
+                        intake = await enqueue_chat_runtime(
+                            db,
+                            agent=agent,
+                            user=user,
+                            session=session,
+                            model=model,
+                            content=body.normalized_customer_message,
+                            source_channel="web",
+                            runtime_instruction=caller_directive,
+                            run_state_reader=reader,
+                        )
+                    if intake is None:
+                        await _mark_failed(claim_row.id, "runtime_v2_disabled_for_agent")
+                        return JSONResponse(
+                            status_code=409, content={"error": "runtime_v2_disabled_for_agent"}
+                        )
+
+                    run_id = intake.handle.run_id
+                    session_id = session.id
+                    user_msg = await db.get(ChatMessage, intake.message_id)
+                    initiating_at = user_msg.created_at if user_msg is not None else accepted_at
+
+                    await db.execute(
+                        _UPDATE_ENQUEUED_SQL,
+                        {
+                            "id": str(claim_row.id),
+                            "session_id": str(session_id),
+                            "run_id": str(run_id),
+                            "initiating_message_id": str(intake.message_id),
+                            "started_at": accepted_at,
+                        },
+                    )
+        except ChatRuntimeIntakeError as exc:
+            await _mark_failed(claim_row.id, exc.code)
+            return JSONResponse(status_code=409, content={"error": exc.code, "detail": str(exc)})
+    else:
+        # Idempotent replay or genuine concurrent duplicate: never enqueue a
+        # second run. Wait for the winner (or a prior completion) instead.
+        populated = await _wait_for_claim_population(claim_row.id)
+        if populated.state == "completed" and populated.terminal_message_id is not None:
+            async with async_session() as db:
+                message = await db.get(ChatMessage, uuid.UUID(str(populated.terminal_message_id)))
+            content = (message.content or "").strip() if message is not None else ""
+            return JSONResponse(
+                status_code=200,
+                content=_envelope(
+                    agent_id=agent_id,
+                    session_id=populated.session_id,
+                    correlation_id=correlation_id,
+                    tenant_id=tenant_id,
+                    customer_reply=content or None,
+                    confidence=1.0 if content else 0.0,
+                ),
+            )
+        if populated.state in ("failed", "rejected", "cancelled", "expired"):
+            return JSONResponse(
+                status_code=200,
+                content=_envelope(
+                    agent_id=agent_id,
+                    session_id=populated.session_id or uuid.uuid4(),
+                    correlation_id=correlation_id,
+                    tenant_id=tenant_id,
+                    customer_reply=None,
+                    confidence=0.0,
+                    escalation_requested=True,
+                    escalation_reason_code="tool_failure",
+                    escalation_explanation=f"prior attempt for this correlation_id ended in {populated.error_class}",
+                ),
+            )
+        if populated.session_id is None or populated.run_id is None:
+            # Winner has not finished enqueuing yet. Retryable: the claim
+            # already exists, so a retry will not create a second run.
+            return JSONResponse(
+                status_code=504,
+                content={"error": "claim_not_yet_populated", "retry_after_seconds": 3},
+            )
+        run_id = uuid.UUID(str(populated.run_id))
+        session_id = uuid.UUID(str(populated.session_id))
+        if populated.initiating_message_id is not None:
+            async with async_session() as db:
+                msg = await db.get(ChatMessage, uuid.UUID(str(populated.initiating_message_id)))
+            initiating_at = msg.created_at if msg is not None else accepted_at
+        else:
+            initiating_at = accepted_at
+
+    settled, final_status, reply = await _poll_and_read(tenant_id, run_id, session_id, initiating_at)
+
+    if not settled:
+        # Row stays 'running'. A retry with the same correlation_id lands in
+        # the loser branch above and waits on the SAME run — no second
+        # enqueue.
+        return JSONResponse(
+            status_code=504,
+            content={
+                "error": "runtime_timeout",
+                "run_id": str(run_id),
+                "session_id": str(session_id),
+                "correlation_id": correlation_id,
+            },
+        )
+
+    latency_ms = int((_now() - accepted_at).total_seconds() * 1000)
+
+    if reply is not None:
+        async with async_session() as db:
+            message = await _read_last_assistant(db, session_id, initiating_at)
+            terminal_message_id = str(message.id) if message is not None else None
+            await db.execute(
+                _UPDATE_TERMINAL_SQL,
+                {
+                    "id": str(claim_row.id),
+                    "state": "completed",
+                    "terminal_message_id": terminal_message_id,
+                    "completed_at": _now(),
+                    "error_class": None,
+                    "now": _now(),
+                },
+            )
+            await db.commit()
+        return JSONResponse(
+            status_code=200,
+            content=_envelope(
+                agent_id=agent_id,
+                session_id=session_id,
+                correlation_id=correlation_id,
+                tenant_id=tenant_id,
+                customer_reply=reply,
+                confidence=1.0,
+                latency_ms=latency_ms,
+            ),
+        )
+
+    # Settled but no assistant reply was produced (e.g. the run failed or
+    # cancelled). Return an escalation rather than a bare error so Foundation
+    # gets a contract-valid, actionable outcome.
+    async with async_session() as db:
+        await db.execute(
+            _UPDATE_TERMINAL_SQL,
+            {
+                "id": str(claim_row.id),
+                "state": "failed",
+                "terminal_message_id": None,
+                "completed_at": _now(),
+                "error_class": f"run_{final_status}_no_reply",
+                "now": _now(),
+            },
+        )
+        await db.commit()
+    return JSONResponse(
+        status_code=200,
+        content=_envelope(
+            agent_id=agent_id,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            tenant_id=tenant_id,
+            customer_reply=None,
+            confidence=0.0,
+            escalation_requested=True,
+            escalation_reason_code="tool_failure",
+            escalation_explanation=f"agent run ended in status {final_status!r} with no reply",
+            latency_ms=latency_ms,
+        ),
+    )
+
+
+__all__ = ["router"]
