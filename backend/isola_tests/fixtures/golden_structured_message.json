@@ -1,0 +1,90 @@
+{
+  "request_input": {
+    "tenantId": "43b006e4-33e0-42a8-bec7-4422ba290d79",
+    "bindingTenantId": "43b006e4-33e0-42a8-bec7-4422ba290d79",
+    "conversationTenantId": "43b006e4-33e0-42a8-bec7-4422ba290d79",
+    "businessId": "epic-communications-inc",
+    "chatwootAccountId": "5",
+    "inboxId": "46",
+    "conversationId": "cmrxj42cg001qs62mdqtebjy8",
+    "inboundMessageId": "90210",
+    "contactRef": "contact:abc123",
+    "customerMessage": "Do you install fibre in Roseau?",
+    "history": [{ "role": "user", "content": "hi" }],
+    "designatedAgentId": "81b38cd6-9fba-4cc8-8f87-1bce1a4aa162",
+    "knowledgeScopeIds": ["kb-epic-services"],
+    "allowedTools": [
+      {
+        "name": "crm.lead.create",
+        "description": "Create a lead",
+        "arguments": ["name", "phone"],
+        "mutating": true
+      }
+    ],
+    "ownershipState": "AI_OWNED",
+    "correlationId": "corr-golden-2026-08-02-0001",
+    "locale": "en-DM",
+    "timezone": "America/Dominica",
+    "responseDeadlineMs": 45000
+  },
+  "request": {
+    "schema_version": "1.0.0",
+    "tenant_id": "43b006e4-33e0-42a8-bec7-4422ba290d79",
+    "business_id": "epic-communications-inc",
+    "chatwoot_account_id": "5",
+    "inbox_id": "46",
+    "conversation_id": "cmrxj42cg001qs62mdqtebjy8",
+    "inbound_message_id": "90210",
+    "contact_ref": "contact:abc123",
+    "normalized_customer_message": "Do you install fibre in Roseau?",
+    "bounded_conversation_history": [{ "role": "user", "content": "hi" }],
+    "designated_agent_id": "81b38cd6-9fba-4cc8-8f87-1bce1a4aa162",
+    "knowledge_scope_ids": ["kb-epic-services"],
+    "allowed_tools": [
+      {
+        "name": "crm.lead.create",
+        "description": "Create a lead",
+        "arguments": ["name", "phone"],
+        "mutating": true
+      }
+    ],
+    "ownership_state": "AI_OWNED",
+    "correlation_id": "corr-golden-2026-08-02-0001",
+    "locale": "en-DM",
+    "timezone": "America/Dominica",
+    "response_deadline_ms": 45000
+  },
+  "response": {
+    "schema_version": "1.0.0",
+    "agent_id": "81b38cd6-9fba-4cc8-8f87-1bce1a4aa162",
+    "session_id": "11111111-2222-4333-8444-555555555555",
+    "correlation_id": "corr-golden-2026-08-02-0001",
+    "customer_reply": "Yes — EPIC installs fibre in Roseau. Would you like to check availability at your address?",
+    "intent": "service_availability",
+    "confidence": 0.9,
+    "qualification_state": "qualifying",
+    "knowledge_references": ["kb-epic-services#fibre"],
+    "tool_requests": [],
+    "escalation": {
+      "requested": false,
+      "reason_code": null,
+      "explanation": null,
+      "urgency": null,
+      "required_team": null,
+      "customer_handoff_message": null
+    },
+    "missing_information": [],
+    "follow_up_required": false,
+    "usage": { "latency_ms": 1200 }
+  },
+  "legacy_live_response": {
+    "reply": "Yes, we do.",
+    "run_id": "22222222-3333-4444-8888-999999999999",
+    "matched_session": "33333333-4444-5555-8888-666666666666",
+    "status": "completed",
+    "correlation_id": "corr-golden-2026-08-02-0001",
+    "agent_id": "81b38cd6-9fba-4cc8-8f87-1bce1a4aa162",
+    "agent_name": "EMA",
+    "tenant_id": "43b006e4-33e0-42a8-bec7-4422ba290d79"
+  }
+}
