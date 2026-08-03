@@ -215,6 +215,38 @@ async def test_no_receipt_yet_still_falls_back_to_result_summary(monkeypatch, cl
 
 
 @pytest.mark.asyncio
+async def test_no_receipt_yet_still_falls_back_to_waiting_reason(monkeypatch, client):
+    """Symmetric with `test_no_receipt_yet_still_falls_back_to_result_summary`
+    for the `waiting_reason` field specifically (R1.1 Phase 1 hardening,
+    `dec-clawith-r1-1-run-state-fallback-and-correlation-identity-fix-2026-
+    08-03`): when no receipt exists at all, the exact-run `waiting_reason` is
+    returned unchanged."""
+    _wire_happy_path(
+        monkeypatch,
+        final_status="waiting_user",
+        waiting_reason="please confirm your account number",
+        result_summary=None,
+    )
+
+    async def fake_read_run_owned_reply(db, **kwargs):
+        return None
+
+    monkeypatch.setattr(isola_bridge, "read_run_owned_reply", fake_read_run_owned_reply)
+    monkeypatch.setattr(isola_bridge, "_MESSAGE_GRACE_S", 0.0)
+    monkeypatch.setattr(isola_bridge, "_POLL_INTERVAL_S", 0.01)
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/message",
+            json={"agent_id": str(AGENT_ID), "phone": "+18095551234", "text": "hi"},
+            headers=_headers(),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reply"] == "please confirm your account number"
+
+
+@pytest.mark.asyncio
 async def test_happy_path_returns_the_run_owned_reply_content(monkeypatch, client):
     """Baseline: a valid run-owned reply is returned as-is."""
     _wire_happy_path(

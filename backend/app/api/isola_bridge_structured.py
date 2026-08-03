@@ -675,6 +675,44 @@ async def bridge_structured_message(
     # -2026-08-02): isola_bridge_v2.py cannot write, read or contend for a
     # row here — there is no shared table, unique constraint or claim
     # namespace between the two bridges.
+    # Correlation-identity binding (`dec-clawith-r1-1-run-state-fallback-and-
+    # correlation-identity-fix-2026-08-03`, closing `defect-clawith-
+    # structured-correlation-replay-request-identity-not-bound-2026-08-03`):
+    # `correlation_id` is an idempotency key bound to the ORIGINAL claimed
+    # request's identity, not merely to its tool policy. A same-tenant
+    # request reusing this `correlation_id` but naming a different contact,
+    # designated agent, or external conversation must never join, wait on,
+    # or replay the existing claim -- doing so would let a mismatched
+    # duplicate receive another recipient's real reply. `contact_ref`,
+    # `agent_id` and `external_conversation_id` are already durably stored
+    # on every row this SELECT can return (all three are non-optional on
+    # the code path that inserts a row -- see `_claim` above), so this is a
+    # database-backed comparison, not a new migration. On the WINNING path
+    # `claim_row` is the row this same request just inserted with its own
+    # values, so the comparison is always a no-op there; it only ever
+    # rejects on the LOSING path. Checked before any join, wait, replay,
+    # terminal-result or winner-reply below -- no claim mutation, no new
+    # run/session/user/message/tool/audit row on mismatch.
+    stored_contact_ref = getattr(claim_row, "contact_ref", None)
+    stored_agent_id = getattr(claim_row, "agent_id", None)
+    stored_external_conversation_id = getattr(claim_row, "external_conversation_id", None)
+    if (
+        stored_contact_ref != body.contact_ref
+        or str(stored_agent_id) != str(body.designated_agent_id)
+        or stored_external_conversation_id != body.conversation_id
+    ):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "correlation_id_request_mismatch",
+                "detail": (
+                    "this correlation_id is already claimed by a request "
+                    "naming a different contact_ref, designated_agent_id, "
+                    "or external_conversation_id"
+                ),
+            },
+        )
+
     stored_digest = getattr(claim_row, "tool_policy_digest", None)
     if stored_digest != tool_policy_digest:
         # This correlation_id is already claimed under a DIFFERENT (or
