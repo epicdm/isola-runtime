@@ -217,7 +217,15 @@ class _FakeClaimStore:
     def __init__(self):
         self.rows: dict[str, SimpleNamespace] = {}
 
-    def claim(self, tenant_id, correlation_id, tool_policy_digest=None, contact_ref=None, agent_id=None):
+    def claim(
+        self,
+        tenant_id,
+        correlation_id,
+        tool_policy_digest=None,
+        contact_ref=None,
+        agent_id=None,
+        external_conversation_id=None,
+    ):
         db_key = f"{tenant_id}:{correlation_id}"
         if db_key in self.rows:
             return False, self.rows[db_key]
@@ -234,6 +242,7 @@ class _FakeClaimStore:
             tool_policy_digest=tool_policy_digest,
             contact_ref=contact_ref or GOLDEN_REQUEST["contact_ref"],
             agent_id=agent_id or AGENT_ID,
+            external_conversation_id=external_conversation_id or GOLDEN_REQUEST["conversation_id"],
         )
         self.rows[db_key] = row
         return True, row
@@ -260,7 +269,14 @@ class _FakeClaimStore:
 
 def _wire_claim_store(monkeypatch, store: _FakeClaimStore):
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
-        return store.claim(tenant_id, correlation_id, tool_policy_digest)
+        return store.claim(
+            tenant_id,
+            correlation_id,
+            tool_policy_digest,
+            contact_ref=body.contact_ref,
+            agent_id=body.designated_agent_id,
+            external_conversation_id=body.conversation_id,
+        )
 
     async def fake_wait_for_claim_population(row_id):
         for row in store.rows.values():
@@ -730,6 +746,9 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
             state="running",
             initiating_message_id=None,
             tool_policy_digest=tool_policy_digest,
+            contact_ref=GOLDEN_REQUEST["contact_ref"],
+            agent_id=AGENT_ID,
+            external_conversation_id=GOLDEN_REQUEST["conversation_id"],
         )
 
     monkeypatch.setattr(structured_api, "_claim", spy_claim)
@@ -823,6 +842,9 @@ async def test_duplicate_tool_names_in_request_deduplicate_to_one_name(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
             tool_policy_digest=tool_policy_digest,
+            contact_ref=GOLDEN_REQUEST["contact_ref"],
+            agent_id=AGENT_ID,
+            external_conversation_id=GOLDEN_REQUEST["conversation_id"],
         )
 
     monkeypatch.setattr(structured_api, "_claim", spy_claim)
@@ -927,6 +949,9 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
             tool_policy_digest=tool_policy_digest,
+            contact_ref=body.contact_ref,
+            agent_id=body.designated_agent_id,
+            external_conversation_id=body.conversation_id,
         )
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
@@ -1060,6 +1085,9 @@ async def test_correlation_id_reused_with_different_allowed_tools_is_rejected_no
         state="running",
         initiating_message_id=None,
         tool_policy_digest=winner_digest,
+        contact_ref=GOLDEN_REQUEST["contact_ref"],
+        agent_id=AGENT_ID,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
     )
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
@@ -1129,6 +1157,7 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
         tool_policy_digest=matching_digest,
         contact_ref=GOLDEN_REQUEST["contact_ref"],
         agent_id=AGENT_ID,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
     )
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
@@ -1200,15 +1229,23 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
 
 
 @pytest.mark.asyncio
-async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(monkeypatch, client):
-    """Regression test for a BLOCKING adversarial-review finding: a
-    duplicate/retried request reusing an existing correlation_id but
-    carrying a DIFFERENT contact_ref than the request that actually won the
-    claim must still derive user_id from the CLAIMED row's own contact_ref
-    -- never from this request's own body.contact_ref. Deriving it from the
-    request would make the run-owned lookup see the winner's real reply as
-    a user mismatch, which would mark the SHARED claim row failed and
-    poison it for the original, legitimate caller."""
+async def test_contact_ref_mismatch_duplicate_is_rejected_409_before_join_or_replay(
+    monkeypatch, client
+):
+    """R1.1 correlation-identity binding
+    (`dec-clawith-r1-1-run-state-fallback-and-correlation-identity-fix-2026-
+    08-03`, closing `defect-clawith-structured-correlation-replay-request-
+    identity-not-bound-2026-08-03`): a duplicate/retried request reusing an
+    existing correlation_id but carrying a DIFFERENT contact_ref than the
+    request that actually won the claim must be rejected with a
+    deterministic 409 BEFORE join, wait or replay -- it must never receive
+    the winner's real reply, and it must not learn the winner's run_id,
+    session_id or terminal_message_id.
+
+    Supersedes the earlier interim behavior (asserted by this test's
+    previous version) where such a mismatch was merely prevented from
+    POISONING the claim but still received the winner's reply -- that is
+    exactly the confidentiality gap the fresh R2 Gate 8 Codex review found."""
     monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
 
     async def fake_resolve_effective_tool_names(agent_id, requested):
@@ -1221,9 +1258,9 @@ async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(m
     winner_contact_ref = GOLDEN_REQUEST["contact_ref"]
     # Must match what _resolve_effective_tool_names resolves for
     # GOLDEN_REQUEST's own allowed_tools ("crm.lead.create") -- this test
-    # varies only contact_ref, not the tool policy, so the digest must
-    # agree or the request is rejected 409 before ever reaching the loser
-    # path this test is about.
+    # varies only contact_ref, so the digest must agree or the request
+    # would be rejected for the WRONG reason (policy mismatch, not identity
+    # mismatch).
     digest = structured_api._tool_policy_digest(["crm.lead.create"])
     existing_row = SimpleNamespace(
         id=uuid.uuid4(),
@@ -1231,9 +1268,11 @@ async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(m
         run_id=RUN_ID,
         state="running",
         initiating_message_id=None,
+        terminal_message_id=None,
         tool_policy_digest=digest,
         contact_ref=winner_contact_ref,
         agent_id=AGENT_ID,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
     )
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
@@ -1241,17 +1280,20 @@ async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(m
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
 
+    wait_calls = []
+
     async def fake_wait_for_claim_population(row_id):
+        wait_calls.append(row_id)
         return existing_row
 
     monkeypatch.setattr(
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    observed_user_ids = []
+    read_calls = []
 
     async def fake_read_run_owned_reply(db, *, tenant_id, run_id, session_id, agent_id, user_id):
-        observed_user_ids.append(user_id)
+        read_calls.append(user_id)
         return structured_api.RunOwnedReply(
             message_id=uuid.uuid4(),
             content="The winner's real reply.",
@@ -1261,42 +1303,17 @@ async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(m
 
     monkeypatch.setattr(structured_api, "read_run_owned_reply", fake_read_run_owned_reply)
 
-    class _Reader:
-        async def __aenter__(self):
-            return self
+    async def fake_poll_and_read(*a, **k):
+        raise AssertionError("must not poll/read a mismatched-identity duplicate")
 
-        async def __aexit__(self, *a):
-            return False
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
 
-        async def get_run_state(self, tenant_id, run_id):
-            return SimpleNamespace(execution_status="completed", waiting_reason=None, result_summary=None)
+    mark_failed_calls = []
 
-    monkeypatch.setattr(structured_api, "open_run_state_reader", lambda db: _Reader())
+    async def spy_mark_failed(request_id, error_class):
+        mark_failed_calls.append((request_id, error_class))
 
-    class _NoopSession:
-        async def execute(self, *a, **k):
-            return SimpleNamespace(first=lambda: None, mappings=lambda: SimpleNamespace(first=lambda: None))
-
-        async def commit(self):
-            return None
-
-        async def get(self, *a, **k):
-            return None
-
-        def expire_all(self):
-            return None
-
-    class _NoopSessionFactory:
-        def __call__(self):
-            return self
-
-        async def __aenter__(self):
-            return _NoopSession()
-
-        async def __aexit__(self, *a):
-            return False
-
-    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
+    monkeypatch.setattr(structured_api, "_mark_failed", spy_mark_failed)
 
     # This request's own contact_ref deliberately differs from the claimed
     # row's -- a stale retry, a client bug, or an adversarial duplicate.
@@ -1307,25 +1324,37 @@ async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(m
             "/api/isola/bridge/structured/message", json=payload, headers=_headers()
         )
 
-    assert response.status_code == 200
-    # The winner's real reply is returned -- the claim was never poisoned.
-    assert response.json()["customer_reply"] == "The winner's real reply."
-    assert len(observed_user_ids) == 1
-    assert observed_user_ids[0] == structured_api._stable_user_id(TENANT_ID, winner_contact_ref)
-    assert observed_user_ids[0] != structured_api._stable_user_id(
-        TENANT_ID, "contact:a-completely-different-customer"
-    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "correlation_id_request_mismatch"
+    # Zero side effects: never joined, waited, replayed, or mutated the
+    # claim, and never learned anything about the winner.
+    assert wait_calls == []
+    assert read_calls == []
+    assert mark_failed_calls == []
+    assert "customer_reply" not in body
+    assert "run_id" not in body
+    assert "session_id" not in body
+    assert "terminal_message_id" not in body
+    assert "The winner's real reply." not in response.text
+    assert str(RUN_ID) not in response.text
+    assert str(SESSION_ID) not in response.text
 
 
 @pytest.mark.asyncio
-async def test_loser_derives_agent_id_from_the_claimed_row_not_the_request_body(monkeypatch, client):
-    """Same regression as above for agent_id: a duplicate/concurrent
-    request reusing an existing correlation_id under the SAME tenant and
-    tool-policy digest but naming a DIFFERENT designated_agent_id must
-    still validate ownership against the CLAIMED row's own agent_id --
-    never this request's body.designated_agent_id -- or it can fail the
-    run-owned lookup's agent check and mark the shared claim failed,
-    poisoning it for the original winner."""
+async def test_agent_id_mismatch_duplicate_is_rejected_409_before_join_or_replay(
+    monkeypatch, client
+):
+    """Same R1.1 correlation-identity binding as the contact_ref test above,
+    for `designated_agent_id`: a duplicate/concurrent request reusing an
+    existing correlation_id under the SAME tenant and tool-policy digest but
+    naming a DIFFERENT designated_agent_id must be rejected with a
+    deterministic 409 BEFORE join, wait or replay -- it must never receive
+    the winner's real reply.
+
+    Supersedes the earlier interim behavior (asserted by this test's
+    previous version) where such a mismatch was merely prevented from
+    POISONING the claim but still received the winner's reply."""
     monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
 
     async def fake_resolve_effective_tool_names(agent_id, requested):
@@ -1346,9 +1375,11 @@ async def test_loser_derives_agent_id_from_the_claimed_row_not_the_request_body(
         run_id=RUN_ID,
         state="running",
         initiating_message_id=None,
+        terminal_message_id=None,
         tool_policy_digest=digest,
         contact_ref=GOLDEN_REQUEST["contact_ref"],
         agent_id=winner_agent_id,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
     )
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
@@ -1356,17 +1387,20 @@ async def test_loser_derives_agent_id_from_the_claimed_row_not_the_request_body(
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
 
+    wait_calls = []
+
     async def fake_wait_for_claim_population(row_id):
+        wait_calls.append(row_id)
         return existing_row
 
     monkeypatch.setattr(
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    observed_agent_ids = []
+    read_calls = []
 
     async def fake_read_run_owned_reply(db, *, tenant_id, run_id, session_id, agent_id, user_id):
-        observed_agent_ids.append(agent_id)
+        read_calls.append(agent_id)
         return structured_api.RunOwnedReply(
             message_id=uuid.uuid4(),
             content="The winner's real reply.",
@@ -1376,42 +1410,17 @@ async def test_loser_derives_agent_id_from_the_claimed_row_not_the_request_body(
 
     monkeypatch.setattr(structured_api, "read_run_owned_reply", fake_read_run_owned_reply)
 
-    class _Reader:
-        async def __aenter__(self):
-            return self
+    async def fake_poll_and_read(*a, **k):
+        raise AssertionError("must not poll/read a mismatched-identity duplicate")
 
-        async def __aexit__(self, *a):
-            return False
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
 
-        async def get_run_state(self, tenant_id, run_id):
-            return SimpleNamespace(execution_status="completed", waiting_reason=None, result_summary=None)
+    mark_failed_calls = []
 
-    monkeypatch.setattr(structured_api, "open_run_state_reader", lambda db: _Reader())
+    async def spy_mark_failed(request_id, error_class):
+        mark_failed_calls.append((request_id, error_class))
 
-    class _NoopSession:
-        async def execute(self, *a, **k):
-            return SimpleNamespace(first=lambda: None, mappings=lambda: SimpleNamespace(first=lambda: None))
-
-        async def commit(self):
-            return None
-
-        async def get(self, *a, **k):
-            return None
-
-        def expire_all(self):
-            return None
-
-    class _NoopSessionFactory:
-        def __call__(self):
-            return self
-
-        async def __aenter__(self):
-            return _NoopSession()
-
-        async def __aexit__(self, *a):
-            return False
-
-    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
+    monkeypatch.setattr(structured_api, "_mark_failed", spy_mark_failed)
 
     # This request's own designated_agent_id deliberately differs from the
     # claimed row's -- a stale retry, a client bug, or an adversarial
@@ -1424,12 +1433,14 @@ async def test_loser_derives_agent_id_from_the_claimed_row_not_the_request_body(
             "/api/isola/bridge/structured/message", json=payload, headers=_headers()
         )
 
-    assert response.status_code == 200
-    # The winner's real reply is returned -- the claim was never poisoned.
-    assert response.json()["customer_reply"] == "The winner's real reply."
-    assert len(observed_agent_ids) == 1
-    assert observed_agent_ids[0] == winner_agent_id
-    assert observed_agent_ids[0] != different_agent_id
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "correlation_id_request_mismatch"
+    assert wait_calls == []
+    assert read_calls == []
+    assert mark_failed_calls == []
+    assert "customer_reply" not in body
+    assert "The winner's real reply." not in response.text
 
 
 @pytest.mark.asyncio
@@ -1455,6 +1466,9 @@ async def test_fail_closed_when_claim_row_has_no_recorded_digest(monkeypatch, cl
         run_id=RUN_ID,
         state="running",
         initiating_message_id=None,
+        contact_ref=GOLDEN_REQUEST["contact_ref"],
+        agent_id=AGENT_ID,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
     )
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
@@ -1474,3 +1488,184 @@ async def test_fail_closed_when_claim_row_has_no_recorded_digest(monkeypatch, cl
 
     assert response.status_code == 409
     assert response.json()["error"] == "correlation_id_policy_mismatch"
+
+
+# ── R1.1 correlation-identity binding
+# (dec-clawith-r1-1-run-state-fallback-and-correlation-identity-fix-2026-08-03,
+# closing defect-clawith-structured-correlation-replay-request-identity-not-
+# bound-2026-08-03) — remaining required coverage beyond the contact_ref/
+# agent_id mismatch tests above ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_external_conversation_id_mismatch_duplicate_is_rejected_409(monkeypatch, client):
+    """`external_conversation_id` (the request's `conversation_id`) is
+    durably stored on every claim row this SELECT can return, so it is
+    bound the same way as `contact_ref`/`agent_id`: a same-tenant,
+    same-correlation_id, same-tool-digest duplicate naming a DIFFERENT
+    external_conversation_id must be rejected 409 before join/wait/replay,
+    even though contact_ref and designated_agent_id both match."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    digest = structured_api._tool_policy_digest(["crm.lead.create"])
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+        terminal_message_id=None,
+        tool_policy_digest=digest,
+        contact_ref=GOLDEN_REQUEST["contact_ref"],
+        agent_id=AGENT_ID,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
+    )
+
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    wait_calls = []
+
+    async def fake_wait_for_claim_population(row_id):
+        wait_calls.append(row_id)
+        return existing_row
+
+    monkeypatch.setattr(
+        structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
+    )
+
+    async def fake_poll_and_read(*a, **k):
+        raise AssertionError("must not poll/read a mismatched-identity duplicate")
+
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
+
+    # contact_ref and designated_agent_id both match the claimed row exactly
+    # -- only conversation_id (the request's own external_conversation_id)
+    # differs.
+    payload = dict(GOLDEN_REQUEST, conversation_id="cmrxj42cg001qs62mdqtebjy8-DIFFERENT")
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/structured/message", json=payload, headers=_headers()
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "correlation_id_request_mismatch"
+    assert wait_calls == []
+
+
+def test_request_content_identity_is_not_durably_stored_on_the_claim_row():
+    """Audit finding required by R1.1 Phase 4 (migration gate): the claim
+    row stores `contact_ref`, `agent_id` and `external_conversation_id`
+    (all bound above), but NOT a hash or copy of
+    `normalized_customer_message` / `bounded_conversation_history` / any
+    other request-content identity. `REQUEST_CONTENT_MISMATCH=NOT_STORED`
+    per the R1.1 report contract -- this is recorded as a fact, not
+    remediated, because the ratifying decision explicitly forbids inventing
+    a migration when it is not already required for the minimum bound
+    fields (`contact_ref`, `designated_agent_id`) plus what else is already
+    stored (`external_conversation_id`)."""
+    insert_sql = str(structured_api._CLAIM_SQL)
+    for content_column in (
+        "normalized_customer_message",
+        "message_content",
+        "content_hash",
+        "request_hash",
+    ):
+        assert content_column not in insert_sql
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mismatched_duplicates_all_rejected_winner_unaffected(
+    monkeypatch, client
+):
+    """Multiple concurrent mismatched duplicates (varying contact_ref
+    and/or designated_agent_id) sharing one correlation_id must ALL be
+    rejected 409, and the original winner's claim row must be completely
+    untouched -- no attribute on `existing_row` changes, no wait/read/
+    mark-failed call happens for any of them."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    digest = structured_api._tool_policy_digest(["crm.lead.create"])
+    winner_contact_ref = GOLDEN_REQUEST["contact_ref"]
+    winner_agent_id = AGENT_ID
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+        terminal_message_id=None,
+        tool_policy_digest=digest,
+        contact_ref=winner_contact_ref,
+        agent_id=winner_agent_id,
+        external_conversation_id=GOLDEN_REQUEST["conversation_id"],
+    )
+    snapshot_before = dict(vars(existing_row))
+
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    wait_calls = []
+
+    async def fake_wait_for_claim_population(row_id):
+        wait_calls.append(row_id)
+        return existing_row
+
+    monkeypatch.setattr(
+        structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
+    )
+
+    async def fake_poll_and_read(*a, **k):
+        raise AssertionError("must not poll/read a mismatched-identity duplicate")
+
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
+
+    mark_failed_calls = []
+
+    async def spy_mark_failed(request_id, error_class):
+        mark_failed_calls.append((request_id, error_class))
+
+    monkeypatch.setattr(structured_api, "_mark_failed", spy_mark_failed)
+
+    payloads = [
+        dict(GOLDEN_REQUEST, contact_ref="contact:duplicate-a"),
+        dict(GOLDEN_REQUEST, designated_agent_id=str(uuid.uuid4())),
+        dict(GOLDEN_REQUEST, contact_ref="contact:duplicate-b", designated_agent_id=str(uuid.uuid4())),
+    ]
+
+    import asyncio
+
+    async with await client() as ac:
+        responses = await asyncio.gather(
+            *[
+                ac.post("/api/isola/bridge/structured/message", json=payload, headers=_headers())
+                for payload in payloads
+            ]
+        )
+
+    for response in responses:
+        assert response.status_code == 409
+        assert response.json()["error"] == "correlation_id_request_mismatch"
+    assert wait_calls == []
+    assert mark_failed_calls == []
+    # The winner's claim row is byte-for-byte unaffected.
+    assert dict(vars(existing_row)) == snapshot_before
