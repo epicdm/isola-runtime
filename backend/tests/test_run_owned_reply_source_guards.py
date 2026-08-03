@@ -26,7 +26,6 @@ environment-dependent preconditions.
 
 from __future__ import annotations
 
-import hashlib
 import subprocess
 from pathlib import Path
 
@@ -39,16 +38,9 @@ REPO_ROOT = BACKEND_DIR.parent
 # assistant-reply-ownership-2026-08-03's pre-flight verification).
 _BASE_SHA = "9279bed3d008ede469069885e46a06aa0c732714"
 
-# SHA-256 of the two forbidden-to-touch files' content AT that exact base
-# commit (`git show <base_sha>:<path> | sha256sum`), pinned independently of
-# whether git is available at test time.
-_ISOLA_BRIDGE_V2_BASE_SHA256 = (
-    "1419a85f22ae66b4b39d159e05f45c86bcc776d6cae4a3a443b31085054c6f24"
-)
-_DELIVERY_BASE_SHA256 = "fdabee296dfe93ddf9c3097a09db48f96aa499500f2db23e88eb23bf8ebf7e35"
+_ISOLA_BRIDGE_V2_RELPATH = "backend/app/api/isola_bridge_v2.py"
+_DELIVERY_RELPATH = "backend/app/services/agent_runtime/delivery.py"
 
-_ISOLA_BRIDGE_V2_PATH = BACKEND_DIR / "app" / "api" / "isola_bridge_v2.py"
-_DELIVERY_PATH = BACKEND_DIR / "app" / "services" / "agent_runtime" / "delivery.py"
 _LEGACY_BRIDGE_PATH = BACKEND_DIR / "app" / "api" / "isola_bridge.py"
 _STRUCTURED_BRIDGE_PATH = BACKEND_DIR / "app" / "api" / "isola_bridge_structured.py"
 
@@ -59,8 +51,43 @@ _REMOVED_PATTERNS = (
 )
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _git_diff_is_empty(relpath: str) -> str:
+    """Returns '' when `relpath` is byte-for-byte unchanged relative to
+    `_BASE_SHA` (working tree AND any staged/untracked delta), else the raw
+    `git diff`/`git status` output for diagnostics.
+
+    Deliberately NOT a `Path.read_bytes()` SHA-256 against a pinned
+    constant: on a checkout with CRLF line-ending conversion (e.g. Windows
+    `core.autocrlf`/`.gitattributes`), the on-disk bytes differ from the
+    LF-normalized git blob bytes a pinned constant would have been captured
+    from, producing a false "changed" result for a file git itself
+    considers identical. `git diff` compares git's own normalized blob
+    representations on both sides, so it agrees with `git status`
+    regardless of the working tree's checkout line-ending settings.
+    """
+    diff = subprocess.run(
+        ["git", "diff", _BASE_SHA, "--", relpath],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if diff.returncode != 0:
+        return diff.stderr or "git diff failed"
+    if diff.stdout.strip():
+        return diff.stdout
+    untracked = subprocess.run(
+        ["git", "status", "--porcelain", "--", relpath],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if untracked.returncode != 0:
+        return untracked.stderr or "git status failed"
+    return untracked.stdout
 
 
 def _git_repo_at_base() -> bool:
@@ -112,22 +139,14 @@ def test_structured_bridge_terminal_message_id_sourced_from_the_returned_reply()
 
 @pytest.mark.skipif(not _git_repo_at_base(), reason="base commit unavailable in this checkout")
 def test_isola_bridge_v2_is_byte_identical_to_the_ratified_base():
-    assert _sha256(_ISOLA_BRIDGE_V2_PATH) == _ISOLA_BRIDGE_V2_BASE_SHA256
+    diff = _git_diff_is_empty(_ISOLA_BRIDGE_V2_RELPATH)
+    assert diff == "", f"isola_bridge_v2.py differs from base {_BASE_SHA}:\n{diff}"
 
 
 @pytest.mark.skipif(not _git_repo_at_base(), reason="base commit unavailable in this checkout")
 def test_delivery_module_is_byte_identical_to_the_ratified_base():
-    assert _sha256(_DELIVERY_PATH) == _DELIVERY_BASE_SHA256
-
-
-def test_isola_bridge_v2_hash_matches_pinned_constant_independent_of_git():
-    """Same proof as above, restated without a git dependency: if the pinned
-    SHA-256 constant itself was captured correctly from the base commit (this
-    test file's own provenance), a passing byte-identity test above implies
-    this one always agrees. Exists so the identity claim is checkable by
-    inspection even when git is unavailable."""
-    assert len(_ISOLA_BRIDGE_V2_BASE_SHA256) == 64
-    assert len(_DELIVERY_BASE_SHA256) == 64
+    diff = _git_diff_is_empty(_DELIVERY_RELPATH)
+    assert diff == "", f"delivery.py differs from base {_BASE_SHA}:\n{diff}"
 
 
 # ── No migration added ───────────────────────────────────────────────────
