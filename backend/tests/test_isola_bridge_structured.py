@@ -1,31 +1,35 @@
 """Tests for the additive structured bridge endpoint
-(`dec-clawith-structured-bridge-versioned-endpoint-2026-08-02` slice S2).
+(`dec-clawith-structured-bridge-versioned-endpoint-2026-08-02` slice S2) and
+its dedicated claim table
+(`dec-clawith-structured-claim-isolation-dedicated-table-2026-08-02`).
 
 Follows the monkeypatch-the-module pattern already used by
 `test_webhooks_api.py`: the real FastAPI app is exercised end-to-end via
 httpx.ASGITransport, and the module's own async collaborators
 (`_resolve_tenant`, `_claim`, `_wait_for_claim_population`, `_poll_and_read`,
 `enqueue_chat_runtime`, `ensure_primary_platform_session`) are replaced with
-fakes so no real database or LLM runtime is required.
+fakes so no real database or LLM runtime is required for THIS file. Real
+Postgres-backed migration, cross-route isolation and concurrency proofs live
+in `test_isola_structured_bridge_requests_migration.py` and
+`test_isola_structured_bridge_claim_isolation.py`.
 
 `test_duplicate_correlation_id_does_not_enqueue_second_run` and
 `test_replay_after_completion_returns_stored_result_without_polling` are
 the durable-idempotency proofs: they assert `enqueue_chat_runtime` is called
 at most once across multiple requests sharing one `correlation_id`, using a
-fake claim store that mirrors the real `isola_bridge_requests` table's
-`(tenant_id, stable_request_id)` unique-constraint semantics (an
+fake claim store that mirrors the real `isola_structured_bridge_requests`
+table's `(tenant_id, correlation_id)` unique-constraint semantics (an
 `INSERT ... ON CONFLICT DO NOTHING` — see
-`202607311800_add_isola_bridge_requests.py`). The claim store's true
-cross-process/cross-restart atomicity is inherited from that existing,
-already-relied-upon Postgres constraint, not reinvented here; these tests
-prove the endpoint's branch logic (claim-before-enqueue, never enqueue on a
-lost claim) is correct given that constraint.
+`202608021900_add_structured_bridge_requests.py`). The claim store's true
+cross-process/cross-restart atomicity is inherited from that constraint, not
+reinvented here; these tests prove the endpoint's branch logic
+(claim-before-enqueue, never enqueue on a lost claim) is correct given that
+constraint.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -97,10 +101,15 @@ def test_schema_major_parses_major_version_only():
     assert structured_api._schema_major("abc") is None
 
 
-def test_stable_key_is_namespaced_and_distinct_from_v2():
-    key = structured_api._stable_key("corr-1")
-    assert key == "structured:corr-1"
-    assert key != "corr-1"
+def test_structured_module_has_no_stable_key_helper_or_legacy_table_reference():
+    """Regression guard for the claim-isolation migration
+    (dec-clawith-structured-claim-isolation-dedicated-table-2026-08-02): the
+    structured route must not retain the deleted `_stable_key` helper, and
+    its SQL literals must name only the dedicated table."""
+    assert not hasattr(structured_api, "_stable_key")
+    assert "isola_bridge_requests" not in str(structured_api._CLAIM_SQL)
+    assert "isola_structured_bridge_requests" in str(structured_api._CLAIM_SQL)
+    assert "ON CONFLICT (tenant_id, correlation_id)" in str(structured_api._CLAIM_SQL)
 
 
 def test_structured_message_in_forbids_unknown_fields():
@@ -199,23 +208,22 @@ async def test_tenant_mismatch_returns_409_not_400(monkeypatch, client):
 
 
 class _FakeClaimStore:
-    """Mirrors the (tenant_id, stable_request_id) UNIQUE constraint on the
-    real isola_bridge_requests table: the first claim for a key wins, every
-    subsequent claim for the same key is a no-op that returns the existing
-    row. This is the same INSERT ... ON CONFLICT DO NOTHING semantics the
-    production code relies on."""
+    """Mirrors the (tenant_id, correlation_id) UNIQUE constraint on the real
+    isola_structured_bridge_requests table: the first claim for a key wins,
+    every subsequent claim for the same key is a no-op that returns the
+    existing row. This is the same INSERT ... ON CONFLICT DO NOTHING
+    semantics the production code relies on."""
 
     def __init__(self):
         self.rows: dict[str, SimpleNamespace] = {}
 
-    def claim(self, tenant_id, stable_key, correlation_id, tool_policy_digest=None):
-        db_key = f"{tenant_id}:{stable_key}"
+    def claim(self, tenant_id, correlation_id, tool_policy_digest=None):
+        db_key = f"{tenant_id}:{correlation_id}"
         if db_key in self.rows:
             return False, self.rows[db_key]
         row = SimpleNamespace(
             id=uuid.uuid4(),
             tenant_id=tenant_id,
-            stable_request_id=stable_key,
             correlation_id=correlation_id,
             state="accepted",
             session_id=None,
@@ -223,11 +231,7 @@ class _FakeClaimStore:
             initiating_message_id=None,
             terminal_message_id=None,
             error_class=None,
-            metadata_labels=(
-                {"tool_policy_digest": tool_policy_digest}
-                if tool_policy_digest is not None
-                else {}
-            ),
+            tool_policy_digest=tool_policy_digest,
         )
         self.rows[db_key] = row
         return True, row
@@ -253,8 +257,8 @@ class _FakeClaimStore:
 
 
 def _wire_claim_store(monkeypatch, store: _FakeClaimStore):
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
-        return store.claim(tenant_id, stable_key, correlation_id, tool_policy_digest)
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        return store.claim(tenant_id, correlation_id, tool_policy_digest)
 
     async def fake_wait_for_claim_population(row_id):
         for row in store.rows.values():
@@ -283,17 +287,6 @@ async def test_golden_request_produces_a_foundation_parseable_response(monkeypat
         _fake_resolve_effective_tool_names_permit_all,
     )
 
-    enqueue_calls = []
-
-    async def fake_enqueue(row):
-        enqueue_calls.append(row)
-        store.populate_enqueued(
-            row.id, session_id=SESSION_ID, run_id=RUN_ID, initiating_message_id=uuid.uuid4()
-        )
-
-    async def fake_won_path(monkeypatch_inner=None):
-        pass  # placeholder, real wiring below
-
     # The "won" branch talks to Agent/LLMModel/User/ChatMessage and
     # enqueue_chat_runtime directly inside its own `async_session()` block;
     # rather than fake every ORM call, replace the whole branch's side
@@ -301,9 +294,9 @@ async def test_golden_request_produces_a_foundation_parseable_response(monkeypat
     # row (state=running, session/run populated) and asserting the poll
     # layer + envelope construction — the piece unique to this endpoint —
     # behaves correctly. The separate `won` DB-wiring is exercised by
-    # `test_won_claim_calls_enqueue_chat_runtime_exactly_once`.
-    async def fake_claim_pre_enqueued(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
-        won, row = store.claim(tenant_id, stable_key, correlation_id, tool_policy_digest)
+    # `test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path`.
+    async def fake_claim_pre_enqueued(*, tenant_id, correlation_id, body, tool_policy_digest):
+        won, row = store.claim(tenant_id, correlation_id, tool_policy_digest)
         if won:
             store.populate_enqueued(
                 row.id, session_id=SESSION_ID, run_id=RUN_ID, initiating_message_id=uuid.uuid4()
@@ -409,8 +402,8 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
 
     win_count = {"n": 0}
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
-        won, row = store.claim(tenant_id, stable_key, correlation_id, tool_policy_digest)
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        won, row = store.claim(tenant_id, correlation_id, tool_policy_digest)
         if won:
             win_count["n"] += 1
             store.populate_enqueued(
@@ -497,7 +490,6 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
 
     completed_row = store.claim(
         TENANT_ID,
-        structured_api._stable_key(GOLDEN_REQUEST["correlation_id"]),
         GOLDEN_REQUEST["correlation_id"],
         structured_api._tool_policy_digest(["crm.lead.create"]),
     )[1]
@@ -506,7 +498,7 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
     completed_row.state = "completed"
     completed_row.terminal_message_id = uuid.uuid4()
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         return False, completed_row  # always a replay of the already-completed row
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
@@ -585,6 +577,18 @@ def test_tool_policy_digest_is_order_independent():
     ) == structured_api._tool_policy_digest(["write_file", "read_file"])
 
 
+def test_tool_policy_digest_matches_the_column_shape_check():
+    """The digest must satisfy
+    ck_isola_structured_bridge_requests_digest_shape (^[0-9a-f]{16}$) for
+    every input, including the empty set — the fixed public constant a v2
+    caller would need to forge."""
+    import re
+
+    for names in ([], ["a"], ["a,b", "c"], ["read_file", "write_file"]):
+        digest = structured_api._tool_policy_digest(names)
+        assert re.fullmatch(r"[0-9a-f]{16}", digest), digest
+
+
 @pytest.mark.asyncio
 async def test_resolve_effective_tool_names_intersects_and_reports_unsupported():
     """Pure proof of `_resolve_effective_tool_names`'s own contract: the
@@ -640,7 +644,7 @@ async def test_resolve_effective_tool_names_empty_request_is_empty_and_unsupport
 @pytest.mark.asyncio
 async def test_unsupported_tool_rejected_with_400_before_claim(monkeypatch, client):
     """UNKNOWN OR UNSUPPORTED TOOL: rejected before the idempotency claim —
-    no durable isola_bridge_requests row, no reasoning Run."""
+    no durable isola_structured_bridge_requests row, no reasoning Run."""
     monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
 
     async def fake_resolve_effective_tool_names(agent_id, requested):
@@ -652,7 +656,7 @@ async def test_unsupported_tool_rejected_with_400_before_claim(monkeypatch, clie
 
     claim_calls = []
 
-    async def spy_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def spy_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         claim_calls.append(correlation_id)
         raise AssertionError("must not claim before tool governance passes")
 
@@ -690,7 +694,7 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
 
     claim_calls = []
 
-    async def spy_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def spy_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         claim_calls.append(correlation_id)
         return False, SimpleNamespace(
             id=uuid.uuid4(),
@@ -698,7 +702,7 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
             run_id=RUN_ID,
             state="running",
             initiating_message_id=None,
-            metadata_labels={"tool_policy_digest": tool_policy_digest},
+            tool_policy_digest=tool_policy_digest,
         )
 
     monkeypatch.setattr(structured_api, "_claim", spy_claim)
@@ -777,11 +781,11 @@ async def test_duplicate_tool_names_in_request_deduplicate_to_one_name(
         structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
     )
 
-    async def spy_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def spy_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         return False, SimpleNamespace(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
-            metadata_labels={"tool_policy_digest": tool_policy_digest},
+            tool_policy_digest=tool_policy_digest,
         )
 
     monkeypatch.setattr(structured_api, "_claim", spy_claim)
@@ -881,11 +885,11 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
         structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
     )
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         return True, SimpleNamespace(
             id=uuid.uuid4(), session_id=None, run_id=None, state="accepted",
             initiating_message_id=None,
-            metadata_labels={"tool_policy_digest": tool_policy_digest},
+            tool_policy_digest=tool_policy_digest,
         )
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
@@ -1013,10 +1017,10 @@ async def test_correlation_id_reused_with_different_allowed_tools_is_rejected_no
         run_id=RUN_ID,
         state="running",
         initiating_message_id=None,
-        metadata_labels={"tool_policy_digest": winner_digest},
+        tool_policy_digest=winner_digest,
     )
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         # Always reports the loser path against the pre-existing winning
         # claim, mirroring test_replay_after_completion's pattern.
         return False, existing_row
@@ -1080,10 +1084,10 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
         run_id=RUN_ID,
         state="running",
         initiating_message_id=None,
-        metadata_labels={"tool_policy_digest": matching_digest},
+        tool_policy_digest=matching_digest,
     )
 
-    async def fake_claim(*, tenant_id, stable_key, correlation_id, body, tool_policy_digest):
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         return False, existing_row
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim)
@@ -1141,3 +1145,47 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
 
     assert response.status_code == 200
     assert response.json()["customer_reply"] == "Yes — same policy, legitimate retry."
+
+
+@pytest.mark.asyncio
+async def test_fail_closed_when_claim_row_has_no_recorded_digest(monkeypatch, client):
+    """Defence-in-depth proof: even though tool_policy_digest is a NOT NULL
+    database column now, the endpoint's own comparison must still fail
+    CLOSED (reject) rather than silently join when a claim row somehow
+    surfaces without a comparable digest — never treat a missing/unexpected
+    value as "compatible"."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    # No tool_policy_digest attribute at all on this row.
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+    )
+
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    async def fake_poll_and_read(*a, **k):
+        raise AssertionError("must not poll/return a claim with no comparable digest")
+
+    monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/structured/message", json=GOLDEN_REQUEST, headers=_headers()
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "correlation_id_policy_mismatch"

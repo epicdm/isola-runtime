@@ -38,16 +38,26 @@ DESIGN
   authoritative. The request's own ``tenant_id`` field is compared against
   that derived value and a mismatch is rejected — it is never used as an
   authorization assertion on its own.
-* Durable correlation-keyed idempotency reuses the EXISTING
-  ``isola_bridge_requests`` table and its EXISTING
-  ``uq_isola_bridge_requests_tenant_stable`` unique constraint (added by
-  ``202607311800_add_isola_bridge_requests.py`` for the v2 async bridge). No
-  new column, index, table or migration is introduced. The structured
-  endpoint's ``correlation_id`` is namespaced into that table's
-  ``stable_request_id`` column as ``f"structured:{correlation_id}"`` — a
-  value distinct in shape from v2's own opaque, caller-supplied
-  ``stable_request_id`` strings, so the two bridges never collide inside one
-  shared row.
+* Durable correlation-keyed idempotency uses a DEDICATED table,
+  ``isola_structured_bridge_requests`` (added by
+  ``202608021900_add_structured_bridge_requests.py``, ratified by
+  ``dec-clawith-structured-claim-isolation-dedicated-table-2026-08-02``), with
+  its own ``uq_isola_structured_bridge_requests_tenant_correlation`` unique
+  constraint on ``(tenant_id, correlation_id)``. This endpoint no longer
+  shares any table, unique constraint or claim namespace with
+  ``isola_bridge_v2.py``: there is no ``stable_request_id``, no
+  ``idempotency_key`` and no ``"structured:"`` prefix anywhere in this file.
+  A v2 caller has no request field that can select this relation, so
+  cross-route preclaim and forged-digest join are unrepresentable by
+  construction rather than merely rejected — see
+  `defect-clawith-structured-bridge-v2-request-table-collision-2026-08-02`
+  and `evidence-clawith-cross-route-claim-isolation-design-audit-2026-08-02`
+  for the audited attacks this removes.
+* ``tool_policy_digest`` is a first-class, ``NOT NULL``, shape-``CHECK``ed
+  column on the claim row (not a key inside the general-purpose
+  ``metadata_labels`` JSONB, which a shared table's other caller could
+  forge). The digest comparison below is fail-closed defence in depth on
+  top of that database-enforced invariant, not the only line of defence.
 * Claim BEFORE enqueue, not after: unlike ``isola_bridge_v2.submit_request``
   (which checks-then-enqueues-then-inserts inside one transaction — a window
   where two concurrent identical submissions could each pass the check and
@@ -70,8 +80,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Header, Request
@@ -131,6 +142,14 @@ _MESSAGE_GRACE_S = 5.0
 _CLAIM_POPULATE_TIMEOUT_S = 8.0
 _CLAIM_POPULATE_INTERVAL_S = 0.5
 
+# How long a structured claim row is considered live before it is eligible
+# for some future cleanup mechanism. Recorded at claim time as
+# `accepted_at + this interval`. NO cleanup or deletion job exists in this
+# slice (matching the legacy table, which also has none) — expires_at is a
+# durable timestamp only; rows do not disappear on their own. Introducing
+# automatic expiry/deletion is a separate, explicitly out-of-scope decision.
+_STRUCTURED_RETENTION_H = int(os.environ.get("ISOLA_BRIDGE_STRUCTURED_RETENTION_HOURS", "24"))
+
 _SETTLED_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "waiting_user", "waiting_external", "waiting_agent"}
 )
@@ -174,11 +193,12 @@ class StructuredBridgeMessageIn(BaseModel):
     knowledge_scope_ids: list[str] = Field(default_factory=list)
     allowed_tools: list[ClawithToolDefinitionIn] = Field(default_factory=list)
     ownership_state: str
-    # The per-turn operation boundary. Namespaced into isola_bridge_requests
-    # .stable_request_id (existing column, existing unique constraint) as
-    # f"structured:{correlation_id}"; that column's CHECK constraint requires
-    # length >= 8, so correlation_id has no independent minimum here beyond
-    # non-empty, and the "structured:" prefix (11 chars) always satisfies it.
+    # The per-turn operation boundary. Stored directly in
+    # isola_structured_bridge_requests.correlation_id, the unique-constraint
+    # column (paired with tenant_id) on this route's own dedicated table —
+    # no prefix or namespacing needed. Bounds mirror the column's own
+    # ck_isola_structured_bridge_requests_correlation_len CHECK
+    # (1..180 chars).
     correlation_id: str = Field(min_length=1, max_length=180)
     locale: str = Field(min_length=1)
     timezone: str = Field(min_length=1)
@@ -244,35 +264,34 @@ def _sanitized_validation_body(exc: ValidationError) -> dict:
 
 
 # ── Durable correlation-keyed idempotency ───────────────────────────────────
-# Reuses isola_bridge_requests (202607311800_add_isola_bridge_requests.py)
-# and its existing uq_isola_bridge_requests_tenant_stable unique constraint.
-# NO migration, column, index or table is added by this file.
+# Dedicated table (202608021900_add_structured_bridge_requests.py), owned
+# exclusively by this route. isola_bridge_v2.py cannot name this relation —
+# there is no shared model, service or SQL between the two bridges.
 
 _CLAIM_SQL = text(
     """
-    INSERT INTO isola_bridge_requests (
-        id, tenant_id, stable_request_id, correlation_id, external_conversation_id,
-        contact_ref, agent_id, state, accepted_at, idempotency_key, metadata_labels
+    INSERT INTO isola_structured_bridge_requests (
+        id, tenant_id, correlation_id, agent_id, tool_policy_digest, schema_version,
+        state, accepted_at, expires_at, external_conversation_id, contact_ref
     ) VALUES (
-        :id, :tenant_id, :stable_request_id, :correlation_id, :external_conversation_id,
-        :contact_ref, :agent_id, :state, :accepted_at, :idempotency_key,
-        CAST(:metadata_labels AS JSONB)
+        :id, :tenant_id, :correlation_id, :agent_id, :tool_policy_digest, :schema_version,
+        :state, :accepted_at, :expires_at, :external_conversation_id, :contact_ref
     )
-    ON CONFLICT (tenant_id, stable_request_id) DO NOTHING
+    ON CONFLICT (tenant_id, correlation_id) DO NOTHING
     RETURNING id
     """
 )
 
-_SELECT_BY_STABLE_SQL = text(
-    "SELECT * FROM isola_bridge_requests WHERE tenant_id = :tenant_id "
-    "AND stable_request_id = :stable_request_id"
+_SELECT_BY_CORRELATION_SQL = text(
+    "SELECT * FROM isola_structured_bridge_requests WHERE tenant_id = :tenant_id "
+    "AND correlation_id = :correlation_id"
 )
 
-_SELECT_BY_ID_SQL = text("SELECT * FROM isola_bridge_requests WHERE id = :id")
+_SELECT_BY_ID_SQL = text("SELECT * FROM isola_structured_bridge_requests WHERE id = :id")
 
 _UPDATE_ENQUEUED_SQL = text(
     """
-    UPDATE isola_bridge_requests
+    UPDATE isola_structured_bridge_requests
        SET session_id = :session_id,
            run_id = :run_id,
            initiating_message_id = :initiating_message_id,
@@ -284,7 +303,7 @@ _UPDATE_ENQUEUED_SQL = text(
 
 _UPDATE_TERMINAL_SQL = text(
     """
-    UPDATE isola_bridge_requests
+    UPDATE isola_structured_bridge_requests
        SET state = :state,
            terminal_message_id = COALESCE(CAST(:terminal_message_id AS UUID), terminal_message_id),
            completed_at = COALESCE(:completed_at, completed_at),
@@ -293,10 +312,6 @@ _UPDATE_TERMINAL_SQL = text(
      WHERE id = :id
     """
 )
-
-
-def _stable_key(correlation_id: str) -> str:
-    return f"structured:{correlation_id}"
 
 
 def _now() -> datetime:
@@ -370,8 +385,8 @@ async def _resolve_effective_tool_names(
 
 def _tool_policy_digest(effective_tool_names: list[str]) -> str:
     """A short, order-independent fingerprint of one turn's effective tool
-    set, stored alongside the idempotency claim (in the existing
-    `metadata_labels` JSONB column — no migration). Lets a request that
+    set, stored on the idempotency claim row's first-class, NOT NULL,
+    shape-CHECKed `tool_policy_digest` column. Lets a request that
     loses the claim detect whether it is a genuine retry of the SAME
     turn-defining policy, or a `correlation_id` reused with a DIFFERENT
     `allowed_tools` — which must never silently inherit another policy's
@@ -390,15 +405,18 @@ def _tool_policy_digest(effective_tool_names: list[str]) -> str:
 async def _claim(
     *,
     tenant_id,
-    stable_key: str,
     correlation_id: str,
     body: StructuredBridgeMessageIn,
     tool_policy_digest: str,
 ):
-    """Atomic claim attempt against isola_bridge_requests. Returns
-    (won: bool, row: _Row)."""
+    """Atomic claim attempt against the dedicated
+    isola_structured_bridge_requests table, arbitrated entirely by its own
+    `uq_isola_structured_bridge_requests_tenant_correlation` unique
+    constraint on (tenant_id, correlation_id) — no other table, route or
+    caller can contend for this key. Returns (won: bool, row: _Row)."""
     claim_id = uuid.uuid4()
     accepted_at = _now()
+    expires_at = accepted_at + timedelta(hours=_STRUCTURED_RETENTION_H)
     async with async_session() as db:
         async with db.begin():
             inserted = (
@@ -407,23 +425,22 @@ async def _claim(
                     {
                         "id": str(claim_id),
                         "tenant_id": str(tenant_id),
-                        "stable_request_id": stable_key,
                         "correlation_id": correlation_id,
-                        "external_conversation_id": body.conversation_id,
-                        "contact_ref": body.contact_ref,
                         "agent_id": str(body.designated_agent_id),
+                        "tool_policy_digest": tool_policy_digest,
+                        "schema_version": body.schema_version,
                         "state": "accepted",
                         "accepted_at": accepted_at,
-                        "idempotency_key": f"{tenant_id}:{stable_key}",
-                        "metadata_labels": json.dumps(
-                            {"tool_policy_digest": tool_policy_digest}
-                        ),
+                        "expires_at": expires_at,
+                        "external_conversation_id": body.conversation_id,
+                        "contact_ref": body.contact_ref,
                     },
                 )
             ).first()
         row = (
             await db.execute(
-                _SELECT_BY_STABLE_SQL, {"tenant_id": str(tenant_id), "stable_request_id": stable_key}
+                _SELECT_BY_CORRELATION_SQL,
+                {"tenant_id": str(tenant_id), "correlation_id": correlation_id},
             )
         ).mappings().first()
     won = inserted is not None
@@ -605,7 +622,6 @@ async def bridge_structured_message(
 
     agent_id = body.designated_agent_id
     correlation_id = body.correlation_id
-    stable_key = _stable_key(correlation_id)
     accepted_at = _now()
 
     tenant_id, err = await _resolve_tenant(body)
@@ -619,8 +635,8 @@ async def bridge_structured_message(
     if unsupported_tool_names:
         # Reject BEFORE the idempotency claim: an unsupported tool name is a
         # request-shape defect, not a Run outcome, so it must create no
-        # durable isola_bridge_requests row, no reasoning Run, and no
-        # tool execution — see
+        # durable isola_structured_bridge_requests row, no reasoning Run,
+        # and no tool execution — see
         # dec-clawith-structured-per-turn-tool-governance-2026-08-02.
         return JSONResponse(
             status_code=400,
@@ -634,7 +650,6 @@ async def bridge_structured_message(
 
     won, claim_row = await _claim(
         tenant_id=tenant_id,
-        stable_key=stable_key,
         correlation_id=correlation_id,
         body=body,
         tool_policy_digest=tool_policy_digest,
@@ -642,26 +657,23 @@ async def bridge_structured_message(
     if claim_row is None:  # pragma: no cover - defensive; claim always leaves a row
         return JSONResponse(status_code=500, content={"error": "claim_failed"})
 
-    # Fail-closed claim-row policy check: a missing/malformed digest (e.g.
-    # the pre-fix `{}` default) is treated as a MISMATCH, never as
-    # "compatible" — the winner's own just-inserted row always carries the
-    # digest it just wrote, so this is a no-op on the winning path and only
-    # ever rejects on the losing path.
+    # Fail-closed claim-row policy check, kept as defence in depth on top of
+    # the database invariant: tool_policy_digest is a first-class NOT NULL,
+    # shape-CHECKed column on isola_structured_bridge_requests (never a key
+    # inside caller-reachable metadata), so every row this SELECT can return
+    # already carries a valid digest. A missing/unexpected value is still
+    # treated as a MISMATCH, never as "compatible" — the winner's own
+    # just-inserted row always carries the digest it just wrote, so this is
+    # a no-op on the winning path and only ever rejects on the losing path.
     #
-    # KNOWN RESIDUAL GAP (explicitly out of scope for this change, not
-    # silently accepted): isola_bridge_requests is a table SHARED with
-    # isola_bridge_v2, whose `stable_request_id` and `metadata_labels` are
-    # caller-supplied, not server-derived (see `BridgeRequestIn` in
-    # isola_bridge_v2.py). A caller with v2 access could in principle
-    # pre-claim `stable_request_id=f"structured:{correlation_id}"` with a
-    # forged `tool_policy_digest`. Closing that fully needs either a
-    # migration (a `bridge_origin` column distinguishing which endpoint
-    # created a row) or a v2 schema change to stop accepting caller-
-    # supplied `metadata_labels` — both out of bounds for this change (no
-    # migration; the three legacy routes, including v2, must stay
-    # byte-identical). Tracked for follow-up rather than addressed here.
-    stored_labels = claim_row.metadata_labels if hasattr(claim_row, "metadata_labels") else None
-    stored_digest = stored_labels.get("tool_policy_digest") if isinstance(stored_labels, dict) else None
+    # This table is dedicated to this route (ratified by
+    # dec-clawith-structured-claim-isolation-dedicated-table-2026-08-02,
+    # implementing dec-clawith-structured-v2-claim-isolation-gate-2026-08-02
+    # and closing defect-clawith-structured-bridge-v2-request-table-collision
+    # -2026-08-02): isola_bridge_v2.py cannot write, read or contend for a
+    # row here — there is no shared table, unique constraint or claim
+    # namespace between the two bridges.
+    stored_digest = getattr(claim_row, "tool_policy_digest", None)
     if stored_digest != tool_policy_digest:
         # This correlation_id is already claimed under a DIFFERENT (or
         # unrecorded) allowed_tools policy than this request just resolved.

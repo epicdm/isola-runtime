@@ -1,0 +1,3 @@
+/api/isola/bridge/message
+/api/isola/bridge/v2/requests
+/api/isola/bridge/v2/requests/{bridge_request_id}
