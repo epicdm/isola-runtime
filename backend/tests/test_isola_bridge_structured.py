@@ -305,18 +305,24 @@ async def test_golden_request_produces_a_foundation_parseable_response(monkeypat
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim_pre_enqueued)
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
         assert tenant_id == TENANT_ID
         assert run_id == RUN_ID
         assert session_id == SESSION_ID
-        return True, "completed", "Yes — EPIC installs fibre in Roseau."
+        assert agent_id == AGENT_ID
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes — EPIC installs fibre in Roseau.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes — EPIC installs fibre in Roseau.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -427,15 +433,20 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
 
     monkeypatch.setattr(structured_api, "_wait_for_claim_population", fake_wait_for_claim_population)
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "Yes — EPIC installs fibre in Roseau."
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes — EPIC installs fibre in Roseau.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes — EPIC installs fibre in Roseau.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -445,10 +456,6 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
             return None
 
         async def get(self, *a, **k):
-            # Both requests take the wait/read path (fake_claim always
-            # reports "lost"); the endpoint's `db.get(ChatMessage, ...)`
-            # timestamp lookup falls back to `accepted_at` when this
-            # returns None, which is fine — that timestamp isn't asserted.
             return None
 
     class _NoopSessionFactory:
@@ -488,6 +495,7 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
         _fake_resolve_effective_tool_names_permit_all,
     )
 
+    terminal_message_id = uuid.uuid4()
     completed_row = store.claim(
         TENANT_ID,
         GOLDEN_REQUEST["correlation_id"],
@@ -496,7 +504,7 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
     completed_row.session_id = SESSION_ID
     completed_row.run_id = RUN_ID
     completed_row.state = "completed"
-    completed_row.terminal_message_id = uuid.uuid4()
+    completed_row.terminal_message_id = terminal_message_id
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         return False, completed_row  # always a replay of the already-completed row
@@ -516,24 +524,38 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
 
-    class _FakeMessage:
-        content = "Yes — EPIC installs fibre in Roseau."
+    # Replay re-derives through read_run_owned_reply and requires it to
+    # agree with the id the claim row already recorded -- never a bare
+    # ChatMessage fetch by the stored id.
+    async def fake_read_run_owned_reply(db, *, tenant_id, run_id, session_id, agent_id, user_id):
+        assert tenant_id == TENANT_ID
+        assert run_id == RUN_ID
+        assert session_id == SESSION_ID
+        assert agent_id == AGENT_ID
+        return structured_api.RunOwnedReply(
+            message_id=terminal_message_id,
+            content="Yes — EPIC installs fibre in Roseau.",
+            delivery_kind="terminal",
+            lifecycle_status="completed",
+        )
 
-    class _FakeSession:
-        async def get(self, model, pk):
-            return _FakeMessage()
+    monkeypatch.setattr(structured_api, "read_run_owned_reply", fake_read_run_owned_reply)
 
-    class _FakeSessionFactory:
+    class _NoopSession:
+        async def get(self, *a, **k):
+            return None
+
+    class _NoopSessionFactory:
         def __call__(self):
             return self
 
         async def __aenter__(self):
-            return _FakeSession()
+            return _NoopSession()
 
         async def __aexit__(self, *a):
             return False
 
-    monkeypatch.setattr(structured_api, "async_session", _FakeSessionFactory())
+    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
 
     async with await client() as ac:
         response = await ac.post(
@@ -720,15 +742,20 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "ok"
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="ok",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="ok")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -972,15 +999,20 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
         structured_api, "enqueue_chat_runtime", fake_enqueue_chat_runtime
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "Yes."
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     async with await client() as ac:
         response = await ac.post(
@@ -1037,7 +1069,7 @@ async def test_correlation_id_reused_with_different_allowed_tools_is_rejected_no
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
         raise AssertionError(
             "must not poll/return a mismatched-policy claim's result"
         )
@@ -1099,15 +1131,20 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "Yes — same policy, legitimate retry."
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes — same policy, legitimate retry.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes — same policy, legitimate retry.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):

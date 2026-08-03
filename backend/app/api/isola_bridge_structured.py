@@ -94,12 +94,16 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.api.isola_bridge import _authorize, _stable_user_id
 from app.database import async_session
 from app.models.agent import Agent, AgentUserOnboarding
-from app.models.audit import ChatMessage
 from app.models.llm import LLMModel
 from app.models.user import User
 from app.services.agent_runtime.chat_intake import (
     ChatRuntimeIntakeError,
     enqueue_chat_runtime,
+)
+from app.services.agent_runtime.run_owned_reply import (
+    RunOwnedReply,
+    RunOwnedReplyError,
+    read_run_owned_reply,
 )
 from app.services.agent_runtime.run_state_reader import (
     RunStateReadError,
@@ -466,23 +470,12 @@ async def _wait_for_claim_population(row_id):
         await asyncio.sleep(_CLAIM_POPULATE_INTERVAL_S)
 
 
-async def _read_last_assistant(db, session_id: uuid.UUID, after: datetime) -> ChatMessage | None:
-    result = await db.execute(
-        select(ChatMessage)
-        .where(
-            ChatMessage.conversation_id == str(session_id),
-            ChatMessage.role == "assistant",
-            ChatMessage.created_at >= after,
-        )
-        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(1)
-    )
-    return result.scalar_one_or_none()
-
-
-async def _poll_and_read(tenant_id, run_id, session_id, initiating_at: datetime):
+async def _poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
     """Same settle-then-read shape as isola_bridge.bridge_message. Returns
-    (settled: bool, final_status: str | None, reply: str | None)."""
+    (settled: bool, final_status: str | None, reply: RunOwnedReply | None,
+    error_class: str | None). ``error_class`` is set only when a delivery
+    receipt existed but failed run-ownership validation -- fail closed, never
+    fall back to scanning the session for a different assistant message."""
     loop = asyncio.get_event_loop()
     deadline = loop.time() + _POLL_TIMEOUT_S
     final_status: str | None = None
@@ -505,21 +498,30 @@ async def _poll_and_read(tenant_id, run_id, session_id, initiating_at: datetime)
                 await asyncio.sleep(_POLL_INTERVAL_S)
 
             if not settled:
-                return False, final_status, None
+                return False, final_status, None, None
 
-            reply: str | None = None
+            reply: RunOwnedReply | None = None
+            error_class: str | None = None
             grace_deadline = loop.time() + _MESSAGE_GRACE_S
             while True:
                 poll_db.expire_all()
-                message = await _read_last_assistant(poll_db, session_id, initiating_at)
-                if message is not None:
-                    content = (message.content or "").strip()
-                    reply = content or None
+                try:
+                    reply = await read_run_owned_reply(
+                        poll_db,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                    )
+                except RunOwnedReplyError:
+                    error_class = "run_owned_reply_scope_mismatch"
+                    break
                 if reply is not None or loop.time() >= grace_deadline:
                     break
                 await asyncio.sleep(_POLL_INTERVAL_S)
 
-    return True, final_status, reply
+    return True, final_status, reply, error_class
 
 
 def _envelope(
@@ -773,8 +775,6 @@ async def bridge_structured_message(
 
                     run_id = intake.handle.run_id
                     session_id = session.id
-                    user_msg = await db.get(ChatMessage, intake.message_id)
-                    initiating_at = user_msg.created_at if user_msg is not None else accepted_at
 
                     await db.execute(
                         _UPDATE_ENQUEUED_SQL,
@@ -794,9 +794,43 @@ async def bridge_structured_message(
         # second run. Wait for the winner (or a prior completion) instead.
         populated = await _wait_for_claim_population(claim_row.id)
         if populated.state == "completed" and populated.terminal_message_id is not None:
+            # Replay of an already-completed claim: re-derive the reply
+            # through the SAME run-owned receipt lookup used on the winner
+            # path (never a bare ChatMessage fetch by the stored id), and
+            # require it to agree with the id this claim already recorded.
+            # Disagreement is a fail-safe signal, not a "use what we have"
+            # fallback -- see RunOwnedReplyError's fail-closed contract.
+            replay_user_id = _stable_user_id(tenant_id, body.contact_ref.strip())
+            replay_reply: RunOwnedReply | None = None
             async with async_session() as db:
-                message = await db.get(ChatMessage, uuid.UUID(str(populated.terminal_message_id)))
-            content = (message.content or "").strip() if message is not None else ""
+                try:
+                    replay_reply = await read_run_owned_reply(
+                        db,
+                        tenant_id=tenant_id,
+                        run_id=uuid.UUID(str(populated.run_id)),
+                        session_id=uuid.UUID(str(populated.session_id)),
+                        agent_id=agent_id,
+                        user_id=replay_user_id,
+                    )
+                except RunOwnedReplyError:
+                    replay_reply = None
+            if replay_reply is None or str(replay_reply.message_id) != str(
+                populated.terminal_message_id
+            ):
+                return JSONResponse(
+                    status_code=200,
+                    content=_envelope(
+                        agent_id=agent_id,
+                        session_id=populated.session_id,
+                        correlation_id=correlation_id,
+                        tenant_id=tenant_id,
+                        customer_reply=None,
+                        confidence=0.0,
+                        escalation_requested=True,
+                        escalation_reason_code="tool_failure",
+                        escalation_explanation="stored replay result failed run-owned re-validation",
+                    ),
+                )
             return JSONResponse(
                 status_code=200,
                 content=_envelope(
@@ -804,8 +838,8 @@ async def bridge_structured_message(
                     session_id=populated.session_id,
                     correlation_id=correlation_id,
                     tenant_id=tenant_id,
-                    customer_reply=content or None,
-                    confidence=1.0 if content else 0.0,
+                    customer_reply=replay_reply.content,
+                    confidence=1.0,
                 ),
             )
         if populated.state in ("failed", "rejected", "cancelled", "expired"):
@@ -832,14 +866,11 @@ async def bridge_structured_message(
             )
         run_id = uuid.UUID(str(populated.run_id))
         session_id = uuid.UUID(str(populated.session_id))
-        if populated.initiating_message_id is not None:
-            async with async_session() as db:
-                msg = await db.get(ChatMessage, uuid.UUID(str(populated.initiating_message_id)))
-            initiating_at = msg.created_at if msg is not None else accepted_at
-        else:
-            initiating_at = accepted_at
+        user_id = _stable_user_id(tenant_id, body.contact_ref.strip())
 
-    settled, final_status, reply = await _poll_and_read(tenant_id, run_id, session_id, initiating_at)
+    settled, final_status, reply, poll_error_class = await _poll_and_read(
+        tenant_id, run_id, session_id, agent_id, user_id
+    )
 
     if not settled:
         # Row stays 'running'. A retry with the same correlation_id lands in
@@ -858,15 +889,15 @@ async def bridge_structured_message(
     latency_ms = int((_now() - accepted_at).total_seconds() * 1000)
 
     if reply is not None:
+        # terminal_message_id is read from the SAME run-owned reply object
+        # whose text is returned below -- never a second, independent query.
         async with async_session() as db:
-            message = await _read_last_assistant(db, session_id, initiating_at)
-            terminal_message_id = str(message.id) if message is not None else None
             await db.execute(
                 _UPDATE_TERMINAL_SQL,
                 {
                     "id": str(claim_row.id),
                     "state": "completed",
-                    "terminal_message_id": terminal_message_id,
+                    "terminal_message_id": str(reply.message_id),
                     "completed_at": _now(),
                     "error_class": None,
                     "now": _now(),
@@ -880,15 +911,22 @@ async def bridge_structured_message(
                 session_id=session_id,
                 correlation_id=correlation_id,
                 tenant_id=tenant_id,
-                customer_reply=reply,
+                customer_reply=reply.content,
                 confidence=1.0,
                 latency_ms=latency_ms,
             ),
         )
 
-    # Settled but no assistant reply was produced (e.g. the run failed or
-    # cancelled). Return an escalation rather than a bare error so Foundation
-    # gets a contract-valid, actionable outcome.
+    # Settled but no assistant reply was produced -- either the run ended
+    # with nothing to deliver (failed/cancelled), or a delivery receipt
+    # existed but failed run-ownership validation (poll_error_class set).
+    # Either way this is an escalation, never another turn's text.
+    error_class = poll_error_class or f"run_{final_status}_no_reply"
+    escalation_explanation = (
+        "run-owned delivery receipt failed ownership/identity validation"
+        if poll_error_class is not None
+        else f"agent run ended in status {final_status!r} with no reply"
+    )
     async with async_session() as db:
         await db.execute(
             _UPDATE_TERMINAL_SQL,
@@ -897,7 +935,7 @@ async def bridge_structured_message(
                 "state": "failed",
                 "terminal_message_id": None,
                 "completed_at": _now(),
-                "error_class": f"run_{final_status}_no_reply",
+                "error_class": error_class,
                 "now": _now(),
             },
         )
@@ -913,7 +951,7 @@ async def bridge_structured_message(
             confidence=0.0,
             escalation_requested=True,
             escalation_reason_code="tool_failure",
-            escalation_explanation=f"agent run ended in status {final_status!r} with no reply",
+            escalation_explanation=escalation_explanation,
             latency_ms=latency_ms,
         ),
     )
