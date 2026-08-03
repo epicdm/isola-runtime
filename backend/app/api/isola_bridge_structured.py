@@ -800,7 +800,14 @@ async def bridge_structured_message(
             # require it to agree with the id this claim already recorded.
             # Disagreement is a fail-safe signal, not a "use what we have"
             # fallback -- see RunOwnedReplyError's fail-closed contract.
-            replay_user_id = _stable_user_id(tenant_id, body.contact_ref.strip())
+            #
+            # Derived from the CLAIMED row's own contact_ref, never this
+            # request's body.contact_ref: a duplicate/retried request
+            # carrying a different (stale or mistaken) contact_ref must not
+            # be able to fail run-ownership validation against the winner's
+            # real run and then mark the SHARED claim row failed --
+            # poisoning it for the original, legitimate caller.
+            replay_user_id = _stable_user_id(tenant_id, populated.contact_ref.strip())
             replay_reply: RunOwnedReply | None = None
             async with async_session() as db:
                 try:
@@ -866,7 +873,13 @@ async def bridge_structured_message(
             )
         run_id = uuid.UUID(str(populated.run_id))
         session_id = uuid.UUID(str(populated.session_id))
-        user_id = _stable_user_id(tenant_id, body.contact_ref.strip())
+        # Derived from the CLAIMED row's own contact_ref, not this request's
+        # body.contact_ref -- see the replay branch above for why: a
+        # duplicate request with a mismatched contact_ref must not be able
+        # to fail run-ownership validation against the winner's real run
+        # and mark the shared claim failed, poisoning it for the original
+        # caller.
+        user_id = _stable_user_id(tenant_id, populated.contact_ref.strip())
 
     settled, final_status, reply, poll_error_class = await _poll_and_read(
         tenant_id, run_id, session_id, agent_id, user_id
