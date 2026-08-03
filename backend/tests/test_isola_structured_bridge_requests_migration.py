@@ -18,6 +18,7 @@ database.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -512,6 +513,50 @@ async def test_downgrade_with_a_populated_table_fails_closed_and_preserves_the_r
         assert current == REVISION, "a failed downgrade must not move the recorded alembic head"
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_downgrade_guard_locks_before_counting_closing_the_insert_race():
+    """Regression test for a BLOCKING finding from adversarial review: the
+    original guard counted rows and then, if zero, proceeded straight to
+    dropping the table — a check-then-act race where a row inserted between
+    the count and the drop would be silently destroyed despite an
+    apparently-empty count. The fix takes an ACCESS EXCLUSIVE lock on the
+    table BEFORE counting. This test proves the lock is real and blocking:
+    while an external transaction holds the SAME lock uncommitted, a
+    concurrent `alembic downgrade` attempt must not even complete its count
+    — it must sit blocked waiting for the lock — until that transaction
+    releases it."""
+    holder = await asyncpg.connect(_asyncpg_dsn())
+    try:
+        tx = holder.transaction()
+        await tx.start()
+        await holder.execute(f"LOCK TABLE {TABLE} IN ACCESS EXCLUSIVE MODE")
+
+        loop = asyncio.get_event_loop()
+        downgrade_future = loop.run_in_executor(
+            None, _run_alembic, "downgrade", DOWN_REVISION
+        )
+
+        # The downgrade attempt must still be blocked waiting for the lock
+        # this connection holds — it cannot have completed (successfully
+        # or otherwise) while the lock is held.
+        await asyncio.sleep(1.5)
+        assert not downgrade_future.done(), (
+            "downgrade completed while the table was still externally "
+            "locked — the guard's LOCK statement is not actually "
+            "serializing against concurrent access"
+        )
+
+        await tx.rollback()
+    finally:
+        await holder.close()
+
+    result = await downgrade_future
+    assert result.returncode == 0, result.stderr
+
+    result = _run_alembic("upgrade", "head")
+    assert result.returncode == 0, result.stderr
 
 
 # ── A8: old code operates safely with the new table present and populated ──

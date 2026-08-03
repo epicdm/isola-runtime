@@ -80,6 +80,13 @@ applied and before any structured traffic exists). Once structured claims
 exist, the recommended production rollback is IMAGE-ONLY: restore the prior
 container image. The previous code never names this relation, so the table
 sits inert with zero data loss and nothing to reconcile on re-apply.
+
+The guard takes an ``ACCESS EXCLUSIVE`` lock on the table BEFORE counting
+its rows, not after. Counting first and locking second would leave a window
+where a row inserted between the count and the removal statements is
+silently destroyed despite an apparently-empty count — a check-then-act
+race, not a real guard. Locking first makes the count-then-decide sequence
+atomic with respect to any concurrent structured-route claim.
 """
 
 from __future__ import annotations
@@ -168,6 +175,20 @@ def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     if _TABLE in inspector.get_table_names():
+        # LOCK first, THEN count: without this, a row inserted between the
+        # count and the table removal further down (both live-traffic
+        # reality, since the structured route claims rows continuously)
+        # would be silently destroyed despite an empty count moments
+        # earlier — a check-then-act race, not a genuine guard.
+        # ACCESS EXCLUSIVE is the same lock level the table-removal
+        # statement itself takes, so acquiring it here blocks every
+        # concurrent INSERT/UPDATE/SELECT against this table from
+        # proceeding until this transaction commits or rolls back;
+        # nothing can slip a new row in between the count and the removal.
+        # Migrations already run inside one transaction per revision
+        # (`Will assume transactional DDL`), so this lock releases
+        # automatically when upgrade/downgrade finishes either way.
+        bind.execute(sa.text(f"LOCK TABLE {_TABLE} IN ACCESS EXCLUSIVE MODE"))
         row_count = bind.execute(sa.text(f"SELECT count(*) FROM {_TABLE}")).scalar_one()
         if row_count > 0:
             raise RuntimeError(

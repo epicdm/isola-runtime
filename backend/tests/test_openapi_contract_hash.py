@@ -160,6 +160,39 @@ def test_transitive_referenced_component_change_changes_subset_hash():
     )
 
 
+def test_ref_target_unescapes_json_pointer_tokens():
+    """RFC 6901: `~1` decodes to `/`, `~0` decodes to `~`. A component
+    literally named "a/b" is referenced as `#/components/schemas/a~1b`;
+    failing to unescape would look up the wrong (nonexistent) key and
+    silently drop the component from the closure."""
+    assert tool._ref_target("#/components/schemas/a~1b") == ("schemas", "a/b")
+    assert tool._ref_target("#/components/schemas/a~0b") == ("schemas", "a~b")
+    assert tool._ref_target("#/components/schemas/a~1~0b") == ("schemas", "a/~b")
+    assert tool._ref_target("#/components/schemas/Widget") == ("schemas", "Widget")
+
+
+def test_closure_resolves_a_component_name_containing_an_escaped_slash():
+    components = {"schemas": {"a/b": {"type": "string"}}}
+    paths = {
+        "/x": {
+            "get": {
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/a~1b"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    doc = _doc(paths, components)
+    subset = tool.build_subset(doc, ["/x"])
+    assert subset["components"]["schemas"] == {"a/b": {"type": "string"}}
+
+
 def test_closure_reaches_a_fixed_point_across_multiple_hops():
     components = {
         "schemas": {

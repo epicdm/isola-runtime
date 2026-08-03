@@ -94,12 +94,25 @@ def _load_paths_file(path: Path) -> list[str]:
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
 
 
+def _unescape_json_pointer_token(token: str) -> str:
+    """RFC 6901 JSON Pointer unescaping: ``~1`` -> ``/``, ``~0`` -> ``~``,
+    in that order (escaping ~ first would corrupt a literal ~1/~0
+    sequence). A component name containing a literal ``/`` or ``~`` (rare
+    but valid in an OpenAPI document) is encoded this way inside a
+    ``$ref`` string; looking it up in ``components.<container>`` without
+    unescaping would silently miss it, treating the closure as complete
+    when a real component was never resolved."""
+    return token.replace("~1", "/").replace("~0", "~")
+
+
 def _ref_target(ref: str) -> tuple[str, str] | None:
     """Parse a local ``#/components/<container>/<name>`` ref into
-    (container, name). Returns None for anything else — external refs and
-    non-component local refs are not expected in this repository's schema
-    and are simply not resolved further (not an error: hashing a document
-    that happens to contain one should not crash)."""
+    (container, name), with ``name`` JSON-Pointer-unescaped so it matches
+    the literal key in ``components.<container>``. Returns None for
+    anything else — external refs and non-component local refs are not
+    expected in this repository's schema and are simply not resolved
+    further (not an error: hashing a document that happens to contain one
+    should not crash)."""
     prefix = "#/components/"
     if not ref.startswith(prefix):
         return None
@@ -110,7 +123,7 @@ def _ref_target(ref: str) -> tuple[str, str] | None:
     container, name = parts
     if container not in _COMPONENT_CONTAINERS:
         return None
-    return container, name
+    return container, _unescape_json_pointer_token(name)
 
 
 def _iter_refs(node: Any):
