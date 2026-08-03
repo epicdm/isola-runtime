@@ -217,7 +217,7 @@ class _FakeClaimStore:
     def __init__(self):
         self.rows: dict[str, SimpleNamespace] = {}
 
-    def claim(self, tenant_id, correlation_id, tool_policy_digest=None):
+    def claim(self, tenant_id, correlation_id, tool_policy_digest=None, contact_ref=None, agent_id=None):
         db_key = f"{tenant_id}:{correlation_id}"
         if db_key in self.rows:
             return False, self.rows[db_key]
@@ -232,6 +232,8 @@ class _FakeClaimStore:
             terminal_message_id=None,
             error_class=None,
             tool_policy_digest=tool_policy_digest,
+            contact_ref=contact_ref or GOLDEN_REQUEST["contact_ref"],
+            agent_id=agent_id or AGENT_ID,
         )
         self.rows[db_key] = row
         return True, row
@@ -305,18 +307,24 @@ async def test_golden_request_produces_a_foundation_parseable_response(monkeypat
 
     monkeypatch.setattr(structured_api, "_claim", fake_claim_pre_enqueued)
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
         assert tenant_id == TENANT_ID
         assert run_id == RUN_ID
         assert session_id == SESSION_ID
-        return True, "completed", "Yes — EPIC installs fibre in Roseau."
+        assert agent_id == AGENT_ID
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes — EPIC installs fibre in Roseau.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes — EPIC installs fibre in Roseau.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -427,15 +435,20 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
 
     monkeypatch.setattr(structured_api, "_wait_for_claim_population", fake_wait_for_claim_population)
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "Yes — EPIC installs fibre in Roseau."
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes — EPIC installs fibre in Roseau.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes — EPIC installs fibre in Roseau.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -445,10 +458,9 @@ async def test_duplicate_correlation_id_does_not_enqueue_second_run(monkeypatch,
             return None
 
         async def get(self, *a, **k):
-            # Both requests take the wait/read path (fake_claim always
-            # reports "lost"); the endpoint's `db.get(ChatMessage, ...)`
-            # timestamp lookup falls back to `accepted_at` when this
-            # returns None, which is fine — that timestamp isn't asserted.
+            return None
+
+        def expire_all(self):
             return None
 
     class _NoopSessionFactory:
@@ -488,6 +500,7 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
         _fake_resolve_effective_tool_names_permit_all,
     )
 
+    terminal_message_id = uuid.uuid4()
     completed_row = store.claim(
         TENANT_ID,
         GOLDEN_REQUEST["correlation_id"],
@@ -496,7 +509,7 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
     completed_row.session_id = SESSION_ID
     completed_row.run_id = RUN_ID
     completed_row.state = "completed"
-    completed_row.terminal_message_id = uuid.uuid4()
+    completed_row.terminal_message_id = terminal_message_id
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
         return False, completed_row  # always a replay of the already-completed row
@@ -516,24 +529,38 @@ async def test_replay_after_completion_returns_stored_result_without_polling(mon
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
 
-    class _FakeMessage:
-        content = "Yes — EPIC installs fibre in Roseau."
+    # Replay re-derives through read_run_owned_reply and requires it to
+    # agree with the id the claim row already recorded -- never a bare
+    # ChatMessage fetch by the stored id.
+    async def fake_read_run_owned_reply(db, *, tenant_id, run_id, session_id, agent_id, user_id):
+        assert tenant_id == TENANT_ID
+        assert run_id == RUN_ID
+        assert session_id == SESSION_ID
+        assert agent_id == AGENT_ID
+        return structured_api.RunOwnedReply(
+            message_id=terminal_message_id,
+            content="Yes — EPIC installs fibre in Roseau.",
+            delivery_kind="terminal",
+            lifecycle_status="completed",
+        )
 
-    class _FakeSession:
-        async def get(self, model, pk):
-            return _FakeMessage()
+    monkeypatch.setattr(structured_api, "read_run_owned_reply", fake_read_run_owned_reply)
 
-    class _FakeSessionFactory:
+    class _NoopSession:
+        async def get(self, *a, **k):
+            return None
+
+    class _NoopSessionFactory:
         def __call__(self):
             return self
 
         async def __aenter__(self):
-            return _FakeSession()
+            return _NoopSession()
 
         async def __aexit__(self, *a):
             return False
 
-    monkeypatch.setattr(structured_api, "async_session", _FakeSessionFactory())
+    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
 
     async with await client() as ac:
         response = await ac.post(
@@ -714,21 +741,28 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
             run_id=RUN_ID,
             state="running",
             initiating_message_id=None,
+            contact_ref=GOLDEN_REQUEST["contact_ref"],
+            agent_id=AGENT_ID,
         )
 
     monkeypatch.setattr(
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "ok"
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="ok",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="ok")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -738,6 +772,9 @@ async def test_empty_allowed_tools_request_proceeds_past_governance_check(
             return None
 
         async def get(self, *a, **k):
+            return None
+
+        def expire_all(self):
             return None
 
     class _NoopSessionFactory:
@@ -972,15 +1009,20 @@ async def test_effective_tool_names_reach_enqueue_chat_runtime_on_the_won_path(
         structured_api, "enqueue_chat_runtime", fake_enqueue_chat_runtime
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "Yes."
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     async with await client() as ac:
         response = await ac.post(
@@ -1037,7 +1079,7 @@ async def test_correlation_id_reused_with_different_allowed_tools_is_rejected_no
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
         raise AssertionError(
             "must not poll/return a mismatched-policy claim's result"
         )
@@ -1085,6 +1127,8 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
         state="running",
         initiating_message_id=None,
         tool_policy_digest=matching_digest,
+        contact_ref=GOLDEN_REQUEST["contact_ref"],
+        agent_id=AGENT_ID,
     )
 
     async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
@@ -1099,15 +1143,20 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
         structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
     )
 
-    async def fake_poll_and_read(tenant_id, run_id, session_id, initiating_at):
-        return True, "completed", "Yes — same policy, legitimate retry."
+    async def fake_poll_and_read(tenant_id, run_id, session_id, agent_id, user_id):
+        return (
+            True,
+            "completed",
+            structured_api.RunOwnedReply(
+                message_id=uuid.uuid4(),
+                content="Yes — same policy, legitimate retry.",
+                delivery_kind="terminal",
+                lifecycle_status="completed",
+            ),
+            None,
+        )
 
     monkeypatch.setattr(structured_api, "_poll_and_read", fake_poll_and_read)
-
-    async def fake_read_last_assistant(db, session_id, after):
-        return SimpleNamespace(id=uuid.uuid4(), content="Yes — same policy, legitimate retry.")
-
-    monkeypatch.setattr(structured_api, "_read_last_assistant", fake_read_last_assistant)
 
     class _NoopSession:
         async def execute(self, *a, **k):
@@ -1117,6 +1166,9 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
             return None
 
         async def get(self, *a, **k):
+            return None
+
+        def expire_all(self):
             return None
 
     class _NoopSessionFactory:
@@ -1145,6 +1197,239 @@ async def test_correlation_id_retry_with_same_allowed_tools_digest_still_joins_c
 
     assert response.status_code == 200
     assert response.json()["customer_reply"] == "Yes — same policy, legitimate retry."
+
+
+@pytest.mark.asyncio
+async def test_loser_derives_user_id_from_the_claimed_row_not_the_request_body(monkeypatch, client):
+    """Regression test for a BLOCKING adversarial-review finding: a
+    duplicate/retried request reusing an existing correlation_id but
+    carrying a DIFFERENT contact_ref than the request that actually won the
+    claim must still derive user_id from the CLAIMED row's own contact_ref
+    -- never from this request's own body.contact_ref. Deriving it from the
+    request would make the run-owned lookup see the winner's real reply as
+    a user mismatch, which would mark the SHARED claim row failed and
+    poison it for the original, legitimate caller."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    winner_contact_ref = GOLDEN_REQUEST["contact_ref"]
+    # Must match what _resolve_effective_tool_names resolves for
+    # GOLDEN_REQUEST's own allowed_tools ("crm.lead.create") -- this test
+    # varies only contact_ref, not the tool policy, so the digest must
+    # agree or the request is rejected 409 before ever reaching the loser
+    # path this test is about.
+    digest = structured_api._tool_policy_digest(["crm.lead.create"])
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+        tool_policy_digest=digest,
+        contact_ref=winner_contact_ref,
+        agent_id=AGENT_ID,
+    )
+
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    async def fake_wait_for_claim_population(row_id):
+        return existing_row
+
+    monkeypatch.setattr(
+        structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
+    )
+
+    observed_user_ids = []
+
+    async def fake_read_run_owned_reply(db, *, tenant_id, run_id, session_id, agent_id, user_id):
+        observed_user_ids.append(user_id)
+        return structured_api.RunOwnedReply(
+            message_id=uuid.uuid4(),
+            content="The winner's real reply.",
+            delivery_kind="terminal",
+            lifecycle_status="completed",
+        )
+
+    monkeypatch.setattr(structured_api, "read_run_owned_reply", fake_read_run_owned_reply)
+
+    class _Reader:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get_run_state(self, tenant_id, run_id):
+            return SimpleNamespace(execution_status="completed", waiting_reason=None, result_summary=None)
+
+    monkeypatch.setattr(structured_api, "open_run_state_reader", lambda db: _Reader())
+
+    class _NoopSession:
+        async def execute(self, *a, **k):
+            return SimpleNamespace(first=lambda: None, mappings=lambda: SimpleNamespace(first=lambda: None))
+
+        async def commit(self):
+            return None
+
+        async def get(self, *a, **k):
+            return None
+
+        def expire_all(self):
+            return None
+
+    class _NoopSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return _NoopSession()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
+
+    # This request's own contact_ref deliberately differs from the claimed
+    # row's -- a stale retry, a client bug, or an adversarial duplicate.
+    payload = dict(GOLDEN_REQUEST, contact_ref="contact:a-completely-different-customer")
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/structured/message", json=payload, headers=_headers()
+        )
+
+    assert response.status_code == 200
+    # The winner's real reply is returned -- the claim was never poisoned.
+    assert response.json()["customer_reply"] == "The winner's real reply."
+    assert len(observed_user_ids) == 1
+    assert observed_user_ids[0] == structured_api._stable_user_id(TENANT_ID, winner_contact_ref)
+    assert observed_user_ids[0] != structured_api._stable_user_id(
+        TENANT_ID, "contact:a-completely-different-customer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_loser_derives_agent_id_from_the_claimed_row_not_the_request_body(monkeypatch, client):
+    """Same regression as above for agent_id: a duplicate/concurrent
+    request reusing an existing correlation_id under the SAME tenant and
+    tool-policy digest but naming a DIFFERENT designated_agent_id must
+    still validate ownership against the CLAIMED row's own agent_id --
+    never this request's body.designated_agent_id -- or it can fail the
+    run-owned lookup's agent check and mark the shared claim failed,
+    poisoning it for the original winner."""
+    monkeypatch.setattr(structured_api, "_resolve_tenant", _fake_resolve_tenant_ok)
+
+    async def fake_resolve_effective_tool_names(agent_id, requested):
+        return sorted(requested), set()
+
+    monkeypatch.setattr(
+        structured_api, "_resolve_effective_tool_names", fake_resolve_effective_tool_names
+    )
+
+    winner_agent_id = AGENT_ID
+    # Must match what _resolve_effective_tool_names resolves for
+    # GOLDEN_REQUEST's own allowed_tools ("crm.lead.create") -- this test
+    # varies only designated_agent_id, not the tool policy.
+    digest = structured_api._tool_policy_digest(["crm.lead.create"])
+    existing_row = SimpleNamespace(
+        id=uuid.uuid4(),
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        state="running",
+        initiating_message_id=None,
+        tool_policy_digest=digest,
+        contact_ref=GOLDEN_REQUEST["contact_ref"],
+        agent_id=winner_agent_id,
+    )
+
+    async def fake_claim(*, tenant_id, correlation_id, body, tool_policy_digest):
+        return False, existing_row
+
+    monkeypatch.setattr(structured_api, "_claim", fake_claim)
+
+    async def fake_wait_for_claim_population(row_id):
+        return existing_row
+
+    monkeypatch.setattr(
+        structured_api, "_wait_for_claim_population", fake_wait_for_claim_population
+    )
+
+    observed_agent_ids = []
+
+    async def fake_read_run_owned_reply(db, *, tenant_id, run_id, session_id, agent_id, user_id):
+        observed_agent_ids.append(agent_id)
+        return structured_api.RunOwnedReply(
+            message_id=uuid.uuid4(),
+            content="The winner's real reply.",
+            delivery_kind="terminal",
+            lifecycle_status="completed",
+        )
+
+    monkeypatch.setattr(structured_api, "read_run_owned_reply", fake_read_run_owned_reply)
+
+    class _Reader:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get_run_state(self, tenant_id, run_id):
+            return SimpleNamespace(execution_status="completed", waiting_reason=None, result_summary=None)
+
+    monkeypatch.setattr(structured_api, "open_run_state_reader", lambda db: _Reader())
+
+    class _NoopSession:
+        async def execute(self, *a, **k):
+            return SimpleNamespace(first=lambda: None, mappings=lambda: SimpleNamespace(first=lambda: None))
+
+        async def commit(self):
+            return None
+
+        async def get(self, *a, **k):
+            return None
+
+        def expire_all(self):
+            return None
+
+    class _NoopSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return _NoopSession()
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(structured_api, "async_session", _NoopSessionFactory())
+
+    # This request's own designated_agent_id deliberately differs from the
+    # claimed row's -- a stale retry, a client bug, or an adversarial
+    # duplicate reusing the same correlation_id.
+    different_agent_id = uuid.uuid4()
+    payload = dict(GOLDEN_REQUEST, designated_agent_id=str(different_agent_id))
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/isola/bridge/structured/message", json=payload, headers=_headers()
+        )
+
+    assert response.status_code == 200
+    # The winner's real reply is returned -- the claim was never poisoned.
+    assert response.json()["customer_reply"] == "The winner's real reply."
+    assert len(observed_agent_ids) == 1
+    assert observed_agent_ids[0] == winner_agent_id
+    assert observed_agent_ids[0] != different_agent_id
 
 
 @pytest.mark.asyncio

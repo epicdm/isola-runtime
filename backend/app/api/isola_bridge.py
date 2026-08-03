@@ -6,7 +6,10 @@ chat turn through the plain, durable chat runtime (``enqueue_chat_runtime``)
 and returns the settled assistant reply synchronously — WITHOUT using the
 native channel-delivery path (which requires a hardcoded channel allowlist we
 do not fork). Instead it reuses the ordinary Web-Chat runtime and reads the
-settled Run's assistant reply from the persisted ChatMessage stream.
+settled Run's own run-owned delivery receipt
+(`app.services.agent_runtime.run_owned_reply`), never a session-wide scan
+for "the newest assistant message" (`dec-clawith-run-scoped-assistant-reply-
+ownership-2026-08-03`).
 
 All net-new logic lives in this single additive file. Only one
 ``include_router`` line is added to ``main.py``.
@@ -18,22 +21,23 @@ import asyncio
 import hmac
 import os
 import uuid
-from datetime import UTC, datetime
 
 from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.database import async_session
 from app.models.agent import Agent, AgentUserOnboarding
-from app.models.audit import ChatMessage
 from app.models.llm import LLMModel
 from app.models.user import User
 from app.services.agent_runtime.chat_intake import (
     ChatRuntimeIntakeError,
     enqueue_chat_runtime,
+)
+from app.services.agent_runtime.run_owned_reply import (
+    RunOwnedReplyError,
+    read_run_owned_reply,
 )
 from app.services.agent_runtime.run_state_reader import (
     RunStateReadError,
@@ -84,24 +88,6 @@ def _authorize(secret_header: str | None) -> JSONResponse | None:
 
 def _stable_user_id(tenant_id: uuid.UUID, phone: str) -> uuid.UUID:
     return uuid.uuid5(_ISOLA_USER_NS, f"isola-bridge:{tenant_id}:{phone.strip()}")
-
-
-async def _read_last_assistant(db, session_id: uuid.UUID, after: datetime) -> str | None:
-    result = await db.execute(
-        select(ChatMessage)
-        .where(
-            ChatMessage.conversation_id == str(session_id),
-            ChatMessage.role == "assistant",
-            ChatMessage.created_at >= after,
-        )
-        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(1)
-    )
-    message = result.scalar_one_or_none()
-    if message is None:
-        return None
-    content = (message.content or "").strip()
-    return content or None
 
 
 @router.post("/message")
@@ -218,10 +204,6 @@ async def bridge_message(
 
                 run_id = intake.handle.run_id
                 session_id = session.id
-                user_msg = await db.get(ChatMessage, intake.message_id)
-                user_created_at = (
-                    user_msg.created_at if user_msg is not None else datetime.now(UTC)
-                )
     except ChatRuntimeIntakeError as exc:
         return JSONResponse(
             status_code=409, content={"error": exc.code, "detail": str(exc)}
@@ -264,20 +246,44 @@ async def bridge_message(
                     },
                 )
 
-            # Once settled, the assistant reply is persisted as a ChatMessage.
-            # Give delivery a short grace window in case the message row lands
-            # a beat after the status transition.
+            # Once settled, the assistant reply is durably on record as this
+            # run's own delivery receipt (agent_run_events, written
+            # transactionally by deliver_runtime_message). Give delivery a
+            # short grace window in case the receipt lands a beat after the
+            # status transition. A run-ownership scope mismatch fails closed
+            # immediately -- it never falls back to scanning the session for
+            # a different assistant message.
             reply: str | None = None
+            ownership_error = False
             grace_deadline = loop.time() + _MESSAGE_GRACE_S
             while True:
                 poll_db.expire_all()
-                reply = await _read_last_assistant(poll_db, session_id, user_created_at)
-                if reply is not None or loop.time() >= grace_deadline:
+                try:
+                    owned_reply = await read_run_owned_reply(
+                        poll_db,
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        session_id=session_id,
+                        agent_id=agent.id,
+                        user_id=user.id,
+                    )
+                except RunOwnedReplyError:
+                    ownership_error = True
+                    break
+                if owned_reply is not None:
+                    reply = owned_reply.content
+                    break
+                if loop.time() >= grace_deadline:
                     break
                 await asyncio.sleep(_POLL_INTERVAL_S)
 
-    if reply is None:
-        # Defensive fallbacks so the spine still gets the model's output text.
+    if reply is None and not ownership_error:
+        # Defensive fallbacks so the spine still gets the model's output
+        # text -- but ONLY when no delivery receipt was found at all. Once a
+        # receipt exists and fails ownership validation, that is a positive
+        # corruption signal for this run; substituting waiting_reason/
+        # result_summary at that point would silently mask it behind
+        # seemingly-normal output instead of failing closed.
         reply = (waiting_reason or result_summary or "").strip() or None
 
     if reply is None:
