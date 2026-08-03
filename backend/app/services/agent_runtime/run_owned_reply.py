@@ -189,6 +189,16 @@ async def read_run_owned_reply(
             "message_conversation_mismatch",
             f"ChatMessage {message_id} conversation_id does not match the requested session",
         )
+    if message.agent_id != agent_id:
+        raise RunOwnedReplyError(
+            "message_agent_mismatch",
+            f"ChatMessage {message_id} agent_id does not match the requested agent",
+        )
+    if message.user_id != user_id:
+        raise RunOwnedReplyError(
+            "message_user_mismatch",
+            f"ChatMessage {message_id} user_id does not match the requested user",
+        )
 
     run_result = await db.execute(
         select(AgentRun).where(AgentRun.tenant_id == tenant_id, AgentRun.id == run_id)

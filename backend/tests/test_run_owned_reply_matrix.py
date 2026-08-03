@@ -156,6 +156,35 @@ async def _seed_scope(db) -> Scope:
     return Scope(tenant_id=tenant_id, model_id=model_id, user_id=user_id, agent_id=agent_id, session_id=session_id)
 
 
+async def _seed_other_agent(db, scope: Scope) -> uuid.UUID:
+    """A second, real Agent row in the SAME tenant -- ChatMessage.agent_id
+    has a real foreign key, so an adversarial/doctored row still needs a
+    row that actually exists in `agents`, not just an arbitrary UUID."""
+    other_agent_id = uuid.uuid4()
+    db.add(
+        Agent(
+            id=other_agent_id, tenant_id=scope.tenant_id, creator_id=scope.user_id,
+            name="Matrix Other Agent", avatar_url="agent.png", status="idle",
+        )
+    )
+    await db.flush()
+    return other_agent_id
+
+
+async def _seed_other_user(db, scope: Scope) -> uuid.UUID:
+    """A second, real User row in the SAME tenant -- ChatMessage.user_id has
+    a real foreign key."""
+    other_user_id = uuid.uuid4()
+    db.add(
+        User(
+            id=other_user_id, tenant_id=scope.tenant_id, display_name="Matrix Other Customer",
+            role="member", is_active=True,
+        )
+    )
+    await db.flush()
+    return other_user_id
+
+
 async def _make_run(db, scope: Scope, *, session_id: uuid.UUID | None = None) -> AgentRun:
     run_id = uuid.uuid4()
     run = AgentRun(
@@ -350,7 +379,7 @@ async def test_two_terminal_receipts_with_identical_created_at_pick_deterministi
         for message_id, content in ((message_a_id, "Candidate A"), (message_b_id, "Candidate B")):
             db.add(
                 ChatMessage(
-                    id=message_id, agent_id=scope.agent_id, role="assistant",
+                    id=message_id, agent_id=scope.agent_id, user_id=scope.user_id, role="assistant",
                     content=content, conversation_id=str(scope.session_id),
                     created_at=same_instant,
                 )
@@ -529,6 +558,83 @@ async def test_receipt_referencing_wrong_role_message_fails_closed():
 
 
 @pytest.mark.asyncio
+async def test_receipt_referencing_message_with_wrong_agent_id_fails_closed():
+    """Regression test for an adversarial-review finding: a
+    delivery_succeeded receipt can carry a correct run-id/idempotency-key/
+    uuid5 binding while the ChatMessage row it names was authored for a
+    DIFFERENT agent (a corrupted or doctored row). The message's own
+    agent_id must be checked, not just the re-read AgentRun's -- otherwise a
+    scope-inconsistent row's content would still be returned."""
+    async with async_session() as db, db.begin():
+        scope = await _seed_scope(db)
+        run = await _make_run(db, scope)
+        idem_key = f"run:{run.id}:terminal:completed"
+        message_id = uuid.uuid5(run.id, f"delivery-message:{idem_key}")
+        other_agent_id = await _seed_other_agent(db, scope)
+        db.add(
+            ChatMessage(
+                id=message_id, agent_id=other_agent_id, user_id=scope.user_id, role="assistant",
+                content="Belongs to a different agent",
+                conversation_id=str(scope.session_id),
+            )
+        )
+        db.add(
+            AgentRunEvent(
+                id=uuid.uuid4(), run_id=run.id, tenant_id=scope.tenant_id,
+                agent_id=scope.agent_id, event_type="delivery_succeeded",
+                summary="Runtime delivery succeeded",
+                payload={
+                    "version": 1, "status": "delivered", "delivery_kind": "terminal",
+                    "message_id": str(message_id), "actual_session_id": str(scope.session_id),
+                    "lifecycle_status": "completed",
+                },
+                idempotency_key=idem_key,
+            )
+        )
+
+    with pytest.raises(RunOwnedReplyError) as exc_info:
+        await _read(scope, run)
+    assert exc_info.value.code == "message_agent_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_receipt_referencing_message_with_wrong_user_id_fails_closed():
+    """Same regression as above for the message's own user_id: a
+    scope-inconsistent row must fail closed even when the run/idempotency/
+    uuid5/session/role/content checks all pass."""
+    async with async_session() as db, db.begin():
+        scope = await _seed_scope(db)
+        run = await _make_run(db, scope)
+        idem_key = f"run:{run.id}:terminal:completed"
+        message_id = uuid.uuid5(run.id, f"delivery-message:{idem_key}")
+        other_user_id = await _seed_other_user(db, scope)
+        db.add(
+            ChatMessage(
+                id=message_id, agent_id=scope.agent_id, user_id=other_user_id, role="assistant",
+                content="Belongs to a different customer",
+                conversation_id=str(scope.session_id),
+            )
+        )
+        db.add(
+            AgentRunEvent(
+                id=uuid.uuid4(), run_id=run.id, tenant_id=scope.tenant_id,
+                agent_id=scope.agent_id, event_type="delivery_succeeded",
+                summary="Runtime delivery succeeded",
+                payload={
+                    "version": 1, "status": "delivered", "delivery_kind": "terminal",
+                    "message_id": str(message_id), "actual_session_id": str(scope.session_id),
+                    "lifecycle_status": "completed",
+                },
+                idempotency_key=idem_key,
+            )
+        )
+
+    with pytest.raises(RunOwnedReplyError) as exc_info:
+        await _read(scope, run)
+    assert exc_info.value.code == "message_user_mismatch"
+
+
+@pytest.mark.asyncio
 async def test_receipt_referencing_empty_content_message_fails_closed():
     async with async_session() as db, db.begin():
         scope = await _seed_scope(db)
@@ -625,7 +731,10 @@ async def test_cross_agent_lookup_is_rejected():
     other_agent_id = uuid.uuid4()
     with pytest.raises(RunOwnedReplyError) as exc_info:
         await _read(scope, run, agent_id=other_agent_id)
-    assert exc_info.value.code == "run_ownership_mismatch"
+    # Caught by the message-level ownership check (added as a defence-in-
+    # depth hardening) before the AgentRun re-read is even reached -- both
+    # are valid fail-closed outcomes for this scenario.
+    assert exc_info.value.code == "message_agent_mismatch"
 
 
 @pytest.mark.asyncio
@@ -638,7 +747,10 @@ async def test_cross_user_lookup_is_rejected():
     other_user_id = uuid.uuid4()
     with pytest.raises(RunOwnedReplyError) as exc_info:
         await _read(scope, run, user_id=other_user_id)
-    assert exc_info.value.code == "run_ownership_mismatch"
+    # Caught by the message-level ownership check (added as a defence-in-
+    # depth hardening) before the AgentRun re-read is even reached -- both
+    # are valid fail-closed outcomes for this scenario.
+    assert exc_info.value.code == "message_user_mismatch"
 
 
 @pytest.mark.asyncio
