@@ -254,6 +254,7 @@ async def bridge_message(
             # immediately -- it never falls back to scanning the session for
             # a different assistant message.
             reply: str | None = None
+            ownership_error = False
             grace_deadline = loop.time() + _MESSAGE_GRACE_S
             while True:
                 poll_db.expire_all()
@@ -267,6 +268,7 @@ async def bridge_message(
                         user_id=user.id,
                     )
                 except RunOwnedReplyError:
+                    ownership_error = True
                     break
                 if owned_reply is not None:
                     reply = owned_reply.content
@@ -275,8 +277,13 @@ async def bridge_message(
                     break
                 await asyncio.sleep(_POLL_INTERVAL_S)
 
-    if reply is None:
-        # Defensive fallbacks so the spine still gets the model's output text.
+    if reply is None and not ownership_error:
+        # Defensive fallbacks so the spine still gets the model's output
+        # text -- but ONLY when no delivery receipt was found at all. Once a
+        # receipt exists and fails ownership validation, that is a positive
+        # corruption signal for this run; substituting waiting_reason/
+        # result_summary at that point would silently mask it behind
+        # seemingly-normal output instead of failing closed.
         reply = (waiting_reason or result_summary or "").strip() or None
 
     if reply is None:
