@@ -545,6 +545,33 @@ async def test_one_capability_run_does_not_suppress_another_ordinary_run(monkeyp
     assert [call["suppress_model_progress"] for call in enqueued] == [True, False]
 
 
+def test_progress_suppression_is_off_by_default_for_every_other_ingress():
+    """No global disable. The structured bridge is the ONLY ingress that
+    passes the flag; every other caller of `enqueue_chat_runtime` must keep
+    its existing progress behaviour by getting `False` implicitly.
+
+    Asserted on the signature default rather than the call sites, because
+    flipping that one default is exactly how ordinary web chat, the legacy
+    bridge, the v2 bridge and onboarding would silently go dark.
+    """
+    import inspect
+    from pathlib import Path
+
+    from app.services.agent_runtime.chat_intake import enqueue_chat_runtime
+
+    parameter = inspect.signature(enqueue_chat_runtime).parameters["suppress_model_progress"]
+    assert parameter.default is False
+
+    backend_root = Path(__file__).resolve().parents[1]
+    for relative in (
+        "app/api/isola_bridge.py",
+        "app/api/isola_bridge_v2.py",
+        "app/api/websocket.py",
+    ):
+        source = (backend_root / relative).read_text(encoding="utf-8")
+        assert "suppress_model_progress" not in source, relative
+
+
 def test_flag_is_not_part_of_the_public_request_schema():
     fields = set(structured_api.StructuredBridgeMessageIn.model_fields)
     assert "suppress_model_progress" not in fields
