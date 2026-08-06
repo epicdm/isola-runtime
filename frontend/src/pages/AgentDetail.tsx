@@ -126,20 +126,60 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
         return keys;
     };
 
+    // Mirrors the backend's response-side classifier so a credential-shaped key
+    // is treated as write-only here even when the schema fails to declare it.
+    const SENSITIVE_NAME_PARTS = [
+        'api_key', 'apikey', 'access_token', 'refresh_token', 'auth_code',
+        'authorization', 'client_secret', 'credential', 'hmac_secret', 'passwd',
+        'password', 'private_key', 'pwd', 'secret', 'token', 'webhook_secret',
+    ];
+    const isSensitiveName = (key: string): boolean => {
+        const lowered = (key || '').trim().toLowerCase();
+        return SENSITIVE_NAME_PARTS.some(part => lowered.includes(part));
+    };
+    const isWriteOnly = (key: string, sensitiveKeys: Set<string>): boolean =>
+        sensitiveKeys.has(key) || isSensitiveName(key);
+
+    /**
+     * May this value for a write-only field be sent to the server?
+     *
+     * `null` yes — that is the explicit "clear this credential" action, which is
+     * deliberately distinct from leaving the input blank. A blank or absent
+     * input is omitted so the stored credential survives. A boolean is a
+     * configured-state flag and must never be written back as a value. A
+     * "****"-prefixed string is a legacy mask; submitting it would overwrite a
+     * valid credential with placeholder text, so it is refused outright.
+     */
+    const isSubmittableSecret = (value: any): boolean => {
+        if (value === null) return true;
+        if (value === undefined || typeof value === 'boolean') return false;
+        if (typeof value !== 'string') return false;
+        const trimmed = value.trim();
+        if (!trimmed) return false;
+        if (trimmed.startsWith('****')) return false;
+        return true;
+    };
+
     const openConfig = (tool: any) => {
         setConfigTool(tool);
-        // Build merged config: start with global defaults, overlay agent overrides.
-        // For sensitive fields, only use agent_config values (global ones are masked
-        // like "****xxxx" and should not pre-fill the input).
+        // The API returns non-secret configuration only; credential state arrives
+        // as *_configured booleans. Secret inputs are write-only: they always
+        // load blank, so nothing can be written back over a stored credential.
         const sensitiveKeys = getSensitiveKeys(tool.config_schema);
         const globalCfg = tool.global_config || {};
         const agentCfg = tool.agent_config || {};
         const merged: Record<string, any> = {};
         for (const [k, v] of Object.entries(globalCfg)) {
-            if (!sensitiveKeys.has(k)) merged[k] = v;
+            if (!isWriteOnly(k, sensitiveKeys)) merged[k] = v;
         }
-        Object.assign(merged, agentCfg);
+        for (const [k, v] of Object.entries(agentCfg)) {
+            if (!isWriteOnly(k, sensitiveKeys)) merged[k] = v;
+        }
         setConfigData(merged);
+        // Booleans only — used to render "company configured" / "credential
+        // configured" hints. The value itself is never received or rendered.
+        setConfigGlobalData({ ...globalCfg, ...(tool.global_config_configured || {}) });
+        setConfigAgentConfigured(tool.agent_config_configured || {});
         setConfigJson(JSON.stringify(agentCfg, null, 2));
         setFocusedField(null);
     };
@@ -200,7 +240,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                 const sensitiveKeys = getSensitiveKeys(catSchema);
                 const payload: Record<string, any> = {};
                 for (const [k, v] of Object.entries(raw)) {
-                    if (sensitiveKeys.has(k) && (v === '' || v === undefined || v === null)) continue;
+                    if (isWriteOnly(k, sensitiveKeys) && !isSubmittableSecret(v)) continue;
                     payload[k] = v;
                 }
                 await fetch(`/api/tools/agents/${agentId}/category-config/${configCategory}`, {
@@ -212,11 +252,13 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
             } else {
                 const hasSchema = configTool.config_schema?.fields?.length > 0;
                 const raw = hasSchema ? configData : JSON.parse(configJson || '{}');
-                // Strip empty sensitive fields only — agent CAN override company values
+                // Strip untouched sensitive fields only — agent CAN override
+                // company values. An omitted secret leaves the stored credential
+                // intact; an explicit null clears it.
                 const sensitiveKeys = getSensitiveKeys(configTool.config_schema);
                 const payload: Record<string, any> = {};
                 for (const [k, v] of Object.entries(raw)) {
-                    if (sensitiveKeys.has(k) && (v === '' || v === undefined || v === null)) continue;
+                    if (isWriteOnly(k, sensitiveKeys) && !isSubmittableSecret(v)) continue;
                     payload[k] = v;
                 }
                 await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, {
@@ -292,7 +334,9 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {(catTools as any[]).map((tool: any) => {
                         const hasConfig = tool.config_schema?.fields?.length > 0 || tool.type === 'mcp';
-                        const hasAgentOverride = tool.agent_config && Object.keys(tool.agent_config).length > 0;
+                        // Stated by the API. agent_config no longer carries
+                        // secrets, so its emptiness no longer implies "no override".
+                        const hasAgentOverride = tool.has_agent_override ?? (tool.agent_config && Object.keys(tool.agent_config).length > 0);
                         const isGlobalCategoryConfig = category === 'agentbay' && tool.name === 'agentbay_browser_navigate';
                         return (
                             <div key={tool.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px' }}>
@@ -469,7 +513,10 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                             const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
                                                             if (!globalVal) return null;
                                                             // Never render a credential — or a mask of one — as a hint.
-                                                            const isSecretField = field.type === 'password';
+                                                            // A boolean here is configured-state, not a value.
+                                                            const isSecretField = field.type === 'password'
+                                                                || typeof globalVal === 'boolean'
+                                                                || isSensitiveName(field.key);
                                                             return (
                                                                 <span style={{ fontWeight: 400, color: 'var(--accent-primary)', marginLeft: '4px', fontSize: '11px' }}>
                                                                     {isSecretField
@@ -531,8 +578,26 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                             );
                                                         })()}
                                                         {configAgentConfigured?.[field.key] && (
-                                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                                                {t('agent.tools.credentialConfigured', 'Credential configured \u2014 leave blank to keep it')}
+                                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                                <span>
+                                                                    {configData[field.key] === null
+                                                                        ? t('agent.tools.credentialWillBeCleared', 'Credential will be removed when you save')
+                                                                        : t('agent.tools.credentialConfigured', 'Credential configured \u2014 leave blank to keep it')}
+                                                                </span>
+                                                                {/* Removing a credential is an explicit act. Leaving the
+                                                                    input blank keeps the stored value; only this button
+                                                                    sends the null that clears it. */}
+                                                                {configData[field.key] === null ? (
+                                                                    <button type="button" className="btn btn-ghost" style={{ fontSize: '11px', padding: '0 4px' }}
+                                                                        onClick={() => setConfigData(p => { const n = { ...p }; delete n[field.key]; return n; })}>
+                                                                        {t('common.undo', 'Undo')}
+                                                                    </button>
+                                                                ) : (
+                                                                    <button type="button" className="btn btn-ghost" style={{ fontSize: '11px', padding: '0 4px', color: 'var(--error)' }}
+                                                                        onClick={() => setConfigData(p => ({ ...p, [field.key]: null }))}>
+                                                                        {t('agent.tools.clearCredential', 'Clear')}
+                                                                    </button>
+                                                                )}
                                                             </div>
                                                         )}
                                                         {/* Per-provider help text for auth_code */}
@@ -562,17 +627,23 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                     ) : (
                                                         <>
                                                         {(() => {
-                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
-                                                            const isUsingGlobal = globalVal && !configData[field.key];
-                                                            
+                                                            const rawGlobalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
+                                                            // A boolean is configured-state, never a value to render.
+                                                            const globalVal = typeof rawGlobalVal === 'boolean' ? undefined : rawGlobalVal;
+                                                            const globalConfigured = Boolean(rawGlobalVal);
+                                                            const hint = globalVal !== undefined
+                                                                ? t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal })
+                                                                : t('agent.tools.companyConfigured', '(company configured)');
+                                                            const isUsingGlobal = globalConfigured && !configData[field.key];
+
                                                             if (isUsingGlobal && focusedField !== field.key) {
                                                                 return (
-                                                                    <div 
-                                                                        className="form-input" 
+                                                                    <div
+                                                                        className="form-input"
                                                                         style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'text', background: 'var(--bg-tertiary)', borderColor: 'var(--border)', overflow: 'hidden' }}
                                                                         onClick={() => setFocusedField(field.key)}
                                                                     >
-                                                                        <span style={{ flex: 1, color: 'var(--text-tertiary)', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal })}</span>
+                                                                        <span style={{ flex: 1, color: 'var(--text-tertiary)', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{hint}</span>
                                                                         <span style={{ fontSize: '12px', color: 'var(--accent-primary)', flexShrink: 0, cursor: 'pointer' }}>{t('common.edit', 'Edit')}</span>
                                                                     </div>
                                                                 );
@@ -582,7 +653,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                 <input type="text" className="form-input"
                                                                     autoFocus={focusedField === field.key}
                                                                     value={configData[field.key] ?? ''}
-                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
+                                                                    placeholder={globalConfigured ? hint : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
                                                                     onBlur={(e) => {
                                                                         if (!e.target.value) setFocusedField(null);
                                                                     }}
@@ -610,7 +681,10 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                         const res = await fetch('/api/tools/test-email', {
                                                             method: 'POST',
                                                             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                                                            body: JSON.stringify({ config: configData }),
+                                                            // Secret inputs are write-only, so a stored credential
+                                                            // the operator did not retype is resolved server-side
+                                                            // from this tool context rather than sent from here.
+                                                            body: JSON.stringify({ config: configData, agent_id: agentId, tool_id: configTool?.id }),
                                                         });
                                                         const data = await res.json();
                                                         if (status) {
@@ -648,10 +722,13 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                             )}
 
                             <div style={{ display: 'flex', gap: '8px', marginTop: '16px', justifyContent: 'flex-end' }}>
-                                {configTool && configTool.agent_config && Object.keys(configTool.agent_config || {}).length > 0 && (
+                                {configTool && (configTool.has_agent_override ?? (configTool.agent_config && Object.keys(configTool.agent_config || {}).length > 0)) && (
                                     <button className="btn btn-ghost" style={{ color: 'var(--error)', marginRight: 'auto' }} onClick={async () => {
                                         const token = localStorage.getItem('token');
-                                        await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ config: {} }) });
+                                        // replace_config discards the whole override, including any
+                                        // stored credential. An ordinary save preserves omitted
+                                        // secrets, so resetting has to say so explicitly.
+                                        await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ config: {}, replace_config: true }) });
                                         setConfigTool(null); loadTools();
                                     }}>Reset to Global</button>
                                 )}
