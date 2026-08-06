@@ -66,6 +66,187 @@ def _declared_secret_keys(config_schema: dict | None) -> set[str]:
     return keys
 
 
+# ─── Response-side credential containment ───────────────────
+#
+# defect-isola-runtime-tool-config-mask-writeback-and-partial-secret-disclosure-2026-08-06
+#
+# What follows governs what may leave this process in an HTTP response. It is
+# deliberately SEPARATE from SENSITIVE_FIELD_KEYS / _get_sensitive_keys, which
+# govern encryption at rest. Widening the response classifier must never widen
+# the storage classifier: app/services/agent_tools.py keeps its own decryption
+# key set, so a field this module started encrypting would become unreadable to
+# the runtime and break tool execution.
+#
+# A response may never carry a credential in any form — decrypted, encrypted,
+# masked, truncated or placeheld. A "****" + last-four mask is both a partial
+# disclosure and a write-back hazard: the UI can submit it straight back over a
+# valid stored credential. Consumers get booleans instead.
+
+RESPONSE_SENSITIVE_NAME_PARTS = (
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "auth_code",
+    "authorization",
+    "client_secret",
+    "credential",
+    "hmac_secret",
+    "passwd",
+    "password",
+    "private_key",
+    "pwd",
+    "secret",
+    "token",
+    "webhook_secret",
+)
+
+
+def _is_sensitive_name(key: str) -> bool:
+    """True if a config key name is inherently credential-shaped.
+
+    Substring matching on purpose, so ``smithery_api_key``, ``atlassian_api_key``,
+    ``modelscope_api_token`` and ``bot_token`` are all caught without being
+    declared anywhere. It fails closed: a harmless field whose name happens to
+    contain one of these parts is dropped from value-bearing output rather than
+    risked.
+    """
+    lowered = (key or "").strip().lower()
+    return any(part in lowered for part in RESPONSE_SENSITIVE_NAME_PARTS)
+
+
+def _response_secret_keys(config_schema: dict | None, raw: dict | None) -> set[str]:
+    """Every key whose value must never appear in a response.
+
+    Union of the schema's declared password fields, the storage-side fallback
+    set, and any stored key with an inherently sensitive name. Neither source is
+    trusted alone: a schema that mis-declares ``api_key`` as text is still
+    caught by name, and a credential stored under an undeclared name is still
+    caught even though the schema says nothing about it.
+    """
+    try:
+        keys = set(_get_sensitive_keys(config_schema)) | _declared_secret_keys(config_schema)
+    except (AttributeError, TypeError):
+        # A malformed schema must not crash a response, and must not narrow the
+        # secret set either. Fall back to the name-based classification alone.
+        keys = set(SENSITIVE_FIELD_KEYS)
+    keys |= {k for k in (raw or {}) if _is_sensitive_name(k)}
+    keys.discard("")
+    return keys
+
+
+def _project_safe_config(raw: dict | None, config_schema: dict | None) -> dict:
+    """Allowlisted, non-secret projection of a tool config dict.
+
+    Fail-closed on every axis the containment contract requires:
+
+    * only keys the schema declares as non-secret survive, so an absent,
+      empty or malformed schema yields ``{}``;
+    * a declared key whose name is inherently sensitive is dropped anyway, so a
+      mis-declared schema cannot promote a credential into a response;
+    * unknown stored keys are dropped;
+    * a container value is dropped whole, because the schema declares no nested
+      field and therefore allowlists no nested key.
+
+    The input is the value as stored. It is never decrypted, so no plaintext
+    credential is brought into memory on a response path at all.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    if not isinstance(config_schema, dict):
+        return {}
+    try:
+        safe_keys = _safe_config_keys(config_schema, _get_sensitive_keys(config_schema))
+    except (AttributeError, TypeError):
+        return {}  # malformed schema fails closed
+    out: dict = {}
+    for key in sorted(safe_keys):
+        if key not in raw or _is_sensitive_name(key):
+            continue
+        value = raw[key]
+        if isinstance(value, (dict, list, tuple, set)):
+            continue
+        out[key] = value
+    return out
+
+
+def _configured_map(raw: dict | None, config_schema: dict | None) -> dict[str, bool]:
+    """``{secret_key: bool}`` — whether a credential exists, never any part of it.
+
+    Presence is derived from the stored value without decrypting it: ciphertext
+    is present exactly when plaintext was. Every value is strictly ``bool``.
+    """
+    source = raw if isinstance(raw, dict) else {}
+    keys = _response_secret_keys(config_schema, source)
+    return {key: bool(str(source.get(key) or "").strip()) for key in sorted(keys)}
+
+
+def _safe_config_schema(config_schema: dict | None) -> dict:
+    """Field metadata with any stored-looking value stripped.
+
+    Schema metadata describes fields; it must not become a second channel for a
+    credential, so a secret field's ``default`` is removed before the schema is
+    returned.
+    """
+    if not isinstance(config_schema, dict) or not config_schema:
+        return {}
+    fields = config_schema.get("fields")
+    if not isinstance(fields, list):
+        return {k: v for k, v in config_schema.items() if k != "fields"}
+    safe_fields = []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        cleaned = dict(field)
+        if cleaned.get("type") == "password" or _is_sensitive_name(cleaned.get("key", "")):
+            cleaned.pop("default", None)
+        safe_fields.append(cleaned)
+    out = dict(config_schema)
+    out["fields"] = safe_fields
+    return out
+
+
+def _merge_preserving_secrets(
+    stored: dict | None,
+    incoming: dict | None,
+    config_schema: dict | None,
+) -> dict:
+    """Apply an incoming *partial* config without destroying anything omitted.
+
+    defect-isola-runtime-tool-config-schema-empty-config-data-loss-2026-08-06:
+    response safety and storage semantics are independent. ``_project_safe_config``
+    is fail-closed and may legitimately show the caller ``{}`` when a tool's
+    ``config_schema`` is absent, empty or malformed — most seeded tools and every
+    MCP tool created by ``resource_discovery.py`` are in exactly this state. That
+    empty *view* must never be read as "the stored config should become empty":
+    a save starts from the STORED config, and only the keys the caller actually
+    submitted are changed. Every omitted key — secret or not — survives.
+
+    Secrets are additionally write-only: the API never returns them, so a
+    client cannot echo one back and a submitted secret key is always a
+    deliberate act. Sending it as ``null``/blank explicitly clears it (distinct
+    from omitting it, which is "unchanged"); sending a real value replaces it.
+    Non-secret keys the caller submits are written verbatim — clearing a
+    non-secret field is an ordinary value change, not a delete.
+
+    Callers that genuinely want a wholesale replacement pass
+    ``replace_config=true``, which bypasses this function entirely.
+    """
+    stored = stored if isinstance(stored, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+    secret_keys = _response_secret_keys(config_schema, {**stored, **incoming})
+    result = dict(stored)
+    for key, value in incoming.items():
+        if key in secret_keys:
+            if value is None or (isinstance(value, str) and not value.strip()):
+                result.pop(key, None)  # explicit clear
+            else:
+                result[key] = value  # deliberate replacement
+        else:
+            result[key] = value  # ordinary non-secret update
+    return result
+
+
 def _encrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
     """Encrypt sensitive fields in config dict.
 
@@ -114,37 +295,14 @@ def _encrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -
     return result
 
 
-def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
-    """Decrypt sensitive fields in config dict.
-
-    Args:
-        config: Tool config dict
-        config_schema: Optional config_schema to extract password-type field keys
-
-    Returns:
-        Config dict with sensitive fields decrypted
-    """
-    from app.core.security import decrypt_data
-    from app.config import get_settings
-
-    if not config:
-        return config
-
-    settings = get_settings()
-    result = dict(config)
-    sensitive_keys = _get_sensitive_keys(config_schema)
-
-    for key in sensitive_keys:
-        if key in result and result[key]:
-            value = result[key]
-            if isinstance(value, str) and value:
-                try:
-                    result[key] = decrypt_data(value, settings.SECRET_KEY)
-                except Exception:
-                    # If decryption fails, assume it's plaintext
-                    pass
-
-    return result
+# There is deliberately NO decrypt helper in this module.
+#
+# Every response path here is now non-decrypting, so a plaintext credential is
+# never materialised on an API path at all. Decryption belongs to the runtime,
+# which owns its own copy in app/services/agent_tools.py and reads the database
+# directly. Re-adding one here would hand a future edit an easy way to reopen
+# defect-isola-runtime-tool-config-mask-writeback-and-partial-secret-disclosure-2026-08-06;
+# tests/test_tool_config_response_containment.py asserts it stays absent.
 
 
 # ─── Schemas ────────────────────────────────────────────────
@@ -175,6 +333,9 @@ class ToolUpdate(BaseModel):
     parameters_schema: dict | None = None
     is_default: bool | None = None
     config: dict | None = None
+    # Opt-in wholesale replacement. Off by default so a save that omits a
+    # write-only secret preserves the stored credential instead of wiping it.
+    replace_config: bool = False
 
 
 class AgentToolUpdate(BaseModel):
@@ -221,9 +382,13 @@ async def list_tools(
             "mcp_tool_name": t.mcp_tool_name,
             "enabled": t.enabled,
             "is_default": t.is_default,
-            # Decrypt config for the admin UI so saved values are readable
-            "config": _decrypt_sensitive_fields(t.config or {}, t.config_schema),
-            "config_schema": t.config_schema or {},
+            # Non-secret configuration only, allowlisted from the tool's own
+            # config_schema. Credentials are neither decrypted, encrypted nor
+            # masked here — callers read the configured-state booleans instead.
+            "config": _project_safe_config(t.config, t.config_schema),
+            "config_configured": _configured_map(t.config, t.config_schema),
+            "credentials_configured": any(_configured_map(t.config, t.config_schema).values()),
+            "config_schema": _safe_config_schema(t.config_schema),
             "created_at": t.created_at.isoformat() if t.created_at else None,
         }
         for t in tools
@@ -322,9 +487,19 @@ async def update_tool(
         raise HTTPException(status_code=404, detail="Tool not found")
 
     update_data = data.model_dump(exclude_unset=True)
-    # Encrypt sensitive fields in config
-    if "config" in update_data and update_data["config"]:
-        update_data["config"] = _encrypt_sensitive_fields(update_data["config"], tool.config_schema)
+    replace_config = bool(update_data.pop("replace_config", False))
+    # Merge, then encrypt. A secret the client omitted is preserved rather than
+    # deleted: the read contract no longer returns credentials, so the UI cannot
+    # echo one back and an omission means "unchanged". Sending the key with null
+    # or an empty string clears it; replace_config=true replaces wholesale.
+    if "config" in update_data:
+        incoming = update_data["config"] or {}
+        merged = (
+            incoming
+            if replace_config
+            else _merge_preserving_secrets(tool.config, incoming, tool.config_schema)
+        )
+        update_data["config"] = _encrypt_sensitive_fields(merged, tool.config_schema)
 
     for field, value in update_data.items():
         setattr(tool, field, value)
@@ -582,6 +757,10 @@ async def delete_agent_tool(
 
 class AgentToolConfigUpdate(BaseModel):
     config: dict
+    # Opt-in wholesale replacement — used by "remove agent override", which must
+    # genuinely clear the row. Off by default so an ordinary save that omits a
+    # write-only secret preserves the stored credential.
+    replace_config: bool = False
 
 
 @router.get("/agents/{agent_id}/tool-config/{tool_id}")
@@ -591,10 +770,16 @@ async def get_agent_tool_config(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get merged tool config (global defaults + agent overrides) and config_schema.
+    """Get non-secret tool config (global defaults + agent overrides) and config_schema.
 
-    Both configs are decrypted before returning. Global sensitive fields are
-    masked so the frontend can show a key is configured without exposing it.
+    Credentials are never returned — not decrypted, not encrypted, not masked
+    and not placeheld. Callers that need to know whether a credential exists
+    read the ``*_configured`` boolean maps instead.
+
+    Runtime credential resolution is unaffected: the agent runtime merges and
+    decrypts ``Tool.config`` / ``AgentTool.config`` itself in
+    ``app/services/agent_tools.py::_get_tool_config``, straight from the
+    database. It has never consumed this response.
     """
     tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool = tool_r.scalar_one_or_none()
@@ -605,29 +790,27 @@ async def get_agent_tool_config(
     )
     at = at_r.scalar_one_or_none()
 
-    # Decrypt both configs using the tool's config_schema for field type awareness
+    # Values as stored, deliberately NOT decrypted: nothing on this path needs a
+    # plaintext credential, so none is ever brought into memory.
     schema = tool.config_schema
-    raw_global = _decrypt_sensitive_fields(tool.config or {}, schema)
-    raw_agent = _decrypt_sensitive_fields(at.config if at else {}, schema)
+    raw_global = tool.config or {}
+    raw_agent = (at.config if at else {}) or {}
+    # Same precedence the runtime applies: agent override beats company default.
+    raw_merged = {**raw_global, **raw_agent}
+    merged_configured = _configured_map(raw_merged, schema)
 
-    # Mask sensitive fields in global config for display
-    masked_global = dict(raw_global)
-    sensitive_keys = _get_sensitive_keys(schema)
-    for key in sensitive_keys:
-        val = masked_global.get(key)
-        if val and isinstance(val, str) and len(val) > 0:
-            suffix = val[-4:] if len(val) > 4 else val
-            masked_global[key] = f"****{suffix}"
-
-    # Merged: agent overrides take precedence over global defaults.
-    # Use raw (non-masked) global as the base so the agent inherits actual values
-    # at runtime, but the UI will show masked_global for display hints.
-    merged = {**raw_global, **(raw_agent or {})}
     return {
-        "global_config": masked_global,
-        "agent_config": raw_agent or {},
-        "merged_config": merged,
-        "config_schema": tool.config_schema or {},
+        # Non-secret configuration only, allowlisted from the tool's schema.
+        "global_config": _project_safe_config(raw_global, schema),
+        "agent_config": _project_safe_config(raw_agent, schema),
+        "merged_config": _project_safe_config(raw_merged, schema),
+        # Configured-state booleans: a consumer learns that a credential exists
+        # without receiving any part of it, and has nothing to write back.
+        "global_config_configured": _configured_map(raw_global, schema),
+        "agent_config_configured": _configured_map(raw_agent, schema),
+        "merged_config_configured": merged_configured,
+        "credentials_configured": any(merged_configured.values()),
+        "config_schema": _safe_config_schema(schema),
     }
 
 
@@ -651,12 +834,25 @@ async def update_agent_tool_config(
     # Encrypt sensitive fields using the tool's config_schema for field type awareness
     tool_r2 = await db.execute(select(Tool).where(Tool.id == tool_id))
     tool_for_schema = tool_r2.scalar_one_or_none()
-    encrypted_config = _encrypt_sensitive_fields(data.config, tool_for_schema.config_schema if tool_for_schema else None)
+    schema = tool_for_schema.config_schema if tool_for_schema else None
 
     at_r = await db.execute(
         select(AgentTool).where(AgentTool.agent_id == agent_id, AgentTool.tool_id == tool_id)
     )
     at = at_r.scalar_one_or_none()
+
+    # Merge before encrypting. Secret inputs are write-only, so a save that omits
+    # a secret must preserve the stored credential rather than wipe it. Sending
+    # the key with null or an empty string clears it; replace_config=true (used
+    # by "remove agent override") replaces the row's config wholesale.
+    incoming = data.config or {}
+    merged = (
+        incoming
+        if data.replace_config
+        else _merge_preserving_secrets(at.config if at else {}, incoming, schema)
+    )
+    encrypted_config = _encrypt_sensitive_fields(merged, schema)
+
     if at:
         at.config = encrypted_config
     else:
@@ -672,15 +868,16 @@ async def get_agent_tools_with_config(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get agent's enabled tools with per-agent config info and config_schema for settings UI.
+    """Get agent's enabled tools with per-agent config state and config_schema for settings UI.
 
-    Both global_config and agent_config are decrypted before returning.
-    For global_config, sensitive fields are masked (e.g. "sk-****abcd") so the
-    frontend can show that a company key is configured without exposing it.
+    Credentials are never returned — not decrypted, not encrypted, not masked
+    and not placeheld. Each tool carries allowlisted non-secret configuration
+    plus ``*_configured`` boolean maps, so the UI can show that a key exists
+    without receiving any part of it and without anything to write back.
 
     Special handling: some tools (Jina) store their API key in system_settings
-    rather than Tool.config. We resolve those as part of the global config so
-    the agent-level UI can show the inherited key hint.
+    rather than Tool.config. Only the *existence* of that key is resolved, so
+    the agent-level UI can still show the inherited-key hint.
     """
     all_tools_r = await db.execute(select(Tool).where(Tool.enabled == True).order_by(Tool.category, Tool.name))
     all_tools = all_tools_r.scalars().all()
@@ -689,7 +886,9 @@ async def get_agent_tools_with_config(
 
     # Pre-fetch system_settings keys that some tools use as an alternative
     # config storage (e.g. Jina stores its API key in system_settings.jina_api_key)
-    system_keys_cache: dict[str, str] = {}
+    # Booleans only — the system-setting value is tested for presence and
+    # discarded, never retained and never returned.
+    system_keys_cache: dict[str, bool] = {}
     SYSTEM_SETTINGS_TOOL_MAP = {
         # tool_name -> system_settings key + value path
         "jina_search": ("jina_api_key", "api_key"),
@@ -706,12 +905,16 @@ async def get_agent_tools_with_config(
             continue
         enabled = at.enabled if at else t.is_default
 
-        # Decrypt configs for the frontend
-        raw_global = _decrypt_sensitive_fields(t.config or {}, t.config_schema)
+        # Values as stored, deliberately NOT decrypted — nothing here needs a
+        # plaintext credential, so none is brought into memory.
+        raw_global = t.config or {}
+        raw_agent = (at.config if at else {}) or {}
 
-        # Fallback: resolve api_key from system_settings for tools that store
-        # their key there (e.g. Jina). Only if Tool.config doesn't have it.
-        if t.name in SYSTEM_SETTINGS_TOOL_MAP and not raw_global.get("api_key"):
+        global_configured = _configured_map(raw_global, t.config_schema)
+
+        # Fallback: some tools (e.g. Jina) keep their key in system_settings
+        # rather than Tool.config. Resolve only whether one EXISTS.
+        if t.name in SYSTEM_SETTINGS_TOOL_MAP and not global_configured.get("api_key"):
             ss_key, ss_field = SYSTEM_SETTINGS_TOOL_MAP[t.name]
             if ss_key not in system_keys_cache:
                 try:
@@ -720,26 +923,18 @@ async def get_agent_tools_with_config(
                         select(SystemSetting).where(SystemSetting.key == ss_key)
                     )
                     ss = ss_r.scalar_one_or_none()
-                    system_keys_cache[ss_key] = (
-                        ss.value.get(ss_field, "") if ss and ss.value else ""
+                    system_keys_cache[ss_key] = bool(
+                        str((ss.value or {}).get(ss_field, "") if ss else "").strip()
                     )
                 except Exception:
-                    system_keys_cache[ss_key] = ""
+                    system_keys_cache[ss_key] = False
             if system_keys_cache[ss_key]:
-                raw_global["api_key"] = system_keys_cache[ss_key]
+                global_configured["api_key"] = True
 
-        raw_agent = _decrypt_sensitive_fields((at.config if at else {}) or {}, t.config_schema)
-
-        # Mask sensitive fields in global_config so users can see that a key
-        # is configured at the company level without exposing the full value.
-        masked_global = dict(raw_global)
-        sensitive_keys = _get_sensitive_keys(t.config_schema)
-        for key in sensitive_keys:
-            val = masked_global.get(key)
-            if val and isinstance(val, str) and len(val) > 0:
-                # Show "****" + last 4 chars as a hint
-                suffix = val[-4:] if len(val) > 4 else val
-                masked_global[key] = f"****{suffix}"
+        raw_merged = {**raw_global, **raw_agent}
+        merged_configured = _configured_map(raw_merged, t.config_schema)
+        if global_configured.get("api_key"):
+            merged_configured["api_key"] = True
 
         result.append({
             "id": tid,
@@ -753,9 +948,19 @@ async def get_agent_tools_with_config(
             "enabled": enabled,
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
-            "config_schema": t.config_schema or {},
-            "global_config": masked_global,
-            "agent_config": raw_agent,
+            "config_schema": _safe_config_schema(t.config_schema),
+            # Non-secret configuration only, allowlisted from the tool's schema.
+            "global_config": _project_safe_config(raw_global, t.config_schema),
+            "agent_config": _project_safe_config(raw_agent, t.config_schema),
+            # Configured-state booleans, never a value or any fragment of one.
+            "global_config_configured": global_configured,
+            "agent_config_configured": _configured_map(raw_agent, t.config_schema),
+            "merged_config_configured": merged_configured,
+            "credentials_configured": any(merged_configured.values()),
+            # Does this agent hold its own override at all? Previously the UI
+            # inferred this from a populated agent_config, which no longer
+            # carries secrets — so state it explicitly instead.
+            "has_agent_override": bool(raw_agent),
             "source": t.source,
         })
     return result
@@ -772,7 +977,18 @@ async def test_email_connection(
     data: EmailTestRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Test IMAP and SMTP email connections with provided config."""
+    """Test IMAP and SMTP email connections with the caller-supplied config only.
+
+    defect-isola-runtime-tool-config-test-email-credential-exfiltration-2026-08-06:
+    an earlier revision resolved a stored, decrypted credential server-side and
+    merged it with caller-supplied connection fields (host/port/protocol),
+    letting any caller redirect a real credential to a destination of their
+    choosing. This endpoint must never look up stored tool config or touch the
+    database — it only ever connects using exactly what the caller sent, the
+    same as before secrets became write-only. Consequently it cannot test a
+    stored-but-unretyped secret; the operator must retype the credential to
+    test it, same as testing any other still-unsaved value.
+    """
     from app.services.email_service import test_connection
 
     try:

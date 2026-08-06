@@ -1850,8 +1850,76 @@ export default function EnterpriseSettings() {
     const [mcpServerSaving, setMcpServerSaving] = useState(false);
     const [editingToolId, setEditingToolId] = useState<string | null>(null);
     const [editingConfig, setEditingConfig] = useState<Record<string, any>>({});
+    // Per-key credential presence for the open editor. Booleans only — the API
+    // returns no credential value, no mask and no fragment of one.
+    const [editingConfigured, setEditingConfigured] = useState<Record<string, boolean>>({});
 
     const [configCategory, setConfigCategory] = useState<string | null>(null);
+
+    // ── Write-only secret handling ──────────────────────────────────────────
+    // Mirrors the backend's response-side classifier so a credential-shaped key
+    // is treated as write-only even when the schema fails to declare it.
+    const SENSITIVE_NAME_PARTS = [
+        'api_key', 'apikey', 'access_token', 'refresh_token', 'auth_code',
+        'authorization', 'client_secret', 'credential', 'hmac_secret', 'passwd',
+        'password', 'private_key', 'pwd', 'secret', 'token', 'webhook_secret',
+    ];
+    const isSensitiveName = (key: string): boolean => {
+        const lowered = (key || '').trim().toLowerCase();
+        return SENSITIVE_NAME_PARTS.some(part => lowered.includes(part));
+    };
+    /** Config for an editor, with every credential-shaped key removed: a secret
+     *  input always loads blank, so nothing can be written back over storage. */
+    const withoutSecrets = (config: any): Record<string, any> => {
+        const out: Record<string, any> = {};
+        for (const [k, v] of Object.entries(config || {})) {
+            if (!isSensitiveName(k)) out[k] = v;
+        }
+        return out;
+    };
+    /** May this value for a secret field be sent? `null` yes — that is the
+     *  explicit clear. Blank/absent no (stored credential is preserved).
+     *  A boolean is configured-state and a "****" string is a legacy mask;
+     *  writing either back would destroy a valid credential. */
+    const isSubmittableSecret = (value: any): boolean => {
+        if (value === null) return true;
+        if (value === undefined || typeof value === 'boolean') return false;
+        if (typeof value !== 'string') return false;
+        const trimmed = value.trim();
+        return Boolean(trimmed) && !trimmed.startsWith('****');
+    };
+    /** Payload for a config save: non-secret values verbatim, secrets only when
+     *  the operator deliberately supplied or cleared one. */
+    const configSavePayload = (config: Record<string, any>): Record<string, any> => {
+        const payload: Record<string, any> = {};
+        for (const [k, v] of Object.entries(config || {})) {
+            if (isSensitiveName(k) && !isSubmittableSecret(v)) continue;
+            payload[k] = v;
+        }
+        return payload;
+    };
+    /** Credential state under a secret input: whether one is stored, and the
+     *  explicit action that removes it. Leaving the input blank keeps the
+     *  stored value; only this button sends the null that clears it. */
+    const renderSecretState = (key: string) => {
+        if (!editingConfigured?.[key]) return null;
+        const pendingClear = editingConfig[key] === null;
+        return (
+            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span>{pendingClear
+                    ? t('enterprise.tools.credentialWillBeCleared', 'Credential will be removed when you save')
+                    : t('enterprise.tools.credentialConfigured', 'Credential configured — leave blank to keep it')}</span>
+                <button type="button" className="btn btn-ghost"
+                    style={{ fontSize: '11px', padding: '0 4px', color: pendingClear ? undefined : 'var(--error)' }}
+                    onClick={() => setEditingConfig(p => {
+                        if (pendingClear) { const next = { ...p }; delete next[key]; return next; }
+                        return { ...p, [key]: null };
+                    })}>
+                    {pendingClear ? t('common.undo', 'Undo') : t('enterprise.tools.clearCredential', 'Clear')}
+                </button>
+            </div>
+        );
+    };
 
     // Category-level config schemas: tools sharing the same key have config on category header
     const GLOBAL_CATEGORY_CONFIG_SCHEMAS: Record<string, { title: string; fields: any[] }> = {
@@ -3063,7 +3131,7 @@ export default function EnterpriseSettings() {
                                                                                     </div>
                                                                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
                                                                                         {hasOwnConfig && (
-                                                                                            <button style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }} onClick={() => { setEditingToolId(tool.id); setEditingConfig({ ...tool.config }); }}>Configure</button>
+                                                                                            <button style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }} onClick={() => { setEditingToolId(tool.id); setEditingConfig(withoutSecrets(tool.config)); setEditingConfigured(tool.config_configured || {}); }}>Configure</button>
                                                                                         )}
                                                                                         <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: '11px' }} onClick={async () => {
                                                                                             if (!confirm(`${t('common.delete')} ${tool.display_name}?`)) return;
@@ -3104,12 +3172,17 @@ export default function EnterpriseSettings() {
                                                                     onClick={() => {
                                                                         setConfigCategory(category);
                                                                         setEditingConfig({});
-                                                                        // Load existing global config from the first tool in this category that has a non-empty config.
+                                                                        setEditingConfigured({});
+                                                                        // Load existing global config from the first tool in this category that has
+                                                                        // non-empty config or a configured credential.
                                                                         // Do NOT require config_schema — some categories (e.g. AgentBay)
                                                                         // define their schema only in frontend CATEGORY_CONFIG_SCHEMAS.
-                                                                        const firstToolWithConfig = (catTools as any[]).find((tl: any) => tl.config && Object.keys(tl.config).length > 0);
-                                                                        if (firstToolWithConfig?.config) {
-                                                                            setEditingConfig({ ...firstToolWithConfig.config });
+                                                                        const firstToolWithConfig = (catTools as any[]).find((tl: any) =>
+                                                                            (tl.config && Object.keys(tl.config).length > 0) || tl.credentials_configured);
+                                                                        if (firstToolWithConfig) {
+                                                                            // Non-secret values only: a secret input loads blank.
+                                                                            setEditingConfig(withoutSecrets(firstToolWithConfig.config));
+                                                                            setEditingConfigured(firstToolWithConfig.config_configured || {});
                                                                         }
                                                                     }}
                                                                     style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
@@ -3159,7 +3232,7 @@ export default function EnterpriseSettings() {
                                                                                         {tool.type === 'mcp' ? 'MCP' : 'Built-in'}
                                                                                     </span>
                                                                                     {tool.is_default && <span style={{ fontSize: '10px', background: 'rgba(0,200,100,0.15)', color: 'var(--success)', borderRadius: '4px', padding: '1px 5px' }}>Default</span>}
-                                                                                    {tool.config && Object.keys(tool.config).length > 0 && (
+                                                                                    {((tool.config && Object.keys(tool.config).length > 0) || tool.credentials_configured) && (
                                                                                         <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>{t('enterprise.tools.configured', 'Configured')}</span>
                                                                                     )}
                                                                                 </div>
@@ -3178,16 +3251,16 @@ export default function EnterpriseSettings() {
                                                                                     title={t('enterprise.tools.configureSettings', 'Configure settings')}
                                                                                     onClick={async () => {
                                                                                         setEditingToolId(tool.id);
-                                                                                        const cfg = { ...tool.config };
+                                                                                        // Non-secret values only. The stored key is never
+                                                                                        // pre-filled — a secret input is write-only, so a
+                                                                                        // blank field means "keep what is stored".
+                                                                                        const cfg = withoutSecrets(tool.config);
+                                                                                        const configured: Record<string, boolean> = { ...(tool.config_configured || {}) };
                                                                                         if (tool.name === 'jina_search' || tool.name === 'jina_read') {
-                                                                                            try {
-                                                                                                const token = localStorage.getItem('token');
-                                                                                                const res = await fetch('/api/enterprise/system-settings/jina_api_key', { headers: { Authorization: `Bearer ${token}` } });
-                                                                                                const d = await res.json();
-                                                                                                if (d.value?.api_key) cfg.api_key = d.value.api_key;
-                                                                                            } catch { }
+                                                                                            configured.api_key = Boolean(configured.api_key || tool.credentials_configured);
                                                                                         }
                                                                                         setEditingConfig(cfg);
+                                                                                        setEditingConfigured(configured);
                                                                                     }}
                                                                                 >
                                                                                     ⚙️ {t('enterprise.tools.configure')}
@@ -3362,8 +3435,11 @@ export default function EnterpriseSettings() {
                                                                 <input type="number" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} min={field.min} max={field.max}
                                                                     onChange={e => setEditingConfig(p => ({ ...p, [field.key]: Number(e.target.value) }))} />
                                                             ) : field.type === 'password' ? (
-                                                                <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
-                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                <>
+                                                                    <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
+                                                                        onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                    {renderSecretState(field.key)}
+                                                                </>
                                                             ) : (
                                                                 <input type="text" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''}
                                                                     onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
@@ -3384,7 +3460,9 @@ export default function EnterpriseSettings() {
                                                                 });
                                                             }
                                                         } else {
-                                                            await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig }) });
+                                                            // Untouched secret inputs are omitted, so the stored
+                                                            // credential survives an edit to non-secret settings.
+                                                            await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ config: configSavePayload(editingConfig) }) });
                                                         }
                                                         setEditingToolId(null);
                                                         loadAllTools();
@@ -3413,8 +3491,11 @@ export default function EnterpriseSettings() {
                                                 <div key={field.key}>
                                                     <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{field.label}</label>
                                                     {field.type === 'password' ? (
-                                                        <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
-                                                            onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                        <>
+                                                            <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
+                                                                onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                            {renderSecretState(field.key)}
+                                                        </>
                                                     ) : field.type === 'select' ? (
                                                         <select className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))}>
                                                             {(field.options || []).map((o: any) => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -3433,7 +3514,9 @@ export default function EnterpriseSettings() {
                                                     // get_category_config endpoint reads it back.
                                                     const catTools = allTools.filter((tl: any) => (tl.category || 'general') === configCategory);
                                                     if (catTools.length > 0) {
-                                                        await fetchJson(`/tools/${catTools[0].id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig }) });
+                                                        // Untouched secret inputs are omitted, so the stored
+                                                        // credential survives an edit to non-secret settings.
+                                                        await fetchJson(`/tools/${catTools[0].id}`, { method: 'PUT', body: JSON.stringify({ config: configSavePayload(editingConfig) }) });
                                                     }
                                                     setConfigCategory(null);
                                                     loadAllTools();
