@@ -624,6 +624,124 @@ async def test_a_mask_can_no_longer_be_produced_or_written_back(admin_user):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# D2. WRITE PATH — storage does not inherit the response projection's blindness
+# ═══════════════════════════════════════════════════════════════════════════
+# defect-isola-runtime-tool-config-schema-empty-config-data-loss-2026-08-06
+#
+# _project_safe_config is fail-closed and legitimately returns {} when a
+# tool's config_schema is absent, empty or malformed — true for 91/110 seeded
+# tools and every MCP tool app/services/resource_discovery.py creates. That
+# empty READ view must never be read as "the STORED config should become
+# empty": a save must start from the stored config and change only the keys
+# actually submitted, independent of whatever the response side could show.
+
+
+@pytest.mark.parametrize("empty_schema", [None, {}, {"fields": []}])
+async def test_empty_schema_tool_preserves_everything_on_an_ordinary_save(admin_user, empty_schema):
+    """The exact bug: a tool with no usable config_schema loses its stored
+    config on a save, because the read-side allowlist showed the UI nothing.
+
+    Malformed-but-non-empty schema shapes (e.g. ``{"fields": "nonsense"}``) are
+    deliberately excluded here: they exercise a separate, pre-existing gap in
+    the untouched storage-side ``_encrypt_sensitive_fields``/``_get_sensitive_keys``
+    (which lacks the response-side functions' fail-closed try/except), not the
+    write-merge bug this test targets.
+    """
+    secrets = synthetic_secrets()
+    stored = tools_api._encrypt_sensitive_fields(
+        {"api_key": secrets["api_key"], "os_type": "linux", "region": "us-east"}, empty_schema
+    )
+    tool = make_tool(dict(stored), schema=empty_schema)
+    original_ciphertext = tool.config["api_key"]
+
+    # Prove the premise: the read side really does show nothing for this tool.
+    read = await tools_api.get_agent_tool_config(
+        uuid.uuid4(), tool.id, current_user=admin_user,
+        db=FakeDB(DummyResult(tool), DummyResult(None)),
+    )
+    assert read["global_config"] == {}, "fixture must exercise the fail-closed empty projection"
+
+    # The UI's natural no-op save echoes exactly what it was shown to have: nothing.
+    await tools_api.update_tool(
+        tool.id, tools_api.ToolUpdate(config={}),
+        current_user=admin_user, db=FakeDB(DummyResult(tool)),
+    )
+
+    assert tool.config["api_key"] == original_ciphertext, "a credential was lost under an empty schema"
+    assert tool.config["os_type"] == "linux", "non-secret config was lost under an empty schema"
+    assert tool.config["region"] == "us-east", "an unknown-to-the-schema key was lost"
+
+
+async def test_smithery_mcp_tool_config_survives_a_save():
+    """Regression for the exact shape resource_discovery.py writes: an MCP tool
+    with no config_schema holding non-secret Smithery routing fields alongside
+    an encrypted api_key."""
+    secrets = synthetic_secrets()
+    stored = tools_api._encrypt_sensitive_fields(
+        {
+            "api_key": secrets["smithery_api_key"],
+            "smithery_namespace": "epic-namespace",
+            "smithery_connection_id": "conn-123",
+        },
+        None,
+    )
+    merged = tools_api._merge_preserving_secrets(
+        stored, {"smithery_namespace": "epic-namespace-renamed"}, None
+    )
+    assert merged["smithery_connection_id"] == "conn-123", "smithery_connection_id was dropped"
+    assert merged["smithery_namespace"] == "epic-namespace-renamed"
+    assert merged["api_key"] == stored["api_key"], "the encrypted api_key was disturbed"
+
+
+async def test_agentbay_os_type_survives_an_unrelated_field_update(admin_user):
+    """22 of 23 agentbay tools declare no schema field for os_type at all — a
+    save touching a different field must not silently revert it."""
+    tool = make_tool({"os_type": "linux", "region": "us-west"}, schema=None, name="agentbay_tool_no_schema")
+
+    await tools_api.update_tool(
+        tool.id, tools_api.ToolUpdate(config={"region": "eu-central"}),
+        current_user=admin_user, db=FakeDB(DummyResult(tool)),
+    )
+
+    assert tool.config["os_type"] == "linux", "os_type silently reverted"
+    assert tool.config["region"] == "eu-central"
+
+
+async def test_blank_secret_and_explicit_clear_still_behave_correctly_under_an_empty_schema(admin_user):
+    """The secret write-only semantics (omit=preserve, null=clear, value=replace)
+    must hold even when config_schema can't drive the read-side allowlist —
+    _response_secret_keys' name-based fallback is what makes this possible."""
+    secrets = synthetic_secrets()
+    stored = tools_api._encrypt_sensitive_fields({"api_key": secrets["api_key"], "os_type": "linux"}, None)
+    tool = make_tool(dict(stored), schema=None)
+    original_ciphertext = tool.config["api_key"]
+
+    # Omitted secret: preserved.
+    await tools_api.update_tool(
+        tool.id, tools_api.ToolUpdate(config={"os_type": "windows"}),
+        current_user=admin_user, db=FakeDB(DummyResult(tool)),
+    )
+    assert tool.config["api_key"] == original_ciphertext
+    assert tool.config["os_type"] == "windows"
+
+    # Explicit clear: removes only the targeted secret, nothing else.
+    await tools_api.update_tool(
+        tool.id, tools_api.ToolUpdate(config={"api_key": None}),
+        current_user=admin_user, db=FakeDB(DummyResult(tool)),
+    )
+    assert "api_key" not in tool.config
+    assert tool.config["os_type"] == "windows", "an unrelated key was destroyed by an explicit clear"
+
+
+def test_merge_starts_from_stored_not_from_incoming():
+    """Direct unit test of the corrected merge semantics."""
+    stored = {"api_key": "cipher", "keep_me": "value", "os_type": "linux"}
+    merged = tools_api._merge_preserving_secrets(stored, {"os_type": "windows"}, None)
+    assert merged == {"api_key": "cipher", "keep_me": "value", "os_type": "windows"}
+    assert merged["keep_me"] == "value", "an omitted, undeclared, non-secret key must survive"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # E. RUNTIME COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -755,30 +873,72 @@ async def test_repr_of_the_response_is_clean(admin_user):
     assert_no_credentials(repr(out), secrets)
 
 
-async def test_connectivity_test_never_returns_a_resolved_credential(monkeypatch, admin_user):
-    """The email tester resolves a stored secret server-side; a provider error
-    that quotes it must still not reach the client."""
-    secrets = synthetic_secrets()
-    tool = make_tool({"os_type": "linux"}, name="email_send")
+async def test_test_email_never_touches_the_database_or_tool_storage(admin_user, monkeypatch):
+    """defect-isola-runtime-tool-config-test-email-credential-exfiltration-2026-08-06.
 
-    async def _fake_runtime_config(_agent_id, _tool_name):
-        return {"password": secrets["password"], "imap_host": "imap.example.com"}
+    An earlier revision resolved a stored, decrypted credential server-side and
+    merged it with caller-supplied host/port fields, letting a caller redirect a
+    real credential to a destination of their choosing. The endpoint must never
+    resolve stored config at all: it takes no ``db`` dependency, no longer
+    accepts ``agent_id``/``tool_id``, and never calls into runtime config
+    resolution — proven here by making that call raise if it is ever reached.
+    """
+    import inspect
+
+    sig = inspect.signature(tools_api.test_email_connection)
+    assert "db" not in sig.parameters, "must not depend on the database at all"
+    assert set(tools_api.EmailTestRequest.model_fields) == {"config"}, (
+        "agent_id/tool_id must not exist on this request model"
+    )
+
+    async def _must_not_be_called(*_args, **_kwargs):
+        raise AssertionError("test-email must never resolve stored tool config")
+
+    monkeypatch.setattr(agent_tools_svc, "_get_tool_config", _must_not_be_called)
 
     async def _fake_test(config):
-        # A real provider commonly echoes the rejected credential.
-        return {"ok": False, "error": f"auth failed for {config['password']}"}
+        return {"ok": True, "imap": "connected", "smtp": "connected", "_seen": config}
 
-    monkeypatch.setattr(agent_tools_svc, "_get_tool_config", _fake_runtime_config)
     monkeypatch.setattr("app.services.email_service.test_connection", _fake_test)
 
     result = await tools_api.test_email_connection(
-        tools_api.EmailTestRequest(config={}, agent_id=uuid.uuid4(), tool_id=tool.id),
+        tools_api.EmailTestRequest(config={"imap_host": "caller.example.com"}),
         current_user=admin_user,
-        db=FakeDB(DummyResult(tool)),
     )
+    assert result["_seen"] == {"imap_host": "caller.example.com"}
 
-    assert secrets["password"] not in render(result)
-    assert "[redacted]" in result["error"]
+
+async def test_test_email_config_is_exactly_what_the_caller_sent(admin_user, monkeypatch):
+    """No server-side value is ever merged in — the caller-supplied dict is the
+    entire connection config, byte for byte. This is what makes host/port/
+    protocol manipulation harmless: there is nothing server-side to redirect."""
+    secrets = synthetic_secrets()
+    payload = {
+        "imap_host": "attacker.example.com", "imap_port": 993,
+        "smtp_host": "attacker.example.com", "smtp_port": 465,
+        "password": secrets["password"],  # the caller's OWN value, not a stored one
+    }
+    seen = {}
+
+    async def _fake_test(config):
+        seen.update(config)
+        return {"ok": True}
+
+    monkeypatch.setattr("app.services.email_service.test_connection", _fake_test)
+
+    await tools_api.test_email_connection(
+        tools_api.EmailTestRequest(config=payload), current_user=admin_user,
+    )
+    assert seen == payload, "the endpoint augmented the caller's config with server-side data"
+
+
+# A genuine negative control for this class (temporarily reintroducing the
+# resolution behavior in app/api/tools.py itself and confirming the two tests
+# above fail, then reverting) was run manually and is recorded in Port
+# evidence, matching how the rest of this suite's negative controls are
+# performed — not as a permanently committed test, since that would require
+# either duplicating the vulnerable handler here (testing a fiction) or
+# runtime-patching the real handler's source (fragile and unreadable).
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -681,10 +681,11 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                         const res = await fetch('/api/tools/test-email', {
                                                             method: 'POST',
                                                             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                                                            // Secret inputs are write-only, so a stored credential
-                                                            // the operator did not retype is resolved server-side
-                                                            // from this tool context rather than sent from here.
-                                                            body: JSON.stringify({ config: configData, agent_id: agentId, tool_id: configTool?.id }),
+                                                            // Secret inputs are write-only: this endpoint never
+                                                            // resolves a stored credential server-side (that was a
+                                                            // credential-exfiltration vector), so testing a
+                                                            // stored-but-unretyped secret requires retyping it here.
+                                                            body: JSON.stringify({ config: configData }),
                                                         });
                                                         const data = await res.json();
                                                         if (status) {

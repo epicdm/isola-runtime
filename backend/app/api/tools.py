@@ -206,59 +206,44 @@ def _safe_config_schema(config_schema: dict | None) -> dict:
     return out
 
 
-def _redact_values(payload, values) -> object:
-    """Remove specific credential values from anything about to be returned.
-
-    A provider's error string is outside this module's control and can quote the
-    credential it rejected. Nothing that was resolved server-side for a
-    connectivity test may travel back out, so those exact values are stripped
-    from every string in the payload.
-    """
-    targets = [v for v in (values or []) if isinstance(v, str) and len(v) >= 4]
-    if not targets:
-        return payload
-    if isinstance(payload, str):
-        for value in targets:
-            payload = payload.replace(value, "[redacted]")
-        return payload
-    if isinstance(payload, dict):
-        return {k: _redact_values(v, targets) for k, v in payload.items()}
-    if isinstance(payload, list):
-        return [_redact_values(v, targets) for v in payload]
-    return payload
-
-
 def _merge_preserving_secrets(
     stored: dict | None,
     incoming: dict | None,
     config_schema: dict | None,
 ) -> dict:
-    """Apply an incoming config without destroying an omitted credential.
+    """Apply an incoming *partial* config without destroying anything omitted.
 
-    Secrets are write-only now: the API no longer returns them, so a client
-    cannot echo one back and an omitted secret key must mean "unchanged" rather
-    than "delete". Explicit removal stays available — send the key with ``null``
-    or an empty string — which is a deliberate act distinct from leaving an
-    input blank, because a blank secret input is omitted from the payload
-    entirely. Callers that genuinely want a wholesale replacement pass
-    ``replace_config=true``.
+    defect-isola-runtime-tool-config-schema-empty-config-data-loss-2026-08-06:
+    response safety and storage semantics are independent. ``_project_safe_config``
+    is fail-closed and may legitimately show the caller ``{}`` when a tool's
+    ``config_schema`` is absent, empty or malformed — most seeded tools and every
+    MCP tool created by ``resource_discovery.py`` are in exactly this state. That
+    empty *view* must never be read as "the stored config should become empty":
+    a save starts from the STORED config, and only the keys the caller actually
+    submitted are changed. Every omitted key — secret or not — survives.
 
-    A preserved value is carried across exactly as stored (ciphertext stays
-    ciphertext); ``_encrypt_sensitive_fields`` recognises it and leaves it
-    alone.
+    Secrets are additionally write-only: the API never returns them, so a
+    client cannot echo one back and a submitted secret key is always a
+    deliberate act. Sending it as ``null``/blank explicitly clears it (distinct
+    from omitting it, which is "unchanged"); sending a real value replaces it.
+    Non-secret keys the caller submits are written verbatim — clearing a
+    non-secret field is an ordinary value change, not a delete.
+
+    Callers that genuinely want a wholesale replacement pass
+    ``replace_config=true``, which bypasses this function entirely.
     """
     stored = stored if isinstance(stored, dict) else {}
     incoming = incoming if isinstance(incoming, dict) else {}
     secret_keys = _response_secret_keys(config_schema, {**stored, **incoming})
-    result = dict(incoming)
-    for key in secret_keys:
-        if key not in incoming:
-            if key in stored:
-                result[key] = stored[key]
-            continue
-        value = incoming[key]
-        if value is None or (isinstance(value, str) and not value.strip()):
-            result.pop(key, None)  # explicit clear
+    result = dict(stored)
+    for key, value in incoming.items():
+        if key in secret_keys:
+            if value is None or (isinstance(value, str) and not value.strip()):
+                result.pop(key, None)  # explicit clear
+            else:
+                result[key] = value  # deliberate replacement
+        else:
+            result[key] = value  # ordinary non-secret update
     return result
 
 
@@ -985,53 +970,32 @@ async def get_agent_tools_with_config(
 
 class EmailTestRequest(BaseModel):
     config: dict
-    # Optional context. Secret inputs are write-only, so the client can no
-    # longer echo back a credential it was never given; with these the stored
-    # credential is resolved server-side for the connection attempt instead.
-    agent_id: uuid.UUID | None = None
-    tool_id: uuid.UUID | None = None
 
 
 @router.post("/test-email")
 async def test_email_connection(
     data: EmailTestRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
 ):
-    """Test IMAP and SMTP email connections.
+    """Test IMAP and SMTP email connections with the caller-supplied config only.
 
-    When ``tool_id`` is supplied, the baseline is whatever the agent runtime
-    would itself resolve for that tool — the same merge and the same decryption,
-    through ``app/services/agent_tools._get_tool_config``. Values the operator
-    actually typed are layered on top. Nothing resolved here is returned: any
-    credential that would otherwise surface through a provider error string is
-    redacted before the response leaves this function.
+    defect-isola-runtime-tool-config-test-email-credential-exfiltration-2026-08-06:
+    an earlier revision resolved a stored, decrypted credential server-side and
+    merged it with caller-supplied connection fields (host/port/protocol),
+    letting any caller redirect a real credential to a destination of their
+    choosing. This endpoint must never look up stored tool config or touch the
+    database — it only ever connects using exactly what the caller sent, the
+    same as before secrets became write-only. Consequently it cannot test a
+    stored-but-unretyped secret; the operator must retype the credential to
+    test it, same as testing any other still-unsaved value.
     """
     from app.services.email_service import test_connection
 
-    typed = {k: v for k, v in (data.config or {}).items() if v not in ("", None)}
-    config = dict(typed)
-    resolved: list[str] = []
-
-    if data.tool_id is not None:
-        tool_r = await db.execute(select(Tool).where(Tool.id == data.tool_id))
-        tool = tool_r.scalar_one_or_none()
-        if tool:
-            from app.services.agent_tools import _get_tool_config
-
-            runtime_config = await _get_tool_config(data.agent_id, tool.name) or {}
-            config = {**runtime_config, **typed}
-            resolved = [
-                value
-                for key, value in runtime_config.items()
-                if _is_sensitive_name(key) and isinstance(value, str) and len(value) >= 4
-            ]
-
     try:
-        result = await test_connection(config)
+        result = await test_connection(data.config)
+        return result
     except Exception as e:
-        result = {"ok": False, "error": str(e)[:300]}
-    return _redact_values(result, resolved)
+        return {"ok": False, "error": str(e)[:300]}
 
 
 @router.get("/email-providers")
