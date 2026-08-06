@@ -99,12 +99,46 @@ control, two independent non-prompt controls also apply: (1) a capability
 whose tool name is not already in `effective_tool_names` is rejected
 before the idempotency claim, so it can never reach the model regardless
 of what the model does; (2) any raw capability value that reappears
-verbatim in the settled customer-facing reply is redacted before this
-route returns it, independent of model cooperation. Foundation remains
-the sole authority that validates, claims and consumes the opaque value —
-this file never inspects, decodes or interprets it, and never persists it
-outside the existing `runtime_instruction` snapshot the identity directive
-already uses (no new table, no new column, no migration).
+verbatim in the customer-facing reply is redacted IN THE STORED MESSAGE
+before this route settles the claim, independent of model cooperation.
+
+WHERE THE RAW VALUE ACTUALLY GOES (corrected 2026-08-06 after the
+independent exact-head review of the first head, `dec-pr42-capability
+-sanitizer-and-replay-binding-2026-08-06`). The earlier claim that this
+file "never persists it outside the existing `runtime_instruction`
+snapshot" described only what THIS file writes. It was not an accurate
+description of the delivered mechanism, because the whole point of the
+directive is that the model then attaches the value as a tool argument.
+The accurate contract is:
+
+* the raw value MAY be present in protected runtime/model/tool-call
+  context — the `runtime_instruction` snapshot on the run's initial
+  input, the model request, and the model's own tool call. That is the
+  tolerated surface named in the governing decision, and it is protected
+  by short expiry plus Foundation's one-use atomic claim;
+* the SHARED tool-argument sanitizer removes it from every ordinary
+  projection: `AgentToolExecution.sanitized_arguments`, every
+  `AgentRunEvent.payload["args"]` insertion, and therefore the web-chat
+  run-event stream. That is why `operationcapability` is a member of
+  `_SENSITIVE_KEYS` in `app/services/agent_runtime/tool_execution.py` —
+  the single, separately authorized shared-runtime change;
+* a settled customer reply is redacted BEFORE it is persisted and before
+  the claim is marked completed, so the stored reply is already safe at
+  rest and an idempotent replay never has to resupply the capability
+  list in order to be safe;
+* the policy/idempotency digest stores only a one-way, domain-separated
+  SHA-256 fingerprint of the raw value — never the value itself;
+* Foundation remains the sole authority that validates, claims and
+  consumes the opaque value. This file never inspects, decodes or
+  interprets it, and adds no table, column or migration.
+
+KNOWN RESIDUAL, deliberately NOT fixed here because it is outside the
+narrow shared-runtime authorization: if the model disobeys the directive
+and echoes a raw capability into its assistant text, that text also
+reaches `assistant_progress` run-event payloads written by
+`checkpoint_side_effects.py` and `tool_step_service.py`. Redacting those
+would require editing further core runtime files. Recorded rather than
+silently widened — see the Port defect record.
 """
 
 from __future__ import annotations
@@ -174,6 +208,15 @@ _MAX_RESPONSE_DEADLINE_MS = 90_000
 _MAX_TOOL_CAPABILITIES = 8
 CAPABILITY_CONTRACT_VERSION = "1.0.0"
 CAPABILITY_ARGUMENT_NAME = "operation_capability"
+# Fixed domain separator for the one-way capability fingerprint that binds
+# a capability set into the idempotency/policy digest without ever storing
+# the raw value (dec-pr42-capability-sanitizer-and-replay-binding
+# -2026-08-06). Kept as bytes with an explicit NUL terminator so the
+# separator can never run into attacker-influenced input.
+_CAPABILITY_FINGERPRINT_DOMAIN = b"isola-operation-capability-v1\x00"
+# Marker written over a raw capability that the model echoed into the
+# customer-facing reply. Must match `_redact_capabilities`.
+_CAPABILITY_REDACTION_MARKER = "[redacted-capability]"
 # Same poll shape as isola_bridge.py's synchronous /message route, so both
 # routes give Foundation the same latency profile for the same underlying
 # work. Both stay comfortably under Foundation's DEFAULT_RESPONSE_DEADLINE_MS
@@ -389,6 +432,23 @@ _UPDATE_ENQUEUED_SQL = text(
     """
 )
 
+# Settle-time redaction of the stored customer-facing reply
+# (dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06). Narrowly
+# scoped to the ONE assistant message this run is durably on record as
+# having delivered — the id comes from `read_run_owned_reply`, which has
+# already proved run/session/agent/user ownership for it. Run in the same
+# transaction as, and BEFORE, the terminal claim update, so the claim can
+# never be marked `completed` while the raw value is still at rest.
+_REDACT_STORED_REPLY_SQL = text(
+    """
+    UPDATE chat_messages
+       SET content = :content
+     WHERE id = :id
+       AND role = 'assistant'
+       AND content = :expected_content
+    """
+)
+
 _UPDATE_TERMINAL_SQL = text(
     """
     UPDATE isola_structured_bridge_requests
@@ -471,22 +531,76 @@ async def _resolve_effective_tool_names(
     return effective, unsupported
 
 
-def _tool_policy_digest(effective_tool_names: list[str]) -> str:
+def _capability_fingerprint(raw_capability: str) -> str:
+    """One-way, domain-separated SHA-256 fingerprint of a raw capability
+    (dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06).
+
+    The digest identity below has to be able to say "the same capability"
+    without the raw value ever being stored, logged or persisted. The
+    fixed domain separator keeps this hash space disjoint from any other
+    SHA-256 use in the codebase, so a value fingerprinted here can never
+    be mistaken for — or replayed against — a hash produced elsewhere.
+
+    This supplies REPLAY IDENTITY ONLY. It is not validation: Foundation
+    remains authoritative for the token's authenticity, expiry, tenant,
+    agent, tool and object scope and its atomic one-use claim.
+    """
+    return hashlib.sha256(
+        _CAPABILITY_FINGERPRINT_DOMAIN + raw_capability.encode("utf-8")
+    ).hexdigest()
+
+
+def _capability_binding(capabilities: list[ToolCapabilityIn]) -> list[list[str]]:
+    """Canonical, raw-free description of the turn's capability set, in a
+    stable order, for inclusion in the policy/idempotency digest.
+
+    Per capability: exact tool name, contract version, the normalized
+    expiry metadata this bridge actually acted on (empty string when
+    absent, so "no expiry supplied" and "expiry supplied" are
+    distinguishable), and the one-way fingerprint. Sorted by exact tool
+    name — duplicates are already rejected upstream by
+    `_validate_tool_capabilities`, so tool name is a total order here.
+    """
+    return sorted(
+        [
+            cap.tool_name,
+            cap.contract_version,
+            cap.expires_at.astimezone(UTC).isoformat() if cap.expires_at is not None else "",
+            _capability_fingerprint(cap.capability),
+        ]
+        for cap in capabilities
+    )
+
+
+def _tool_policy_digest(
+    effective_tool_names: list[str],
+    capabilities: list[ToolCapabilityIn] | None = None,
+) -> str:
     """A short, order-independent fingerprint of one turn's effective tool
-    set, stored on the idempotency claim row's first-class, NOT NULL,
-    shape-CHECKed `tool_policy_digest` column. Lets a request that
-    loses the claim detect whether it is a genuine retry of the SAME
-    turn-defining policy, or a `correlation_id` reused with a DIFFERENT
-    `allowed_tools` — which must never silently inherit another policy's
-    already-produced result.
+    set AND its capability binding, stored on the idempotency claim row's
+    first-class, NOT NULL, shape-CHECKed `tool_policy_digest` column. Lets
+    a request that loses the claim detect whether it is a genuine retry of
+    the SAME turn-defining policy, or a `correlation_id` reused with a
+    DIFFERENT `allowed_tools` or a DIFFERENT capability binding — which
+    must never silently inherit another policy's already-produced result.
 
     Canonicalized via JSON array serialization, NOT a naive comma-join:
     `Tool.name` is an unconstrained `String(100)` (app/models/tool.py),
     so a tool literally named e.g. "a,b" makes a naive `",".join(...)` of
     `["a,b", "c"]` collide with `["a", "b,c"]`. JSON's per-element quoting
     disambiguates the boundary in every such case.
+
+    An omitted capability list is a DIFFERENT policy from a supplied one
+    and must conflict rather than silently replay
+    (dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06) — that
+    is the whole point of the second element. Only raw-free fingerprints
+    enter the hash; the raw value never does.
     """
-    canonical = json.dumps(sorted(effective_tool_names), separators=(",", ":"), ensure_ascii=False)
+    canonical = json.dumps(
+        [sorted(effective_tool_names), _capability_binding(capabilities or [])],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
@@ -591,13 +705,22 @@ def _redact_capabilities(reply_text: str | None, capabilities: list[ToolCapabili
     directive is the primary control; this is a second, independent,
     non-LLM control that requires no model cooperation. Only ever narrows
     (redacts) text already produced — never used to authorize or alter
-    behaviour."""
+    behaviour.
+
+    Applied AT SETTLE TIME, to the stored `chat_messages` row, before the
+    claim is marked completed — not only on the way out of this route
+    (dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06). The
+    first head redacted only the response, which left the raw value at
+    rest and let a replay that omitted `tool_capabilities` return it
+    verbatim. Both halves of that gap are closed: the stored text is safe,
+    and a replay with a different capability binding is refused by the
+    digest check before it can read anything."""
     if reply_text is None or not capabilities:
         return reply_text
     redacted = reply_text
     for cap in capabilities:
         if cap.capability and cap.capability in redacted:
-            redacted = redacted.replace(cap.capability, "[redacted-capability]")
+            redacted = redacted.replace(cap.capability, _CAPABILITY_REDACTION_MARKER)
     return redacted
 
 
@@ -850,7 +973,13 @@ async def bridge_structured_message(
         # created.
         return cap_error
 
-    tool_policy_digest = _tool_policy_digest(effective_tool_names)
+    # Capability-aware: a retry that omits, substitutes, re-targets or
+    # re-versions a capability computes a DIFFERENT digest and is refused
+    # as `correlation_id_policy_mismatch` below, rather than inheriting
+    # the original turn's already-produced result. Only raw-free
+    # fingerprints enter the digest
+    # (dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06).
+    tool_policy_digest = _tool_policy_digest(effective_tool_names, body.tool_capabilities)
 
     won, claim_row = await _claim(
         tenant_id=tenant_id,
@@ -1087,6 +1216,15 @@ async def bridge_structured_message(
                         escalation_explanation="stored replay result failed run-owned re-validation",
                     ),
                 )
+            # The stored reply was already redacted at settle time, so this
+            # is a no-op on every well-formed replay. Kept as belt-and-
+            # braces: it costs one substring scan and it is the only thing
+            # standing between a customer and a raw capability if the
+            # settle-time UPDATE were ever skipped. It is NO LONGER the
+            # primary control, and it can no longer be disabled by a
+            # retry that omits `tool_capabilities` -- such a retry now
+            # fails the capability-aware digest check above and never
+            # reaches here.
             return JSONResponse(
                 status_code=200,
                 content=_envelope(
@@ -1154,7 +1292,28 @@ async def bridge_structured_message(
     if reply is not None:
         # terminal_message_id is read from the SAME run-owned reply object
         # whose text is returned below -- never a second, independent query.
+        settled_reply = _redact_capabilities(reply.content, body.tool_capabilities)
         async with async_session() as db:
+            if settled_reply != reply.content:
+                # The model disobeyed the directive and echoed a raw
+                # capability. Overwrite it AT REST first, in the same
+                # transaction and strictly before the claim is marked
+                # completed, so no replay -- and no other reader of
+                # chat_messages -- can ever see the raw value. Guarded on
+                # the exact expected content so a concurrent duplicate
+                # that already redacted this row is a no-op rather than a
+                # lost update. Every request that reaches this point
+                # carries the SAME capability binding (the digest check
+                # above rejects any other), so both racers compute the
+                # identical replacement.
+                await db.execute(
+                    _REDACT_STORED_REPLY_SQL,
+                    {
+                        "id": str(reply.message_id),
+                        "content": settled_reply,
+                        "expected_content": reply.content,
+                    },
+                )
             await db.execute(
                 _UPDATE_TERMINAL_SQL,
                 {
@@ -1174,7 +1333,7 @@ async def bridge_structured_message(
                 session_id=session_id,
                 correlation_id=correlation_id,
                 tenant_id=tenant_id,
-                customer_reply=_redact_capabilities(reply.content, body.tool_capabilities),
+                customer_reply=settled_reply,
                 confidence=1.0,
                 latency_ms=latency_ms,
             ),

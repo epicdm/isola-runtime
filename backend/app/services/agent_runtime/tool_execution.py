@@ -159,6 +159,16 @@ _SENSITIVE_KEYS = frozenset(
         "xgoogsignature",
         "xgoogcredential",
         "xgoogsecuritytoken",
+        # Foundation-minted, single-use, per-turn operation capability
+        # carried as an MCP tool argument named `operation_capability`
+        # (dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06).
+        # It is a live authorization credential, so it must never survive
+        # into `AgentToolExecution.sanitized_arguments`, an
+        # `AgentRunEvent.payload["args"]` projection, or the web-chat run
+        # event stream. `_sensitive_key` matches the EXACT normalized key
+        # only — deliberately, so neighbouring non-credential fields such
+        # as `operation_capability_hint` are untouched.
+        "operationcapability",
     }
 )
 _SECRET_ASSIGNMENT_RE = re.compile(
