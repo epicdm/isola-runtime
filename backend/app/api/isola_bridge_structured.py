@@ -73,6 +73,38 @@ DESIGN
   `running` state, so a retried request with the identical `correlation_id`
   finds the SAME claim and waits for the SAME run rather than starting a
   second one.
+
+TOOL CAPABILITY CARRIER (`dec-revenue-mcp-turn-capability-no-clawith-core
+-fork-2026-08-06`)
+--------------------------------------------------------------------------
+An optional `tool_capabilities` list carries Foundation-minted, opaque,
+single-use, per-turn operation capabilities (NOT identity). Each entry is
+bound 1:1 to a tool name that is already a member of THIS turn's
+`effective_tool_names` — the same intersection `allowed_tools` above
+already computes and the same set `tool_step_service` already enforces
+unconditionally at execution time. A capability can therefore only ever
+NARROW what this turn's model is told to attach where; it cannot expand
+the effective tool set, select a tenant/agent/actor, or move to a
+different tool. The shared `X-Isola-Secret` bearer above remains
+transport/service authentication only and is never treated as Atlas (or
+any other) identity — capabilities are the only per-operation authority
+this file forwards.
+
+Delivered through the SAME `runtime_instruction` channel the identity
+directive above already uses (no new seam, no core-runtime file touched):
+the model is told, per capability, to attach the exact opaque value as a
+named argument on that exact tool call and never disclose it elsewhere.
+Because that is a prompt instruction and not, by itself, a technical
+control, two independent non-prompt controls also apply: (1) a capability
+whose tool name is not already in `effective_tool_names` is rejected
+before the idempotency claim, so it can never reach the model regardless
+of what the model does; (2) any raw capability value that reappears
+verbatim in the settled customer-facing reply is redacted before this
+route returns it, independent of model cooperation. Foundation remains
+the sole authority that validates, claims and consumes the opaque value —
+this file never inspects, decodes or interprets it, and never persists it
+outside the existing `runtime_instruction` snapshot the identity directive
+already uses (no new table, no new column, no migration).
 """
 
 from __future__ import annotations
@@ -132,6 +164,16 @@ _MAX_HISTORY_TURNS = 20
 _MAX_KNOWLEDGE_SCOPE_IDS = 16
 _MAX_ALLOWED_TOOLS = 24
 _MAX_RESPONSE_DEADLINE_MS = 90_000
+
+# Tool capability carrier (dec-revenue-mcp-turn-capability-no-clawith-core
+# -fork-2026-08-06). CAPABILITY_ARGUMENT_NAME is the Foundation-side MCP
+# tool-schema argument name this file instructs the model to attach an
+# opaque capability value to — Foundation's provider-side tool schemas for
+# `isola_revenue_customer_context_get` / `isola_revenue_followup_set` MUST
+# accept an argument with this exact name for the carrier to reach it.
+_MAX_TOOL_CAPABILITIES = 8
+CAPABILITY_CONTRACT_VERSION = "1.0.0"
+CAPABILITY_ARGUMENT_NAME = "operation_capability"
 # Same poll shape as isola_bridge.py's synchronous /message route, so both
 # routes give Foundation the same latency profile for the same underlying
 # work. Both stay comfortably under Foundation's DEFAULT_RESPONSE_DEADLINE_MS
@@ -175,6 +217,36 @@ class ClawithToolDefinitionIn(BaseModel):
     mutating: bool
 
 
+class ToolCapabilityIn(BaseModel):
+    """One Foundation-minted, opaque, single-use, tool-bound turn
+    capability (dec-revenue-mcp-turn-capability-no-clawith-core-fork
+    -2026-08-06). Opaque to Clawith: this repo never inspects, decodes,
+    stores or interprets `capability`'s contents — it only binds the value
+    1:1 to an already-effective tool name and forwards it. `extra="forbid"`
+    means a caller-supplied `agentRef`, `actorType`, tenant id or any other
+    field is a 422 validation error, not a silently-ignored extra key —
+    this model has no field through which caller-selected identity or
+    authority can enter."""
+
+    model_config = ConfigDict(extra="forbid")
+    tool_name: str = Field(min_length=1, max_length=200)
+    capability: str = Field(min_length=1, max_length=4_096)
+    contract_version: str = Field(min_length=1, max_length=40)
+    # Display/validation only, never authoritative — Foundation alone
+    # enforces real expiry at claim time. A blatantly pre-expired value is
+    # rejected here purely to avoid wasting a Run on a request that can
+    # never be honored.
+    expires_at: datetime | None = None
+
+    @field_validator("tool_name", "capability", "contract_version")
+    @classmethod
+    def _strip_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+
 class StructuredBridgeMessageIn(BaseModel):
     """The full ratified structured envelope. Unknown fields are refused —
     an undeclared field is an unbounded authority channel, same posture as
@@ -196,6 +268,11 @@ class StructuredBridgeMessageIn(BaseModel):
     designated_agent_id: uuid.UUID
     knowledge_scope_ids: list[str] = Field(default_factory=list)
     allowed_tools: list[ClawithToolDefinitionIn] = Field(default_factory=list)
+    # Optional. Each entry must name a tool already present in this turn's
+    # effective_tool_names (validated in _validate_tool_capabilities, AFTER
+    # _resolve_effective_tool_names, BEFORE the idempotency claim) — a
+    # capability can therefore never expand what this turn may call.
+    tool_capabilities: list[ToolCapabilityIn] = Field(default_factory=list)
     ownership_state: str
     # The per-turn operation boundary. Stored directly in
     # isola_structured_bridge_requests.correlation_id, the unique-constraint
@@ -242,6 +319,13 @@ class StructuredBridgeMessageIn(BaseModel):
     def _bound_allowed_tools(cls, v: list[ClawithToolDefinitionIn]) -> list[ClawithToolDefinitionIn]:
         if len(v) > _MAX_ALLOWED_TOOLS:
             raise ValueError(f"allowed_tools exceeds {_MAX_ALLOWED_TOOLS} tools")
+        return v
+
+    @field_validator("tool_capabilities")
+    @classmethod
+    def _bound_tool_capabilities(cls, v: list[ToolCapabilityIn]) -> list[ToolCapabilityIn]:
+        if len(v) > _MAX_TOOL_CAPABILITIES:
+            raise ValueError(f"tool_capabilities exceeds {_MAX_TOOL_CAPABILITIES} entries")
         return v
 
 
@@ -404,6 +488,117 @@ def _tool_policy_digest(effective_tool_names: list[str]) -> str:
     """
     canonical = json.dumps(sorted(effective_tool_names), separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _validate_tool_capabilities(
+    effective_tool_names: frozenset[str],
+    capabilities: list[ToolCapabilityIn],
+) -> JSONResponse | None:
+    """Fail-closed, schema-level binding between a per-turn capability and
+    the already-enforced effective tool set
+    (dec-revenue-mcp-turn-capability-no-clawith-core-fork-2026-08-06).
+
+    Runs strictly AFTER `_resolve_effective_tool_names` and strictly
+    BEFORE the idempotency claim — same posture as the `unsupported_tool`
+    check above: a malformed capability request is a request-shape
+    defect, not a Run outcome, and must create no durable row, no Run, no
+    tool execution.
+
+    A capability can only ever NARROW what this turn's model is told to
+    attach where — it can never widen `effective_tool_names`, select an
+    agent/tenant/actor, or substitute for one tool at another. Foundation
+    remains the sole authority that actually validates and consumes the
+    opaque value; this only proves the REQUEST is well-formed and
+    internally consistent before any capability reaches the model.
+
+    Error `detail` lists carry tool names only, never a `capability`
+    value — see the module redaction discipline.
+    """
+    seen_tool_names: set[str] = set()
+    duplicates: set[str] = set()
+    unavailable: set[str] = set()
+    bad_versions: set[str] = set()
+    for cap in capabilities:
+        if cap.tool_name in seen_tool_names:
+            duplicates.add(cap.tool_name)
+            continue
+        seen_tool_names.add(cap.tool_name)
+        if cap.tool_name not in effective_tool_names:
+            unavailable.add(cap.tool_name)
+            continue
+        if cap.contract_version != CAPABILITY_CONTRACT_VERSION:
+            bad_versions.add(cap.tool_name)
+        if cap.expires_at is not None and cap.expires_at <= _now():
+            return JSONResponse(
+                status_code=400,
+                content={"error": "expired_tool_capability", "detail": [cap.tool_name]},
+            )
+    if duplicates:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "duplicate_tool_capability", "detail": sorted(duplicates)},
+        )
+    if unavailable:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "capability_for_unavailable_tool", "detail": sorted(unavailable)},
+        )
+    if bad_versions:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "unsupported_capability_contract_version",
+                "detail": sorted(bad_versions),
+                "supported_contract_version": CAPABILITY_CONTRACT_VERSION,
+            },
+        )
+    return None
+
+
+def _capability_directive(capabilities: list[ToolCapabilityIn]) -> str:
+    """Presents each capability to the model as an opaque per-tool
+    operation token it must attach verbatim and never disclose. This is a
+    prompt instruction, NOT the only control: a capability can only ever
+    be built for a tool name already inside `effective_tool_names`
+    (enforced in `_validate_tool_capabilities` above, and independently,
+    unconditionally, re-enforced downstream by `tool_step_service`'s own
+    allow-list intersection — unchanged by this file). This directive can
+    influence only WHAT ARGUMENT VALUE the model attaches to a call the
+    runtime was already going to allow; it cannot itself authorize a
+    call, widen the tool set, or select an identity.
+    """
+    if not capabilities:
+        return ""
+    intro = (
+        "The following tools have been pre-authorized for this exact turn "
+        "with a single-use operation capability. When, and only when, you "
+        "call one of these tools, you MUST include an argument named "
+        f'"{CAPABILITY_ARGUMENT_NAME}" set to EXACTLY the value shown '
+        "below for that tool, with no modification. Never repeat, quote, "
+        "paraphrase, translate, log, or otherwise disclose any of these "
+        "values anywhere else, including in your reply to the customer or "
+        "in any other tool call."
+    )
+    lines = [intro]
+    for cap in capabilities:
+        lines.append(f'- tool `{cap.tool_name}`: {CAPABILITY_ARGUMENT_NAME}="{cap.capability}"')
+    return "\n".join(lines)
+
+
+def _redact_capabilities(reply_text: str | None, capabilities: list[ToolCapabilityIn]) -> str | None:
+    """Defence in depth against a model that disobeys the directive above
+    and echoes a raw capability value into its customer-facing reply. The
+    directive is the primary control; this is a second, independent,
+    non-LLM control that requires no model cooperation. Only ever narrows
+    (redacts) text already produced — never used to authorize or alter
+    behaviour."""
+    if reply_text is None or not capabilities:
+        return reply_text
+    redacted = reply_text
+    for cap in capabilities:
+        if cap.capability and cap.capability in redacted:
+            redacted = redacted.replace(cap.capability, "[redacted-capability]")
+    return redacted
 
 
 async def _claim(
@@ -648,6 +843,13 @@ async def bridge_structured_message(
             },
         )
 
+    cap_error = _validate_tool_capabilities(frozenset(effective_tool_names), body.tool_capabilities)
+    if cap_error is not None:
+        # Same posture as the unsupported_tool rejection above: a
+        # request-shape defect, rejected before any durable row is
+        # created.
+        return cap_error
+
     tool_policy_digest = _tool_policy_digest(effective_tool_names)
 
     won, claim_row = await _claim(
@@ -791,6 +993,9 @@ async def bridge_structured_message(
                         f"structured bridge. Their verified contact reference is {phone}. "
                         "Treat this as their confirmed identity."
                     )
+                    capability_directive = _capability_directive(body.tool_capabilities)
+                    if capability_directive:
+                        caller_directive = f"{caller_directive}\n\n{capability_directive}"
 
                     async with open_run_state_reader(db) as reader:
                         intake = await enqueue_chat_runtime(
@@ -889,7 +1094,7 @@ async def bridge_structured_message(
                     session_id=populated.session_id,
                     correlation_id=correlation_id,
                     tenant_id=tenant_id,
-                    customer_reply=replay_reply.content,
+                    customer_reply=_redact_capabilities(replay_reply.content, body.tool_capabilities),
                     confidence=1.0,
                 ),
             )
@@ -969,7 +1174,7 @@ async def bridge_structured_message(
                 session_id=session_id,
                 correlation_id=correlation_id,
                 tenant_id=tenant_id,
-                customer_reply=reply.content,
+                customer_reply=_redact_capabilities(reply.content, body.tool_capabilities),
                 confidence=1.0,
                 latency_ms=latency_ms,
             ),
