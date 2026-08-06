@@ -177,6 +177,13 @@ channel_feishu_sender_open_id: ContextVar = ContextVar('channel_feishu_sender_op
 # internal_dispatch.py before the LLM/tool-calling loop runs for that turn.
 dispatch_sandbox_mode: ContextVar = ContextVar('dispatch_sandbox_mode', default=False)
 
+# S5: set True by a tool executor when the customer-facing agent could not
+# confidently answer from grounded Odoo data (no record found, blocked by
+# caller-identity gate, or an Odoo error). Read by internal_dispatch.py after
+# the LLM/tool-calling turn completes and surfaced on InternalDispatchResponse
+# so the BFF can ping the human owner via the existing escalation path.
+needs_handoff_signal: ContextVar = ContextVar('needs_handoff_signal', default=False)
+
 # Tools tagged here perform a real external mutation (Odoo write, outbound
 # message, owner ping, real-money payment link, etc). When dispatch_sandbox_mode
 # is True, execute_tool short-circuits any tool_name in this set instead of
@@ -986,6 +993,23 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "check_enquiry_status",
+            "description": "Look up the status of the customer's most recent enquiry/lead on file (e.g. a quote request or sign-up they submitted earlier). Call this when a customer asks for an update on something they already asked about - no arguments needed, the system knows who is asking. (partner_id honored only for the business owner.)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "partner_id": {
+                        "type": "integer",
+                        "description": "OPTIONAL, owner only: specific customer partner id",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_overdue_invoices",
             "description": "List overdue customer invoices sorted by amount (highest first). Returns invoice names, partner names, amounts owed, and due dates.",
             "parameters": {
@@ -1189,6 +1213,24 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
     return result
 
 
+# S5: tools gated by an env flag at registration — the LLM never sees the
+# schema when the flag is off, so flag-off is a true no-op (not just an
+# executor-level refusal). Add {tool_name: env_var_name} pairs here.
+_FLAG_GATED_TOOLS = {
+    "check_enquiry_status": "CUSTOMER_ODOO_ANSWER_ENABLED",
+}
+
+
+def _filter_flagged_tools(tools: list[dict]) -> list[dict]:
+    """Drop tool schemas whose feature flag is not enabled (default off)."""
+    import os
+    return [
+        t for t in tools
+        if t.get("function", {}).get("name") not in _FLAG_GATED_TOOLS
+        or os.getenv(_FLAG_GATED_TOOLS[t["function"]["name"]], "false").lower() == "true"
+    ]
+
+
 async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
 
@@ -1307,7 +1349,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
                 if not _a2a_async:
                     result = _strip_a2a_msg_type(result)
-                return result
+                return _filter_flagged_tools(result)
     except Exception as e:
         logger.error(f"[Tools] DB load failed, using fallback: {e}")
 
@@ -1315,7 +1357,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     fallback = _patch_computer_tool_descriptions(AGENT_TOOLS, computer_os_type)
     if not _a2a_async:
         fallback = _strip_a2a_msg_type(fallback)
-    return fallback
+    return _filter_flagged_tools(fallback)
 
 
 # ─── Workspace initialization ──────────────────────────────────
@@ -1575,6 +1617,9 @@ async def execute_tool(
     try:
         if tool_name == "list_files":
             result = _list_files(ws, arguments.get("path", ""), tenant_id=_agent_tenant_id)
+        elif tool_name == "escalate_to_human":
+            needs_handoff_signal.set(True)
+            result = "Flagged for a team member to follow up so a person can take over."
         elif tool_name == "read_file":
             path = arguments.get("path")
             if not path:
@@ -1834,6 +1879,43 @@ async def execute_tool(
                     result = f"Odoo error: {e}"
                 except Exception as e:
                     result = f"Error querying customer balance: {type(e).__name__}: {str(e)[:200]}"
+        elif tool_name == "check_enquiry_status":
+            # S5: mirrors get_customer_balance's caller-identity guard exactly —
+            # partner_id is sourced from caller_context (never trusted from the
+            # LLM/customer argument) for the customer role. needs_handoff_signal
+            # is set whenever the agent cannot give a grounded answer (blocked,
+            # spoofed partner_id, no record found, or an Odoo error) so
+            # internal_dispatch.py can surface it for the human-handoff ping.
+            _cc = caller_context.get()
+            from app.services.odoo_service import odoo_context as _octx_guard
+            if not _octx_guard.get():
+                return "I don't have any enquiry records to look that up — I'm a customer-facing assistant, not a back-office tool."
+            if _cc is not None and _cc.get("role") == "public":
+                needs_handoff_signal.set(True)
+                return "This information is only available to account holders. I can have a team member follow up with you on that."
+            if _cc is not None and _cc.get("role") == "customer":
+                _req = arguments.get("partner_id")
+                if _req and int(_req) != int(_cc.get("partner_id") or 0):
+                    return "I can only look up the enquiry belonging to this phone number. For privacy, each customer must ask about their own account."
+                partner_id = _cc.get("partner_id")
+            else:
+                partner_id = arguments.get("partner_id")
+            if not partner_id:
+                result = "Error: partner_id is required"
+            else:
+                from app.services.odoo_service import agent_odoo_service, get_lead_status, OdooError
+                try:
+                    import json as _json
+                    data = get_lead_status(agent_odoo_service(), int(partner_id))
+                    if not data.get("found"):
+                        needs_handoff_signal.set(True)
+                    result = _json.dumps(data)
+                except OdooError as e:
+                    needs_handoff_signal.set(True)
+                    result = f"Odoo error: {e}"
+                except Exception as e:
+                    needs_handoff_signal.set(True)
+                    result = f"Error checking enquiry status: {type(e).__name__}: {str(e)[:200]}"
         elif tool_name == "create_lead":
             _cc = caller_context.get() or {}
             from app.services.odoo_service import odoo_context as _octx_guard

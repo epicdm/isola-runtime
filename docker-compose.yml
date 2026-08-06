@@ -57,6 +57,8 @@ services:
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
       # Phase E.6c: shared service secret for apps/isola <-> isola-runtime
       ISOLA_INTERNAL_SECRET: ${ISOLA_INTERNAL_SECRET:-}
+      ISOLA_CUSTOMER_TOOLS_TOKEN: ${ISOLA_CUSTOMER_TOOLS_TOKEN:-}
+      SPINE_HTTP_URL: ${SPINE_HTTP_URL:-https://isola-foundation.replit.app}
       # L4 S1: shared service secret for isola-runtime -> BFF /api/internal/*
       # outbound calls (cross-store reads of tenant_registry, etc.). Same value
       # as bff-v2's INTERNAL_SECRET; consumer-side renamed to disambiguate.
