@@ -50,6 +50,14 @@ backend/**/*.bak-*
 backend/**/*.pre-*-bak
 docker-compose.override.yml.*-backup
 
+# Scoped-reset operational database dumps (pg_dump output written beside live
+# source on the deployment host by the 2026-07-25 scoped-reset runbook). These
+# are secret-bearing by default -- they carry real tenant rows -- and must never
+# be committed. Scoped to the rooted `backups/scoped-reset-*` prefix rather than
+# a bare `*.dump`/`*.sql` glob so that migrations, fixtures and any legitimate
+# SQL elsewhere in the tree stay visible to git.
+/backups/scoped-reset-*/
+
 # CC-created safety snapshots from rotation/migration work (per workspace-backup runbook)
 *.bak
 .bak-archive-*/
