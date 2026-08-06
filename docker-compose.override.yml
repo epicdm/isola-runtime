@@ -25,10 +25,20 @@
 # /api/internal/dispatch (see app/core/bff_clawith_auth.py). Blank by
 # default -- an operator provisions the actual value later; this repo
 # change only wires the passthrough, it does not set or apply it.
+# 2026-07-25 (port-8800 containment): the backend host port is bound to
+# 127.0.0.1 deliberately. Published without an explicit host address,
+# Docker binds 0.0.0.0 and installs a DNAT rule that bypasses the UFW
+# INPUT chain, so a firewall deny does not contain it -- the loopback
+# bind is the structural fix. The runtime is reached through the nginx
+# reverse proxy on the same host, never directly from outside. Applied
+# live on 2026-07-25; reconstructed here on 2026-08-06 from the live-only
+# working-tree delta (see
+# defect-isola-runtime-live-local-commit-tracks-secret-backup-files-2026-08-06).
+# Do not drop the 127.0.0.1 prefix.
 services:
   backend:
     ports:
-      - "8800:8000"
+      - "127.0.0.1:8800:8000"
     environment:
       BFF_CLAWITH_SHARED_SECRET: ${BFF_CLAWITH_SHARED_SECRET:-}
       BFF_CLAWITH_SHARED_SECRET_STAGING: ${BFF_CLAWITH_SHARED_SECRET_STAGING:-}
