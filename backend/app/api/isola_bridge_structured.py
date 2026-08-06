@@ -132,13 +132,38 @@ The accurate contract is:
   consumes the opaque value. This file never inspects, decodes or
   interprets it, and adds no table, column or migration.
 
-KNOWN RESIDUAL, deliberately NOT fixed here because it is outside the
-narrow shared-runtime authorization: if the model disobeys the directive
-and echoes a raw capability into its assistant text, that text also
-reaches `assistant_progress` run-event payloads written by
-`checkpoint_side_effects.py` and `tool_step_service.py`. Redacting those
-would require editing further core runtime files. Recorded rather than
-silently widened — see the Port defect record.
+MODEL-DERIVED PROGRESS IS SUPPRESSED FOR A CAPABILITY-BEARING TURN
+(`dec-pr42-capability-turns-no-model-derived-progress-events-2026-08-06`).
+The raw capability IS model-visible under this carrier — that is inherent
+to delivering it through `runtime_instruction` without forking Clawith's
+MCP client — so a model may copy it into arbitrary assistant prose. Exact
+-value replacement in free text is not a security boundary: a model can
+split, quote, reformat or encode a credential. So for a turn that carries
+one or more validated capabilities this route sets a non-sensitive,
+server-derived `suppress_model_progress` flag on the Run's immutable
+input snapshot, and the two runtime writers that copy model text into
+ordinary event payloads (`checkpoint_side_effects.py`,
+`tool_step_service.py`) emit NO model-derived text for that Run: no
+`thinking` event, no `assistant_progress` event, and an empty
+`reasoning_content` on tool-activity events. Tool activity itself
+continues through the already-sanitized `args` projection, so the
+operator view does not go dark. The text is never copied into an event in
+the first place, rather than scrubbed afterwards.
+
+The flag is derived ONLY after `_validate_tool_capabilities` succeeds. It
+is not part of the public request schema — `StructuredBridgeMessageIn` is
+`extra="forbid"`, so a caller attempting to send `suppress_model_progress`
+gets a 422 — and it contains no capability value, fingerprint, tenant id,
+agent id, approval or business scope. Key ABSENCE is the ordinary-Run
+signal, so every existing caller's Run payload and progress behaviour is
+byte-identical to before the flag existed.
+
+STILL OPEN, OUTSIDE THIS PR: the live base branch lacks the PR
+#41-equivalent tool-config credential containment, so the shared MCP
+bearer — one of the two mandatory combined controls behind the capability
+model — remains retrievable from tool-config responses on the line this
+code would deploy to. That is a separate release blocker and this PR does
+not close it.
 """
 
 from __future__ import annotations
@@ -1137,6 +1162,16 @@ async def bridge_structured_message(
                             source_channel="web",
                             runtime_instruction=caller_directive,
                             allowed_tool_names=effective_tool_names,
+                            # Server-derived, non-sensitive, per-Run. True
+                            # only because `_validate_tool_capabilities`
+                            # already accepted at least one capability for
+                            # THIS turn -- never read from the request, never
+                            # inferred from prompt or model text
+                            # (dec-pr42-capability-turns-no-model-derived
+                            # -progress-events-2026-08-06). Carries no
+                            # capability value, fingerprint, tenant, agent,
+                            # approval or business scope.
+                            suppress_model_progress=bool(body.tool_capabilities),
                             run_state_reader=reader,
                         )
                     if intake is None:

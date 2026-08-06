@@ -802,10 +802,15 @@ def test_legacy_request_digest_is_stable_and_capability_free():
 
 
 def test_only_the_authorized_sanitizer_file_gained_capability_awareness():
-    """Bounded-scope guard for the ONE authorized shared-runtime change
-    (`dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06`).
-    `tool_execution.py` may now name the capability argument; the other
-    core runtime and MCP files still may not."""
+    """Bounded-scope guard for the two authorized shared-runtime changes
+    (`dec-pr42-capability-sanitizer-and-replay-binding-2026-08-06` and
+    `dec-pr42-capability-turns-no-model-derived-progress-events
+    -2026-08-06`).
+
+    Only `tool_execution.py` may name the capability argument. The progress
+    -suppression files carry a deliberately CAPABILITY-AGNOSTIC boolean, so
+    they must still contain no capability vocabulary at all — that is what
+    keeps the flag non-sensitive and keeps this guard meaningful."""
     backend_root = Path(__file__).resolve().parents[1]
     still_forbidden = (
         "app/services/mcp_client.py",
@@ -813,6 +818,7 @@ def test_only_the_authorized_sanitizer_file_gained_capability_awareness():
         "app/services/agent_runtime/chat_intake.py",
         "app/services/agent_runtime/model_step_service.py",
         "app/services/agent_runtime/tool_step_service.py",
+        "app/services/agent_runtime/checkpoint_side_effects.py",
         "app/services/agent_runtime/chat_stream.py",
         "app/api/isola_bridge.py",
         "app/api/isola_bridge_v2.py",

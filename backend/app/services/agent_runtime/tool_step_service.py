@@ -176,6 +176,30 @@ def _allowed_tool_names_override(state: RuntimeGraphState) -> frozenset[str] | N
     return frozenset(value)
 
 
+def _suppress_model_progress(state: RuntimeGraphState) -> bool:
+    """Per-Run, server-derived switch that removes MODEL-DERIVED text from
+    this Run's ordinary event projections
+    (`dec-pr42-capability-turns-no-model-derived-progress-events
+    -2026-08-06`).
+
+    Same immutable-input channel and same key-absence convention as
+    `_allowed_tool_names_override` above: absence means "ordinary Run",
+    which is every existing caller. Set only by the structured bridge,
+    only after its capability validation has already succeeded, and never
+    by a caller or by the model.
+
+    Fails CLOSED toward suppression: any present value that is not exactly
+    `False` suppresses. Unlike the allowed-tools override, a malformed
+    value does NOT raise here — suppressing costs only optional progress
+    text, while failing the Run would be a worse outcome for a Run that is
+    already carrying a live credential.
+    """
+    initial_input = state["snapshots"].initial_input
+    if "suppress_model_progress" not in initial_input:
+        return False
+    return initial_input["suppress_model_progress"] is not False
+
+
 def _call_fields(call: JsonObject) -> tuple[str, str, dict]:
     call_id = call.get("id")
     function = call.get("function")
@@ -559,6 +583,7 @@ class RuntimeToolStepService:
         lease_owner: str,
         reasoning_content: str = "",
         assistant_content: str = "",
+        suppress_model_progress: bool = False,
     ) -> ToolExecutionReservation:
         async with self._session_factory() as db:
             async with db.begin():
@@ -584,7 +609,16 @@ class RuntimeToolStepService:
                         and policy.retry_policy == "safe"
                     ),
                 )
-                if reasoning_content.strip():
+                # A suppressed Run emits NO model-derived free text: the
+                # `thinking` and `assistant_progress` events are not written
+                # at all, and the tool-activity event carries an empty
+                # `reasoning_content`. The text is never copied into an
+                # event rather than scrubbed afterwards, which is what makes
+                # this hold against a model that splits, quotes, encodes or
+                # reformats a credential
+                # (dec-pr42-capability-turns-no-model-derived-progress
+                # -events-2026-08-06).
+                if reasoning_content.strip() and not suppress_model_progress:
                     await _insert_runtime_activity(
                         db,
                         tenant_id=tenant_id,
@@ -598,7 +632,7 @@ class RuntimeToolStepService:
                             "message_id": assistant_message_id,
                         },
                     )
-                if assistant_content.strip():
+                if assistant_content.strip() and not suppress_model_progress:
                     await _insert_runtime_activity(
                         db,
                         tenant_id=tenant_id,
@@ -624,7 +658,9 @@ class RuntimeToolStepService:
                         "call_id": call_id,
                         "name": tool_name,
                         "args": dict(reservation.execution.sanitized_arguments or {}),
-                        "reasoning_content": reasoning_content.strip(),
+                        "reasoning_content": (
+                            "" if suppress_model_progress else reasoning_content.strip()
+                        ),
                         "assistant_message_id": assistant_message_id,
                     },
                 )
@@ -1096,6 +1132,7 @@ class RuntimeToolStepService:
                 )
             )
             allowed_tool_names_override = _allowed_tool_names_override(state)
+            suppress_model_progress = _suppress_model_progress(state)
             if allowed_tool_names_override is not None:
                 allowed_names = allowed_names & allowed_tool_names_override
             messages: list[JsonObject] = []
@@ -1128,6 +1165,7 @@ class RuntimeToolStepService:
                     lease_owner=lease_owner,
                     reasoning_content=reasoning_content,
                     assistant_content=assistant_content,
+                    suppress_model_progress=suppress_model_progress,
                 )
                 if reservation.reusable_result is not None:
                     if reservation.reusable_result.status == "pending":

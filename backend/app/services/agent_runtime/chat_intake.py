@@ -487,6 +487,7 @@ async def enqueue_chat_runtime(
     source_execution_id_override: str | None = None,
     application_tools_enabled: bool = True,
     allowed_tool_names: list[str] | None = None,
+    suppress_model_progress: bool = False,
     channel_delivery_target: dict | None = None,
     run_state_reader: RunStateReader | None = None,
     settings_override: Settings | None = None,
@@ -503,6 +504,18 @@ async def enqueue_chat_runtime(
     persistent tool configuration. ``model_step_service`` and
     ``tool_step_service`` both read it back to gate, respectively, what the
     model is offered and what may actually execute for this Run.
+
+    ``suppress_model_progress`` rides the SAME immutable per-Run input
+    snapshot (``dec-pr42-capability-turns-no-model-derived-progress-events
+    -2026-08-06``). It is a non-sensitive server-derived boolean: it carries
+    no credential, fingerprint, tenant, agent, approval or business scope,
+    and it is never caller-selectable — the only ingress that sets it is the
+    structured bridge, after its own capability validation has already
+    succeeded. When true, ``checkpoint_side_effects`` and
+    ``tool_step_service`` emit no model-derived progress text for this Run.
+    Default ``False`` leaves the payload byte-identical for every existing
+    caller: the key is written only when the flag is true, so key ABSENCE
+    remains the "ordinary Run" signal both readers already expect.
     """
     runtime_settings = settings_override or get_settings()
     decision = decide_runtime_v2(
@@ -718,6 +731,9 @@ async def enqueue_chat_runtime(
                     if normalized_runtime_instruction
                     else {}
                 ),
+                # Written ONLY when true, so an ordinary Run's payload is
+                # byte-identical to before this field existed.
+                **({"suppress_model_progress": True} if suppress_model_progress else {}),
                 **(
                     {"onboarding_target_phase": normalized_onboarding_target_phase}
                     if normalized_onboarding_target_phase

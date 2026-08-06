@@ -264,6 +264,32 @@ def _tool_arguments(call: Mapping[str, object], tool_name: str) -> dict:
     )
 
 
+def _suppress_model_progress(state: object) -> bool:
+    """Per-Run, server-derived switch that removes MODEL-DERIVED text from
+    this Run's ordinary event projections
+    (`dec-pr42-capability-turns-no-model-derived-progress-events
+    -2026-08-06`).
+
+    Same immutable-input channel and same key-absence convention as
+    `tool_step_service._allowed_tool_names_override`: absence means
+    "ordinary Run", which is every existing caller. Set only by the
+    structured bridge, only after its capability validation has already
+    succeeded, and never by a caller or by the model.
+
+    Fails CLOSED toward suppression: any present value that is not exactly
+    `False` suppresses. Suppressing is never a security risk — it only
+    removes optional progress text — whereas raising here would break event
+    derivation for a Run that is already carrying a live credential.
+    """
+    try:
+        initial_input = state["snapshots"].initial_input  # type: ignore[index]
+    except (KeyError, TypeError, AttributeError):  # pragma: no cover - defensive
+        return False
+    if not isinstance(initial_input, Mapping) or "suppress_model_progress" not in initial_input:
+        return False
+    return initial_input["suppress_model_progress"] is not False
+
+
 def _runtime_observation_events(
     run: RuntimeRunRecord,
     checkpoint: CheckpointObservation,
@@ -273,10 +299,20 @@ def _runtime_observation_events(
     These remain ``status_changed`` product events so the durable event schema
     stays backward compatible. ``activity_type`` is the Web Chat projection
     discriminator; idempotency keys are based on stable message/tool-call IDs.
+
+    When `_suppress_model_progress` is set for this Run, NO model-derived
+    free text is emitted: the `thinking` and `assistant_progress` events are
+    omitted entirely and the `tool_call` events carry an empty
+    `reasoning_content`. Tool activity itself continues, through the
+    already-sanitized `args` projection, so the operator view does not go
+    dark. Nothing is scrubbed or pattern-matched — the text is simply never
+    copied into an event, which is what makes this robust against a model
+    that splits, quotes, encodes or reformats a credential.
     """
     events: list[tuple[str, str, dict, str, str | None]] = []
     calls: dict[str, dict] = {}
     messages = runtime_messages_as_json(checkpoint.state)
+    suppress_progress = _suppress_model_progress(checkpoint.state)
 
     for message in messages:
         if message.get("role") != "assistant" or message.get("runtime_run_id") != str(run.run_id):
@@ -285,7 +321,7 @@ def _runtime_observation_events(
         if not isinstance(message_id, str) or not message_id:
             continue
         reasoning = _text_field(message.get("reasoning_content"))
-        if reasoning is not None:
+        if reasoning is not None and not suppress_progress:
             events.append(
                 (
                     "status_changed",
@@ -302,7 +338,7 @@ def _runtime_observation_events(
             )
         content = _text_field(message.get("content"))
         runtime_intent = message.get("runtime_intent")
-        if content is not None and runtime_intent not in {"finish", "wait"}:
+        if content is not None and runtime_intent not in {"finish", "wait"} and not suppress_progress:
             events.append(
                 (
                     "status_changed",
@@ -332,7 +368,9 @@ def _runtime_observation_events(
                 "call_id": call_id,
                 "name": tool_name,
                 "args": _tool_arguments(raw_call, tool_name),
-                "reasoning_content": reasoning or "",
+                # Model-derived free text: empty for a suppressed Run. `args`
+                # is already sanitized, so tool activity stays visible.
+                "reasoning_content": "" if suppress_progress else (reasoning or ""),
                 "assistant_message_id": message_id,
             }
             calls[call_id] = detail
