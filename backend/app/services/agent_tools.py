@@ -1617,6 +1617,9 @@ async def execute_tool(
     try:
         if tool_name == "list_files":
             result = _list_files(ws, arguments.get("path", ""), tenant_id=_agent_tenant_id)
+        elif tool_name == "escalate_to_human":
+            needs_handoff_signal.set(True)
+            result = "Flagged for a team member to follow up so a person can take over."
         elif tool_name == "read_file":
             path = arguments.get("path")
             if not path:
