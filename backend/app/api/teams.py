@@ -258,7 +258,7 @@ async def configure_teams_channel(
             existing.extra_config.pop("tenant_id", None)
         existing.extra_config["use_managed_identity"] = use_managed_identity
         await db.flush()
-        return ChannelConfigOut.model_validate(existing)
+        return ChannelConfigOut.from_channel_config(existing)
 
     extra_config = {}
     if tenant_id:
@@ -276,7 +276,7 @@ async def configure_teams_channel(
     )
     db.add(config)
     await db.flush()
-    return ChannelConfigOut.model_validate(config)
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get("/agents/{agent_id}/teams-channel", response_model=ChannelConfigOut)
@@ -296,7 +296,7 @@ async def get_teams_channel(
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Microsoft Teams not configured")
-    return ChannelConfigOut.model_validate(config)
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get("/agents/{agent_id}/teams-channel/webhook-url")

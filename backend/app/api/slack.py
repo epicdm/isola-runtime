@@ -53,7 +53,7 @@ async def configure_slack_channel(
         existing.encrypt_key = signing_secret  # Signing Secret
         existing.is_configured = True
         await db.flush()
-        return ChannelConfigOut.model_validate(existing)
+        return ChannelConfigOut.from_channel_config(existing)
 
     config = ChannelConfig(
         agent_id=agent_id,
@@ -65,7 +65,7 @@ async def configure_slack_channel(
     )
     db.add(config)
     await db.flush()
-    return ChannelConfigOut.model_validate(config)
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get("/agents/{agent_id}/slack-channel", response_model=ChannelConfigOut)
@@ -84,7 +84,7 @@ async def get_slack_channel(
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Slack not configured")
-    return ChannelConfigOut.model_validate(config)
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get("/agents/{agent_id}/slack-channel/webhook-url")

@@ -550,7 +550,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
         const isConfigured = ch.id === 'feishu' ? config?.is_configured : config?.is_configured;
         const connMode = connectionModes[ch.id] || 'websocket';
         const isWs = ch.connectionMode && connMode === 'websocket';
-        const configConnMode = config?.extra_config?.connection_mode;
+        const configConnMode = config?.config_summary?.connection_mode;
 
         // Determine desc subtitle based on current mode
         let subtitle = ch.desc;
@@ -745,47 +745,53 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                                     <button className="btn btn-secondary" style={{ fontSize: '12px', padding: '4px 12px' }}
                                         onClick={() => {
                                             // Populate form with existing config data
+                                            // Secret inputs are write-only. The channel API returns
+                                            // no credential value, so a secret is never pre-filled;
+                                            // changing a channel means re-entering its credentials.
+                                            // Non-secret values come from config_summary, the
+                                            // allowlisted projection of extra_config.
                                             const prefill: Record<string, string> = {};
+                                            const summary = config.config_summary || {};
                                             if (ch.id === 'feishu') {
                                                 prefill.app_id = config.app_id || '';
-                                                prefill.app_secret = config.app_secret || '';
-                                                prefill.encrypt_key = config.encrypt_key || '';
-                                                setConnectionModes(prev => ({ ...prev, feishu: config.extra_config?.connection_mode || 'websocket' }));
+                                                prefill.app_secret = '';
+                                                prefill.encrypt_key = '';
+                                                setConnectionModes(prev => ({ ...prev, feishu: summary.connection_mode || 'websocket' }));
                                             } else if (ch.id === 'wecom') {
-                                                const cm = config.extra_config?.connection_mode === 'websocket' ? 'websocket' : 'webhook';
+                                                const cm = summary.connection_mode === 'websocket' ? 'websocket' : 'webhook';
                                                 setConnectionModes(prev => ({ ...prev, wecom: cm }));
                                                 if (cm === 'websocket') {
-                                                    prefill.bot_id = config.extra_config?.bot_id || '';
-                                                    prefill.bot_secret = config.extra_config?.bot_secret || '';
+                                                    prefill.bot_id = summary.bot_id || '';
+                                                    prefill.bot_secret = '';
                                                 } else {
                                                     prefill.corp_id = config.app_id || '';
-                                                    prefill.wecom_agent_id = config.extra_config?.wecom_agent_id || '';
-                                                    prefill.secret = config.app_secret || '';
-                                                    prefill.token = config.verification_token || '';
-                                                    prefill.encoding_aes_key = config.encrypt_key || '';
+                                                    prefill.wecom_agent_id = summary.wecom_agent_id || '';
+                                                    prefill.secret = '';
+                                                    prefill.token = '';
+                                                    prefill.encoding_aes_key = '';
                                                 }
                                             } else if (ch.id === 'slack') {
-                                                prefill.bot_token = config.app_secret || '';
-                                                prefill.signing_secret = config.encrypt_key || '';
+                                                prefill.bot_token = '';
+                                                prefill.signing_secret = '';
                                             } else if (ch.id === 'discord') {
-                                                const cm = config.extra_config?.connection_mode === 'gateway' ? 'websocket' : 'webhook';
+                                                const cm = summary.connection_mode === 'gateway' ? 'websocket' : 'webhook';
                                                 setConnectionModes(prev => ({ ...prev, discord: cm }));
                                                 if (cm === 'websocket') {
-                                                    prefill.bot_token = config.app_secret || '';
+                                                    prefill.bot_token = '';
                                                 } else {
                                                     prefill.application_id = config.app_id || '';
-                                                    prefill.bot_token = config.app_secret || '';
-                                                    prefill.public_key = config.encrypt_key || '';
+                                                    prefill.bot_token = '';
+                                                    prefill.public_key = '';
                                                 }
                                             } else if (ch.id === 'teams') {
                                                 prefill.app_id = config.app_id || '';
-                                                prefill.app_secret = config.app_secret || '';
-                                                prefill.tenant_id = config.extra_config?.tenant_id || '';
+                                                prefill.app_secret = '';
+                                                prefill.tenant_id = summary.tenant_id || '';
                                             } else if (ch.id === 'dingtalk') {
                                                 prefill.app_key = config.app_id || '';
-                                                prefill.app_secret = config.app_secret || '';
-                                                prefill.agent_id = config.extra_config?.agent_id || '';
-                                                setConnectionModes(prev => ({ ...prev, dingtalk: config.extra_config?.connection_mode || 'websocket' }));
+                                                prefill.app_secret = '';
+                                                prefill.agent_id = summary.agent_id || '';
+                                                setConnectionModes(prev => ({ ...prev, dingtalk: summary.connection_mode || 'websocket' }));
                                             } else if (ch.id === 'atlassian') {
                                                 prefill.api_key = '';
                                                 prefill.cloud_id = config.cloud_id || '';

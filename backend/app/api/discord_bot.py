@@ -90,7 +90,7 @@ async def configure_discord_channel(
         except Exception as e:
             logger.warning(f"[Discord] Could not register slash commands: {e}")
 
-    return ChannelConfigOut.model_validate(existing)
+    return ChannelConfigOut.from_channel_config(existing)
 
 
 @router.get("/agents/{agent_id}/discord-channel", response_model=ChannelConfigOut)
@@ -109,7 +109,7 @@ async def get_discord_channel(
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Discord not configured")
-    return ChannelConfigOut.model_validate(config)
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get("/agents/{agent_id}/discord-channel/webhook-url")

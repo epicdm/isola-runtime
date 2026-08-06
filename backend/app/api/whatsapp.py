@@ -90,7 +90,7 @@ async def configure_whatsapp_channel(
         existing.is_configured = True
         await db.commit()
         await db.refresh(existing)
-        return existing
+        return ChannelConfigOut.from_channel_config(existing)
 
     config = ChannelConfig(
         agent_id=agent_id,
@@ -102,7 +102,7 @@ async def configure_whatsapp_channel(
     await db.commit()
     await db.refresh(config)
     logger.info(f"[WhatsApp] Configured channel for agent {agent_id}")
-    return config
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get(
@@ -125,7 +125,7 @@ async def get_whatsapp_channel(
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="WhatsApp channel not configured")
-    return config
+    return ChannelConfigOut.from_channel_config(config)
 
 
 @router.get("/agents/{agent_id}/whatsapp-channel/webhook-url")
