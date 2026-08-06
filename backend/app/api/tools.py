@@ -37,6 +37,35 @@ def _get_sensitive_keys(config_schema: dict | None = None) -> set[str]:
     return keys
 
 
+def _safe_config_keys(config_schema: dict | None, sensitive_keys: set[str]) -> set[str]:
+    """Allowlist of config keys that may be returned to an API consumer.
+
+    Derived from the category's declared ``config_schema``: every declared
+    field that is not a password field and is not otherwise sensitive.
+
+    Fail-closed by construction. A key the schema does not declare is never
+    returned, so a credential written into the row under a new name cannot
+    reach a response without a reviewed schema change.
+    """
+    if not config_schema:
+        return set()
+    keys: set[str] = set()
+    for field in config_schema.get("fields", []):
+        key = field.get("key", "")
+        if key and key not in sensitive_keys and field.get("type") != "password":
+            keys.add(key)
+    return keys
+
+
+def _declared_secret_keys(config_schema: dict | None) -> set[str]:
+    """Password-type keys declared by the schema (for configured-state flags)."""
+    if not config_schema:
+        return set()
+    keys = {f.get("key", "") for f in config_schema.get("fields", []) if f.get("type") == "password"}
+    keys.discard("")
+    return keys
+
+
 def _encrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
     """Encrypt sensitive fields in config dict.
 
@@ -781,7 +810,10 @@ async def get_category_config(
 
     Returns both global_config (company-level, from Tool.config) and
     agent_config (agent-level override, from ChannelConfig) separately.
-    Sensitive fields in global_config are masked for display.
+
+    Credentials are never returned — not decrypted, not encrypted and not
+    masked. Callers that need to know whether a secret exists read the
+    *_configured boolean maps instead.
     Company-level values always take precedence at runtime.
     """
     from app.core.permissions import check_agent_access
@@ -803,17 +835,27 @@ async def get_category_config(
     for ct in all_cat_tools.scalars():
         if ct.config and ct.config != {}:
             cat_schema = ct.config_schema
-            raw_global = _decrypt_sensitive_fields(ct.config, cat_schema)
+            # Deliberately NOT decrypted: this endpoint returns no credential
+            # value, so plaintext secrets are never brought into memory here.
+            raw_global = dict(ct.config)
             break
 
-    # Mask sensitive fields for UI display
-    masked_global = dict(raw_global)
+    # Credentials are never returned by this endpoint — not decrypted, not
+    # encrypted, and not masked. A masked placeholder is both a partial
+    # disclosure and a write-back hazard: the UI can submit it straight back
+    # and overwrite the stored credential. Consumers get booleans instead.
     sensitive_keys = _get_sensitive_keys(cat_schema)
-    for key in sensitive_keys:
-        val = masked_global.get(key)
-        if val and isinstance(val, str):
-            suffix = val[-4:] if len(val) > 4 else val
-            masked_global[key] = f"****{suffix}"
+    safe_keys = _safe_config_keys(cat_schema, sensitive_keys)
+    secret_state_keys = _declared_secret_keys(cat_schema) | sensitive_keys
+
+    def _project_safe(raw: dict) -> dict:
+        """Allowlisted, non-secret subset of a config dict."""
+        return {k: v for k, v in raw.items() if k in safe_keys}
+
+    def _configured_map(raw: dict) -> dict:
+        """{secret_key: bool} — whether a credential exists, never its value."""
+        keys = secret_state_keys | (set(raw) & sensitive_keys)
+        return {k: bool(str(raw.get(k) or "").strip()) for k in sorted(keys)}
 
     # ── 2. Load agent-level config from ChannelConfig ───────────────────────
     result = await db.execute(
@@ -830,29 +872,33 @@ async def get_category_config(
 
     if config:
         config_id = str(config.id)
-        full_agent = {
+        # Not decrypted — only presence is needed to derive configured-state.
+        raw_agent = {
             "api_key": config.app_secret,
             **(config.extra_config or {}),
         }
-        raw_agent = _decrypt_sensitive_fields(full_agent)
-        # Remove None values produced by missing app_secret
         raw_agent = {k: v for k, v in raw_agent.items() if v is not None}
 
     # ── 3. Build effective config ───────────────────────────────────────────
     # Priority: Agent config > Company config > Default
     # Agent can override company values by setting their own.
     effective_config = {**raw_global, **raw_agent}
+    effective_configured = _configured_map(effective_config)
 
     return {
         "id": config_id,
         "agent_id": str(agent_id),
         "category": category,
         "is_configured": is_configured,
-        # Legacy field (backward-compat): full effective config for display
-        "config": effective_config,
-        # New fields for richer UI: show global and agent configs separately
-        "global_config": masked_global,
-        "agent_config": raw_agent,
+        # Non-secret configuration only, allowlisted from the category schema.
+        "config": _project_safe(effective_config),
+        "global_config": _project_safe(raw_global),
+        "agent_config": _project_safe(raw_agent),
+        # Configured-state booleans: the UI learns that a credential exists
+        # without receiving any part of it.
+        "global_config_configured": _configured_map(raw_global),
+        "agent_config_configured": _configured_map(raw_agent),
+        "credentials_configured": any(effective_configured.values()),
     }
 
 

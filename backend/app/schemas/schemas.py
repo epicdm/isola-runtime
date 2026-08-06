@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -425,20 +426,91 @@ class ChannelConfigCreate(BaseModel):
     extra_config: dict | None = None
 
 
+# Per-channel allowlist of NON-SECRET ``extra_config`` keys that may be
+# surfaced to an API consumer. A key that is not listed here is dropped, so a
+# credential added to ``extra_config`` in future cannot reach a response
+# without an explicit, reviewed change to this table.
+SAFE_EXTRA_CONFIG_KEYS: dict[str, frozenset[str]] = {
+    # WhatsApp keeps its whole configuration in extra_config. Only the two
+    # Meta object identifiers are non-secret; access_token, verify_token and
+    # app_secret are credentials and stay out.
+    "whatsapp": frozenset({"phone_number_id", "waba_id"}),
+    # Slack stores bot_token/signing_secret in columns; nothing in
+    # extra_config is safe to surface.
+    "slack": frozenset(),
+    "discord": frozenset({"connection_mode"}),
+    "microsoft_teams": frozenset({"tenant_id", "use_managed_identity"}),
+}
+
+# Allowlisted for every channel type: an operator-set label, never a credential.
+SAFE_EXTRA_CONFIG_COMMON_KEYS: frozenset[str] = frozenset({"display_name"})
+
+# Credentials that live in extra_config rather than in a column, per channel.
+_EXTRA_CONFIG_CREDENTIAL_KEYS: dict[str, tuple[str, ...]] = {
+    "whatsapp": ("access_token", "verify_token", "app_secret"),
+}
+
+
+def _credentials_configured(config: Any, extra: dict) -> bool:
+    """True when the channel actually holds a usable credential set."""
+    required = _EXTRA_CONFIG_CREDENTIAL_KEYS.get(config.channel_type)
+    if required:
+        return all(str(extra.get(key) or "").strip() for key in required)
+    return bool(str(getattr(config, "app_secret", None) or "").strip())
+
+
 class ChannelConfigOut(BaseModel):
+    """Safe read contract for a ``channel_configs`` row.
+
+    Deliberately **not** ``from_attributes``: an ORM row must never be
+    serialised into this model, so a credential column added to
+    ``ChannelConfig`` later cannot silently reach an API consumer. Build
+    instances with :meth:`from_channel_config`.
+
+    No field on this model may carry a credential value. Callers that need to
+    know whether a secret exists get a boolean, not the secret.
+    """
+
     id: uuid.UUID
     agent_id: uuid.UUID
     channel_type: str
     app_id: str | None = None
-    app_secret: str | None = None
-    encrypt_key: str | None = None
     is_configured: bool
     is_connected: bool
     last_tested_at: datetime | None = None
-    extra_config: dict | None = None
     created_at: datetime
 
-    model_config = {"from_attributes": True}
+    # Configured-state only — never the value itself.
+    app_secret_configured: bool = False
+    encrypt_key_configured: bool = False
+    credentials_configured: bool = False
+
+    # Channel-specific projection of the non-secret subset of extra_config.
+    config_summary: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"from_attributes": False}
+
+    @classmethod
+    def from_channel_config(cls, config: Any) -> "ChannelConfigOut":
+        """Project a ``ChannelConfig`` ORM row onto the safe contract."""
+        extra = getattr(config, "extra_config", None) or {}
+        allowed = SAFE_EXTRA_CONFIG_KEYS.get(
+            config.channel_type, frozenset()
+        ) | SAFE_EXTRA_CONFIG_COMMON_KEYS
+        return cls(
+            id=config.id,
+            agent_id=config.agent_id,
+            channel_type=config.channel_type,
+            app_id=config.app_id,
+            is_configured=bool(config.is_configured),
+            is_connected=bool(config.is_connected),
+            last_tested_at=config.last_tested_at,
+            created_at=config.created_at,
+            app_secret_configured=bool(str(getattr(config, "app_secret", None) or "").strip()),
+            encrypt_key_configured=bool(str(getattr(config, "encrypt_key", None) or "").strip()),
+            credentials_configured=_credentials_configured(config, extra),
+            config_summary={key: extra[key] for key in sorted(allowed) if key in extra},
+        )
 
 
 # ─── Approval ───────────────────────────────────────────

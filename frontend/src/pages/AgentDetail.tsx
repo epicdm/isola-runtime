@@ -61,6 +61,9 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     // Global (company-level) config for the currently open modal — used to show
     // lock hints and prevent agent from overriding company-set fields.
     const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
+    // Whether an agent-level credential exists, per key. Booleans only — the
+    // API never returns the credential itself, nor a mask of it.
+    const [configAgentConfigured, setConfigAgentConfigured] = useState<Record<string, boolean>>({});
 
     const CATEGORY_CONFIG_SCHEMAS: Record<string, any> = {
         agentbay: {
@@ -145,6 +148,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
         setConfigCategory(category);
         setConfigData({});
         setConfigGlobalData({});
+        setConfigAgentConfigured({});
         setConfigSaving(true);
         setFocusedField(null);
         try {
@@ -154,20 +158,28 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
             });
             if (res.ok) {
                 const data = await res.json();
-                // global_config: company-level (masked sensitive fields like ****xxxx)
-                // agent_config: agent-level overrides only
+                // The API returns non-secret configuration only. Credential
+                // state arrives as *_configured booleans — never a value and
+                // never a mask — so no secret can be pre-filled into an input
+                // and none can be written back on save.
                 const globalCfg = data.global_config || {};
                 const agentCfg = data.agent_config || {};
-                setConfigGlobalData(globalCfg);
-                // Pre-fill only agent-level values; company fields show as hints
                 const catSchema = CATEGORY_CONFIG_SCHEMAS[category];
                 const sensitiveKeys = getSensitiveKeys(catSchema);
+                // Sensitive keys carry a boolean purely so the UI can show that
+                // a company key exists; the value is never rendered.
+                setConfigGlobalData({ ...globalCfg, ...(data.global_config_configured || {}) });
+                setConfigAgentConfigured(data.agent_config_configured || {});
                 const merged: Record<string, any> = {};
                 for (const [k, v] of Object.entries(globalCfg)) {
                     // Non-sensitive global fields (e.g. os_type) pre-fill; sensitive ones don't
                     if (!sensitiveKeys.has(k)) merged[k] = v;
                 }
-                Object.assign(merged, agentCfg);
+                // Defence in depth: a secret input is write-only, so it is never
+                // pre-filled even if the API were to start returning one again.
+                for (const [k, v] of Object.entries(agentCfg)) {
+                    if (!sensitiveKeys.has(k)) merged[k] = v;
+                }
                 setConfigData(merged);
             }
         } catch (e) { console.error(e); }
@@ -456,9 +468,13 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                         {(() => {
                                                             const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
                                                             if (!globalVal) return null;
+                                                            // Never render a credential — or a mask of one — as a hint.
+                                                            const isSecretField = field.type === 'password';
                                                             return (
                                                                 <span style={{ fontWeight: 400, color: 'var(--accent-primary)', marginLeft: '4px', fontSize: '11px' }}>
-                                                                    (company: {String(globalVal).slice(0, 20)}{String(globalVal).length > 20 ? '\u2026' : ''})
+                                                                    {isSecretField
+                                                                        ? t('agent.tools.companyConfigured', '(company configured)')
+                                                                        : `(company: ${String(globalVal).slice(0, 20)}${String(globalVal).length > 20 ? '\u2026' : ''})`}
                                                                 </span>
                                                             );
                                                         })()}
@@ -497,7 +513,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                         style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'text', background: 'var(--bg-tertiary)', borderColor: 'var(--border)', overflow: 'hidden' }}
                                                                         onClick={() => setFocusedField(field.key)}
                                                                     >
-                                                                        <span style={{ flex: 1, color: 'var(--text-tertiary)', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal })}</span>
+                                                                        <span style={{ flex: 1, color: 'var(--text-tertiary)', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('agent.tools.usingCompanyKeyConfigured', 'Using company key')}</span>
                                                                         <span style={{ fontSize: '12px', color: 'var(--accent-primary)', flexShrink: 0, cursor: 'pointer' }}>{t('common.edit', 'Edit')}</span>
                                                                     </div>
                                                                 );
@@ -507,13 +523,18 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                 <input type="password" autoComplete="new-password" className="form-input"
                                                                     autoFocus={focusedField === field.key}
                                                                     value={configData[field.key] ?? ''}
-                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
+                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyKeyConfigured', 'Using company key') : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
                                                                     onBlur={(e) => {
                                                                         if (!e.target.value) setFocusedField(null);
                                                                     }}
                                                                     onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
                                                             );
                                                         })()}
+                                                        {configAgentConfigured?.[field.key] && (
+                                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                                                                {t('agent.tools.credentialConfigured', 'Credential configured \u2014 leave blank to keep it')}
+                                                            </div>
+                                                        )}
                                                         {/* Per-provider help text for auth_code */}
                                                         {field.key === 'auth_code' && (() => {
                                                             const providerField = configTool?.config_schema?.fields?.find((f: any) => f.key === 'email_provider');
