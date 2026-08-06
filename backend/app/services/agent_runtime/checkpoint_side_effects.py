@@ -202,7 +202,23 @@ def delivery_from_checkpoint(
     run: RuntimeRunRecord,
     checkpoint: CheckpointObservation,
 ) -> DeliveryRequest | None:
-    """Derive a user-visible request without consulting a product projection."""
+    """Derive a user-visible request without consulting a product projection.
+
+    ``thinking`` is the SECOND model-derived sink in this module, and it is
+    not an ``AgentRunEvent``: ``delivery.py`` persists it verbatim into the
+    ``chat_messages.thinking`` COLUMN for a ``direct`` session, and
+    ``api/chat_sessions.py`` returns that column to ordinary tenant clients.
+    Every structured-bridge run is a ``direct`` session
+    (``ensure_primary_platform_session``), and the bridge's settle-time
+    redaction rewrites ``content`` only — so a capability echoed into
+    terminal ``reasoning_content`` but not into the reply body was persisted
+    raw and readable. It therefore honours the SAME per-Run suppression
+    switch as ``_runtime_observation_events``
+    (``dec-pr42-capability-turns-no-model-derived-progress-events
+    -2026-08-06``). Omission, not scrubbing — the text is never copied out
+    of the checkpoint, so it holds against a model that splits, quotes,
+    encodes or reformats a credential.
+    """
     status = checkpoint.state["lifecycle"]["status"]
     if run.system_role == "group_planning" and status == "completed":
         return None
@@ -223,7 +239,14 @@ def delivery_from_checkpoint(
         group_handoff_intent=_terminal_group_handoff(checkpoint),
         failure_code=failure_code,
         failure_message=failure_message,
-        thinking=_terminal_thinking(run, checkpoint),
+        # Model-derived free text -> `chat_messages.thinking` -> tenant chat
+        # API. Omitted entirely for a suppressed Run; unchanged for every
+        # ordinary Run, where key ABSENCE keeps the existing behaviour.
+        thinking=(
+            None
+            if _suppress_model_progress(checkpoint.state)
+            else _terminal_thinking(run, checkpoint)
+        ),
     )
 
 
@@ -266,9 +289,15 @@ def _tool_arguments(call: Mapping[str, object], tool_name: str) -> dict:
 
 def _suppress_model_progress(state: object) -> bool:
     """Per-Run, server-derived switch that removes MODEL-DERIVED text from
-    this Run's ordinary event projections
+    this Run's ordinary projections
     (`dec-pr42-capability-turns-no-model-derived-progress-events
     -2026-08-06`).
+
+    TWO projections in this module read it, and they are different kinds of
+    sink: `_runtime_observation_events` (the `AgentRunEvent` payloads) and
+    `delivery_from_checkpoint` (the `chat_messages.thinking` COLUMN, which
+    `api/chat_sessions.py` serves to tenant clients). An event-only audit
+    misses the second one.
 
     Same immutable-input channel and same key-absence convention as
     `tool_step_service._allowed_tool_names_override`: absence means

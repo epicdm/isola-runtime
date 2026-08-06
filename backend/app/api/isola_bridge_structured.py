@@ -141,14 +141,30 @@ MCP client — so a model may copy it into arbitrary assistant prose. Exact
 split, quote, reformat or encode a credential. So for a turn that carries
 one or more validated capabilities this route sets a non-sensitive,
 server-derived `suppress_model_progress` flag on the Run's immutable
-input snapshot, and the two runtime writers that copy model text into
-ordinary event payloads (`checkpoint_side_effects.py`,
-`tool_step_service.py`) emit NO model-derived text for that Run: no
-`thinking` event, no `assistant_progress` event, and an empty
-`reasoning_content` on tool-activity events. Tool activity itself
-continues through the already-sanitized `args` projection, so the
-operator view does not go dark. The text is never copied into an event in
-the first place, rather than scrubbed afterwards.
+input snapshot, and every runtime projection that copies model text out of
+the checkpoint honours it for that Run.
+
+Three sinks read the flag, across two files and TWO DIFFERENT KINDS of
+sink — an event-only audit is not sufficient here, which is how the third
+was originally missed:
+
+* `checkpoint_side_effects._runtime_observation_events` and
+  `tool_step_service._reserve` write `AgentRunEvent` payloads: no
+  `thinking` event, no `assistant_progress` event, and an empty
+  `reasoning_content` on tool-activity events;
+* `checkpoint_side_effects.delivery_from_checkpoint` sets
+  `DeliveryRequest.thinking`, which `delivery.py` persists into the
+  `chat_messages.thinking` COLUMN for a `direct` session — which is what
+  every structured-bridge run is — and which `api/chat_sessions.py`
+  returns to ordinary tenant clients. The settle-time redaction below
+  rewrites `content` only, so a capability echoed into terminal
+  `reasoning_content` but not into the reply body was persisted raw and
+  tenant-readable. That sink is now omitted for a capability run too.
+
+Tool activity itself continues through the already-sanitized `args`
+projection, so the operator view does not go dark. In every case the text
+is never copied out of the checkpoint in the first place, rather than
+scrubbed afterwards.
 
 The flag is derived ONLY after `_validate_tool_capabilities` succeeds. It
 is not part of the public request schema — `StructuredBridgeMessageIn` is
