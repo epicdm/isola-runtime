@@ -1,7 +1,7 @@
 """privacy: chat_sessions.visibility — private by default
 
 Revision ID: p1_privacy_session_visibility
-Revises: f12_p6_agent_vertical
+Revises: g01_enforced_usage_limits
 Create Date: 2026-09-10
 
 Adds a per-session visibility marker so a manager's `manage` right over an
@@ -21,7 +21,13 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "p1_privacy_session_visibility"
-down_revision = "f12_p6_agent_vertical"
+# CHAIN RECONCILIATION (2026-09-10, Lane REPAIR):
+# This and g01_enforced_usage_limits were both authored against
+# f12_p6_agent_vertical on separate branches, which would leave Alembic with
+# TWO heads once both merge. Chained here instead:
+#   f12_p6_agent_vertical -> g01_enforced_usage_limits -> p1_privacy_session_visibility
+# Consequence, stated plainly: PR #43 must merge BEFORE PR #44.
+down_revision = "g01_enforced_usage_limits"
 branch_labels = None
 depends_on = None
 
