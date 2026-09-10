@@ -19,6 +19,9 @@ class ChatSession(Base):
     is_group: True for group chat sessions (Feishu group, WeCom group, Slack channel, etc.).
               Group sessions have user_id=NULL and only appear in the 'all sessions' view.
     group_name: Display name for group chat sessions (e.g. the group/channel name from IM platform).
+    visibility: 'private' (default) | 'shared'. A private session belongs to its
+                user_id alone; `manage` access to the agent does not open it.
+                See app.core.session_privacy.
     """
 
     __tablename__ = "chat_sessions"
@@ -33,6 +36,8 @@ class ChatSession(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="New Session")
     source_channel: Mapped[str] = mapped_column(String(20), nullable=False, default="web")
     external_conv_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Privacy boundary: private by default, opt-in to sharing.
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="private", server_default="private")
     # Group chat support: group sessions have user_id=NULL and show group_name instead
     is_group: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     group_name: Mapped[str | None] = mapped_column(String(200), nullable=True)

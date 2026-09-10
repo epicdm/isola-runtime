@@ -8,6 +8,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.session_privacy import MANAGE, resolve_access_level
 from app.models.agent import Agent, AgentPermission
 from app.models.user import User
 
@@ -21,35 +22,21 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
     1. User is platform admin → manage
     2. User is the agent creator → manage
     3. User has explicit permission (company/user scope) → from permission record
+
+    Resolution is delegated to app.core.session_privacy.resolve_access_level so
+    that routes, retrieval and call-time tool authorization all answer from the
+    same live read of `agent_permissions`. A deactivated user or a deleted
+    permission row is refused on the next request.
     """
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
-    # Platform admins can access everything with manage
-    if user.role == "platform_admin":
-        return agent, "manage"
-
-    # Tenant isolation: non-platform-admin users can only access agents in their own tenant
-    if agent.tenant_id != user.tenant_id:
+    level = await resolve_access_level(db, user, agent)
+    if level is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")
-
-    # Creator always has manage access
-    if agent.creator_id == user.id:
-        return agent, "manage"
-
-    # Check permission scopes
-    perms = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent_id))
-    permissions = perms.scalars().all()
-
-    for perm in permissions:
-        if perm.scope_type == "company":
-            return agent, perm.access_level or "use"
-        if perm.scope_type == "user" and perm.scope_id == user.id:
-            return agent, perm.access_level or "use"
-
-    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")
+    return agent, level
 
 
 def is_agent_creator(user: User, agent: Agent) -> bool:
