@@ -10,6 +10,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
+from app.core.session_privacy import MANAGE, can_read_session, readable_sessions_clause
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.audit import ChatMessage
@@ -20,12 +21,14 @@ from app.models.user import User
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
 
-def _can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
-    """Admins and the agent creator may list/view/delete other users' chat sessions."""
-    return (
-        user.role in ("platform_admin", "org_admin", "agent_admin")
-        or str(agent.creator_id) == str(user.id)
-    )
+def _can_view_all_agent_chat_sessions(access_level: Optional[str]) -> bool:
+    """Scope=all is a `manage` right on THIS agent, resolved from agent_permissions.
+
+    It is deliberately not a platform role check. `org_admin` is held by 297 of
+    330 principals on this estate; role is not permission. Even `manage` does
+    not open another principal's PRIVATE session — see can_read_session.
+    """
+    return access_level == MANAGE
 
 
 class SessionOut(BaseModel):
@@ -71,18 +74,22 @@ async def list_sessions(
     agent = agent_result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    await check_agent_access(db, current_user, agent_id)
+    _, access_level = await check_agent_access(db, current_user, agent_id)
 
     if scope == "all":
-        if not _can_view_all_agent_chat_sessions(current_user, agent):
+        if not _can_view_all_agent_chat_sessions(access_level):
             raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
-        # Fetch all sessions (including agent-to-agent where this agent is peer)
+        # Fetch all sessions (including agent-to-agent where this agent is peer),
+        # narrowed to what this principal may actually read.
         result = await db.execute(
             select(ChatSession)
             .where(
-                (ChatSession.agent_id == agent_id)
-                | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
+                (
+                    (ChatSession.agent_id == agent_id)
+                    | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
+                ),
+                readable_sessions_clause(current_user, access_level),
             )
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
         )
@@ -268,7 +275,7 @@ async def rename_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Rename a session. Owner, agent creator, or admin may rename others' sessions."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
     )
@@ -276,7 +283,7 @@ async def rename_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if not can_read_session(current_user, session, access_level):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     session.title = body.title
@@ -292,7 +299,7 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a chat session and its messages. Owner, agent creator, or admin may delete others' sessions."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
     )
@@ -300,7 +307,7 @@ async def delete_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if not can_read_session(current_user, session, access_level):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # Delete associated messages first
@@ -319,7 +326,7 @@ async def get_session_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Get chat messages for a specific session."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
     # Allow looking up sessions where agent_id OR peer_agent_id matches
     result = await db.execute(
         select(ChatSession).where(
@@ -331,8 +338,8 @@ async def get_session_messages(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Permission: session owner, agent creator, or admin.
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    # Permission: the principal's own session, or a SHARED session at `manage`.
+    if not can_read_session(current_user, session, access_level):
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
