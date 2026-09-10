@@ -524,7 +524,15 @@ async def _process_whatsapp_message(
                 agent_id,
                 user_text,
                 history=history,
-                user_id=agent.creator_id,
+                # An inbound WhatsApp sender is an EXTERNAL, unauthenticated
+                # principal. It previously passed agent.creator_id, so every
+                # sender's tools ran with the owner's authority.
+                # NOTE: sess.user_id is ALSO agent.creator_id (the session row
+                # is created that way at :420 because chat_sessions.user_id is
+                # NOT NULL), so substituting sess.user_id would be a no-op.
+                # Carrying no principal is the correct, fail-closed value:
+                # assert_tool_allowed refuses every owner-level tool.
+                user_id=None,
                 session_id=session_conv_id,
             )
         except Exception as e:
