@@ -23,7 +23,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
-from app.services.agent_tools import AGENT_TOOLS, execute_tool, get_agent_tools_for_llm
+from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
+# Call-time principal authorization. agent_tools.execute_tool authorizes
+# nothing with the user_id it is handed; tool_guard.execute_tool resolves the
+# principal against agent_permissions first and refuses owner-level actions.
+from app.core.tool_guard import execute_tool
 from app.services.token_tracker import record_token_usage, extract_usage_tokens, estimate_tokens_from_chars
 
 from .client import LLMError
@@ -249,7 +253,9 @@ async def _process_tool_call(
     result = await execute_tool(
         tool_name, args,
         agent_id=agent_id,
-        user_id=user_id or agent_id,
+        # Never substitute the agent for a person. A missing principal must
+        # reach the tool gate as missing, so it can be refused.
+        user_id=user_id,
         session_id=session_id,
     )
     logger.debug(f"[LLM] Tool result: {result[:100]}")
@@ -701,7 +707,10 @@ async def call_agent_llm(
             agent_name=agent.name,
             role_description=agent.role_description or "",
             agent_id=agent_id,
-            user_id=user_id or agent_id,
+            # Second, previously undocumented substitution site. Left in place
+            # it defeats the tool gate entirely: user_id is coerced to agent_id
+            # HERE, before the tool loop is ever reached.
+            user_id=user_id,
             session_id=session_id,
             on_chunk=on_chunk,
             on_thinking=on_thinking,
