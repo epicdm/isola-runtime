@@ -67,13 +67,27 @@ class MeteredLLMClient:
         self._session_factory = session_factory
 
     async def complete(self, *args, **kwargs):
+        return await self._metered("complete", *args, **kwargs)
+
+    async def stream(self, *args, **kwargs):
+        """MUST be metered too.
+
+        The human-chat tool loop (app/services/llm/caller.py) calls
+        ``client.stream()``, not ``complete()``. Metering only ``complete()``
+        would leave chat entirely unmetered while __getattr__ passed
+        ``stream`` straight through to the raw client -- i.e. the same
+        fail-open shape as the bug being fixed, one method along.
+        """
+        return await self._metered("stream", *args, **kwargs)
+
+    async def _metered(self, method: str, *args, **kwargs):
         async with self._session_factory() as db:
             # Raises UsageLimitExceeded -> the provider is never called.
             await reserve_llm_call(self._agent_id, db)
 
         started = time.monotonic()
         try:
-            response = await self._inner.complete(*args, **kwargs)
+            response = await getattr(self._inner, method)(*args, **kwargs)
         except Exception as exc:
             await self._record(None, None, started, success=False,
                                error_class=type(exc).__name__)
@@ -110,8 +124,17 @@ class MeteredLLMClient:
         except Exception as exc:  # accounting must never break the call path
             logger.warning(f"[usage_meter] telemetry write failed for {self._agent_id}: {exc}")
 
+    #: Methods that reach a provider. Anything added to a client class that
+    #: makes a billable call MUST be listed here, or __getattr__ will pass it
+    #: through unmetered.
+    _PROVIDER_METHODS = ("complete", "stream")
+
     def __getattr__(self, name):
-        # close(), stream(), etc. pass through untouched.
+        # close() and other non-billable helpers pass through untouched.
+        if name in self._PROVIDER_METHODS:          # pragma: no cover - defensive
+            raise AttributeError(
+                f"{name} must be metered explicitly, not passed through"
+            )
         return getattr(self._inner, name)
 
 
