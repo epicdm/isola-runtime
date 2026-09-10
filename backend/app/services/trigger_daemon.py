@@ -298,6 +298,13 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
                     select(ChatMessage).join(
                         ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
                     ).where(
+                        # Previously unbounded: this join matched the newest
+                        # assistant message in ANY session on the estate and
+                        # copied 2000 chars of it into the triggered agent's
+                        # context. Constrain to this agent, and to sessions
+                        # explicitly marked shared.
+                        ChatSession.agent_id == trigger.agent_id,
+                        ChatSession.visibility == "shared",
                         ChatMessage.participant_id == from_participant,
                         ChatMessage.created_at > since,
                         ChatMessage.role == "assistant",
@@ -355,17 +362,15 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
                         ).order_by(ChatMessage.created_at.desc()).limit(1)
                     )
                 else:
-                    # Fallback: search by message content or session title containing the name
-                    result = await db.execute(
-                        select(ChatMessage).join(
-                            ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                        ).where(
-                            ChatSession.agent_id == trigger.agent_id,
-                            ChatSession.source_channel.in_(["feishu", "slack", "discord"]),
-                            ChatMessage.role == "user",
-                            ChatMessage.created_at > since,
-                        ).order_by(ChatMessage.created_at.desc()).limit(1)
+                    # Fail closed. The former fallback dropped the user filter
+                    # and searched every session on the agent, so an
+                    # unresolvable name matched an arbitrary principal's
+                    # message. If we cannot name the principal, we do not fire.
+                    logger.info(
+                        f"[Trigger] from_user_name={from_user_name!r} did not resolve "
+                        f"to a user in this tenant; not firing (fail closed)."
                     )
+                    return False
 
                 msg = result.scalar_one_or_none()
                 if not msg:
