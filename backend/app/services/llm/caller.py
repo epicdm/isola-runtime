@@ -29,6 +29,7 @@ from app.services.token_tracker import record_token_usage, extract_usage_tokens,
 from .client import LLMError
 from .failover import classify_error, FailoverErrorType
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
+from app.services.usage_meter import UsageLimitExceeded
 try:
     from langfuse import observe as _lf_observe, get_client as _lf_get_client
     _LANGFUSE_AVAILABLE = True
@@ -97,6 +98,18 @@ def is_retryable_error(result: str) -> bool:
         return False
         
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
+
+
+async def _get_tenant_id_for_agent(agent_id):
+    """Tenant for usage accounting. Never raises into the call path."""
+    try:
+        from app.database import async_session
+        from app.models.agent import Agent as _A
+        async with async_session() as _db:
+            r = await _db.execute(select(_A.tenant_id).where(_A.id == agent_id))
+            return r.scalar_one_or_none()
+    except Exception:
+        return None
 
 
 def _get_model_timeout(model: "LLMModel") -> float:
@@ -409,6 +422,25 @@ async def call_llm(
     except Exception as e:
         return f"[Error] Failed to create LLM client: {e}"
 
+    # ── Enforcement + accounting, BEFORE any provider execution ──
+    # call_llm is the single chokepoint for human chat (websocket ->
+    # call_llm_with_failover -> call_llm) AND for the retry path (failover
+    # calls call_llm a second time with the fallback model, creating a new
+    # client here and therefore reserving again). Every stream()/complete()
+    # in the tool loop below reserves one unit first; a refusal never
+    # reaches the provider.
+    if agent_id is not None:
+        from app.services.llm_metered import MeteredLLMClient
+        client = MeteredLLMClient(
+            client,
+            agent_id=agent_id,
+            tenant_id=await _get_tenant_id_for_agent(agent_id),
+            provider=model.provider,
+            model=model.model,
+            model_id=getattr(model, "id", None),
+            intent="chat",
+        )
+
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, 'max_output_tokens', None))
     _accumulated_tokens = 0
 
@@ -445,6 +477,16 @@ async def call_llm(
                 model,
                 round_i,
             )
+        except UsageLimitExceeded as e:
+            # Budget exhausted: the provider was NOT called. Deliberately not
+            # an "[LLM Error]" prefix, so is_retryable_error() returns False
+            # and failover does not spend the fallback budget on a call that
+            # would be refused too.
+            logger.warning(f"[LLM] agent={agent_id} refused by usage meter: {e.message}")
+            if agent_id and _accumulated_tokens > 0:
+                await record_token_usage(agent_id, _accumulated_tokens)
+            await client.close()
+            return f"⚠️ {e.message}"
         except LLMError as e:
             logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
             if agent_id and _accumulated_tokens > 0:
