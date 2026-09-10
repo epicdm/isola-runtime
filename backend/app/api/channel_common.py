@@ -145,7 +145,12 @@ async def _call_agent_llm(
         messages.extend(history[-ctx_size:])
     messages.append({"role": "user", "content": user_text})
 
-    effective_user_id = user_id or agent_id
+    # Do NOT substitute the agent for a person. This line defeated the
+    # whatsapp.py repair on its own: the sender's absent principal was
+    # coerced back into an id that resolve_access_level treats as a
+    # subject. An absent principal must stay absent so the tool gate
+    # (assert_tool_allowed) can refuse owner-level actions.
+    effective_user_id = user_id
     _timeout = _get_llm_timeout(model)
 
     # Day 4b -- ADR-0070 #2: SOUL.md from Paperclip overrides role_description
