@@ -332,7 +332,10 @@ _SPEND_SQL = text(
            COUNT(*) FILTER (WHERE cost_cents IS NULL) AS unpriced_calls
       FROM llm_call_telemetry
      WHERE created_at >= :since
-       AND (:agent_id IS NULL OR agent_id = :agent_id)
+       -- CAST is required: asyncpg cannot infer the type of a bare bound
+       -- parameter used in "IS NULL", and raises AmbiguousParameterError.
+       -- SQLite accepts the untyped form, so this only shows on Postgres.
+       AND (CAST(:agent_id AS TEXT) IS NULL OR CAST(agent_id AS TEXT) = CAST(:agent_id AS TEXT))
     """
 )
 
