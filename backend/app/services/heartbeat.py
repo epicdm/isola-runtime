@@ -162,6 +162,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             agent_name = agent.name
             agent_role = agent.role_description or ""
             agent_creator_id = agent.creator_id
+            agent_tenant_id = agent.tenant_id
             model_provider = model.provider
             model_api_key = get_model_api_key(model)
             model_model = model.model
@@ -257,6 +258,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         # Call LLM with tools using unified client
         from app.services.llm import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
+        from app.services.llm_metered import MeteredLLMClient
+        from app.services.usage_meter import UsageLimitExceeded
 
         try:
             client = create_llm_client(
@@ -265,6 +268,20 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 model=model_model,
                 base_url=model_base_url,
                 timeout=float(model_request_timeout or 120.0),
+            )
+            # ── Enforcement + accounting on the volume path ──
+            # This module never imported quota_guard. 278 agents wake on a
+            # 240-minute heartbeat, each wake up to 20 provider calls, none
+            # checked, none counted. Every complete() below now reserves
+            # budget atomically BEFORE the provider is reached.
+            client = MeteredLLMClient(
+                client,
+                agent_id=agent_id,
+                tenant_id=agent_tenant_id,
+                provider=model_provider,
+                model=model_model,
+                model_id=model_id,
+                intent="heartbeat",
             )
         except Exception as e:
             logger.error(f"Failed to create LLM client: {e}")
@@ -294,6 +311,11 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     temperature=model_temperature,
                     max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
                 )
+            except UsageLimitExceeded as e:
+                # Budget exhausted: the provider was NOT called. Stop the wake.
+                logger.info(f"[Heartbeat] {agent_name} stopped at round {round_i}: {e.message}")
+                reply = ""
+                break
             except LLMError as e:
                 logger.error(f"LLM error in heartbeat: {e}")
                 reply = ""
