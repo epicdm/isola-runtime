@@ -17,15 +17,21 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _column_exists(table_name: str, column_name: str) -> bool:
+    # initial_schema builds fresh databases from the current models, so the
+    # column may already exist when this revision runs.
+    return column_name in {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns(table_name)
+    }
+
+
 def upgrade() -> None:
-    op.add_column(
-        "agent_schedules",
-        sa.Column("delivery_target_id", postgresql.UUID(as_uuid=True), nullable=True),
-    )
-    op.add_column(
-        "agent_triggers",
-        sa.Column("delivery_target_id", postgresql.UUID(as_uuid=True), nullable=True),
-    )
+    for table_name in ("agent_schedules", "agent_triggers"):
+        if not _column_exists(table_name, "delivery_target_id"):
+            op.add_column(
+                table_name,
+                sa.Column("delivery_target_id", postgresql.UUID(as_uuid=True), nullable=True),
+            )
 
 
 def downgrade() -> None:
